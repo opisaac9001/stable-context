@@ -1,0 +1,49 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev --prefix ..",
+    "beforeBuildCommand": "npm run build --prefix ..",
+    "devPath": "http://localhost:5173",
+    "distDir": "../dist",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "LLM Context OS GUI",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": true
+      },
+      "http": {
+        "all": true, // Allow all http requests, including to localhost backend
+        "scope": ["http://localhost:8000/*"]
+      }
+    },
+    "bundle": {
+      "active": true,
+      "identifier": "com.llmcontextos.dev",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ]
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "resizable": true,
+        "title": "LLM Context OS",
+        "width": 1000,
+        "height": 750
+      }
+    ]
+  }
+}
