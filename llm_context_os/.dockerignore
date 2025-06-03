@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.env
+venv/
+.venv/
+env/
+ENV/
+*.egg
+
+# Node.js artifacts (especially for GUI development outside Docker build if any)
+gui/node_modules/
+gui/dist/
+gui/.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE and OS specific
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Docker specific (if Dockerfiles are in subdirs, not needed if in root)
+# Dockerfile # If you have a generic Dockerfile you don't always use
+# docker-compose.yml # If managing compose files elsewhere sometimes
+
+# Local model files (already in .gitignore, but good to have here too for build context)
+models/

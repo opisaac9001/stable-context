@@ -32,6 +32,10 @@ Phase Scope Key Output Est.
 
 Total MVP: about 8 sprint‑weeks; polish continues thereafter.
 
+## Docker Support
+
+This project includes Docker support for easier setup and deployment. For instructions on how to build and run the application using Docker, please see [DOCKER.md](DOCKER.md).
+
 2 · Filesystem Scaffold
 text
 Copy

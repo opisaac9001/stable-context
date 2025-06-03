@@ -1,0 +1,63 @@
+# llm_context_os/docker-compose.yml
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000" # Exposes backend API on host port 8000
+    # volumes:
+    #   # Mount the application code for development (reflects changes without rebuild)
+    #   # Note: requirements.txt changes would still need a rebuild of the image if not also mounted.
+    #   # This assumes your Python code is primarily within the llm_context_os sub-package.
+    #   - ./llm_context_os:/app/llm_context_os
+    #   # If you have other Python files in the root, you might need a broader mount like:
+    #   # - .:/app
+    #   # However, be careful not to overwrite installed packages in /app if WORKDIR is /app.
+    # command: uvicorn llm_context_os.api.main:app --host 0.0.0.0 --port 8000 --reload # For dev
+    # depends_on:
+    #   - some_db_service # If you add a database service later
+    environment:
+      # - PYTHONUNBUFFERED=1 # Already set in Dockerfile.backend but can be explicit
+      - APP_ENV=development # Example environment variable
+      # - PYTHONPATH=/app # Ensures llm_context_os package is found if not installed site-wide
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "5173:80" # Map Nginx port 80 (container) to host's 5173 (Vite's default dev port for familiarity)
+    # depends_on:
+    #   - backend # Ensures backend starts before frontend, though frontend is static files.
+    #             # For API calls, frontend will just hit backend's port when ready.
+                    # Not strictly necessary for static builds served by Nginx unless Nginx
+                    # itself needs to proxy to the backend during its startup (not the case here).
+
+# Optional: Define a network if services need to communicate by service name
+# (e.g., if frontend Nginx needed to proxy_pass to `http://backend:8000`)
+# For direct browser-to-backend API calls using localhost:8000, a shared Docker network isn't strictly needed,
+# but it's good practice for inter-service communication if that evolves.
+# networks:
+#   llm_os_network:
+#     driver: bridge
+
+# Optional: Define volumes if you need persistent storage
+# (e.g., for a DB, or to make the 'models' directory available to the backend container)
+# volumes:
+#   local_models_volume: # Example: make local models dir available to backend
+#     driver: local
+#     driver_opts:
+#       type: 'none' # Use 'none' for bind mount
+#       o: 'bind'
+#       device: '${PWD}/models' # Path on the host
+
+# If using the above volume for models with the backend:
+# services:
+#   backend:
+#     volumes:
+#       - local_models_volume:/app/models # Mounts the named volume to /app/models in backend
+#       # ... other backend config
+```

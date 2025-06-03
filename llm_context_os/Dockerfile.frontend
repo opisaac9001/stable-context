@@ -1,0 +1,41 @@
+# llm_context_os/Dockerfile.frontend
+
+# ---- Stage 1: Build the React application ----
+FROM node:18-alpine AS builder
+
+# Set working directory for the GUI app source code
+WORKDIR /app/gui
+
+# Copy package.json and package-lock.json (if available) first
+# This leverages Docker layer caching for dependencies
+COPY gui/package.json gui/package-lock.json* ./
+# The './' at the end of destination is important if package-lock.json might not exist
+# Also ensure that the context for Docker build is the project root (llm_context_os)
+# so that 'gui/package.json' correctly refers to llm_context_os/gui/package.json.
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+# Copy the rest of the GUI application source code
+COPY gui/ ./
+
+# Build the application
+RUN npm run build
+
+# ---- Stage 2: Serve the built application with Nginx ----
+FROM nginx:alpine
+
+# Remove default Nginx configuration
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy custom Nginx configuration (will be created in a later step)
+# This file should handle SPA routing (e.g., try_files $uri $uri/ /index.html)
+# It's assumed nginx.conf will be in the root of the build context (llm_context_os/)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy the built static assets from the builder stage
+COPY --from=builder /app/gui/dist /usr/share/nginx/html
+
+# Expose port 80 for Nginx
+EXPOSE 80
+
+# Default command to start Nginx (already set by base image, but can be explicit)
+CMD ["nginx", "-g", "daemon off;"]
