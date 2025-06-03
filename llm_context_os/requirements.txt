@@ -1,23 +1,26 @@
 # llm_context_os/requirements.txt
 
-# Core / General Dependencies (add as identified)
-# pydantic
-# fastapi
-# uvicorn
-# sse-starlette
-# python-dotenv
-# PyYAML (for config)
-# watchdog (for config hot-reloading, optional)
+# --- Core API & Schema Dependencies ---
+fastapi
+uvicorn[standard] # Includes pydantic, starlette, and standard uvicorn features
+pydantic
 
-# For Tokenizers (beyond basic char counting)
+# --- Other Core / General Dependencies (add as identified) ---
+# sse-starlette # For streaming if needed beyond basic WebSocket/HTTP
+# python-dotenv # For managing environment variables
+# PyYAML        # For config file loading
+# watchdog      # For config hot-reloading (optional)
+
+# --- Tokenizers (beyond basic char counting) ---
 # sentencepiece
 # transformers[tokenizers] # For Hugging Face tokenizers
 
+# --- Model Runners ---
 # For LlamaCppRunner (GGUF models)
 # llama-cpp-python
 
 # For AWQRunner (Transformers-based AWQ)
-# transformers # Already listed for tokenizers, but core for AWQ models
+# transformers # Also listed for tokenizers, but core for AWQ models
 # autoawq    # For AWQ quantization/models specifically
 # torch      # Required by transformers and autoawq
 
@@ -29,19 +32,19 @@
 # httpx      # For making HTTP requests
 # openai     # If using the OpenAI Python client directly
 
-# For Retriever (SentenceTransformer + Chroma)
+# --- Retriever (Phase 4) ---
 # sentence-transformers
 # chromadb
 
-# For GUI (Tauri - Python part if any, or for helper scripts)
+# --- GUI (Phase 5) ---
 # PyGObject (if GTK bindings are needed, less likely with Tauri direct webview)
 
-# For Testing
+# --- Testing ---
 # unittest (built-in)
 # pytest (optional, popular alternative)
 # pytest-cov (optional, for coverage)
 
-# For Development
+# --- Development Tools ---
 # ruff (linter/formatter)
 # mypy (type checking)
 # pre-commit (for git hooks)

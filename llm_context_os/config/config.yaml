@@ -1,0 +1,30 @@
+llm_context_os_config:
+  # Settings for ModelManager
+  idle_unload_sec: 900 # Seconds before an idle model is unloaded. Set to null or 0 to disable.
+
+  # Default generation parameters (can be overridden in ChatRequest)
+  generation_defaults:
+    temperature: 0.7
+    top_p: 1.0
+    max_new_tokens: 256 # Renamed from max_tokens for clarity, matching schema
+    use_kv_cache: true
+
+  # Settings for ContextManager (max_tokens here refers to context window capacity)
+  context_manager:
+    max_tokens: 4096 # Default from blueprint, context window size
+    # system_prompt: "You are a helpful AI assistant." # Example, could be loaded from here
+
+  # Settings for Retriever (Phase 4 - placeholders for now)
+  # rag:
+  #   embed_model: "all-MiniLM-L6-v2" # Default from blueprint
+  #   db_path: "data/chroma_db" # Example path
+  #   retrieval_budget_tokens: 512 # Default from blueprint
+
+  # Settings for API Runner (example structure)
+  # api_runner_defaults:
+  #   openai_api_key: "YOUR_OPENAI_API_KEY_HERE_OR_USE_ENV_VAR"
+  #   openai_base_url: "https://api.openai.com/v1"
+
+  # MCP Servers (Phase 4 - placeholder)
+  # mcp_servers:
+  #   - "https://mcp.mycorp.example"
