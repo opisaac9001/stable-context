@@ -4,7 +4,8 @@ from .api_runner import APIRunner
 from .llama_cpp_runner import LlamaCppRunner
 from .awq_runner import AWQRunner
 from .exl2_runner import EXL2Runner
-from .speculative_runner import SpeculativeRunner # Added this line
+from .speculative_runner import SpeculativeRunner
+from .vllm_runner import VLLMRunner # Added this line
 from .manager import ModelManager
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "LlamaCppRunner",
     "AWQRunner",
     "EXL2Runner",
-    "SpeculativeRunner", # Added this line
+    "SpeculativeRunner",
+    "VLLMRunner", # Added this line
     "ModelManager",
 ]

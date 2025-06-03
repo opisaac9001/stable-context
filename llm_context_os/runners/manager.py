@@ -1,15 +1,16 @@
 # llm_context_os/runners/manager.py
 import typing as t
 import time
-from pathlib import Path # Ensure Path is imported if used in __main__ for cleanup
-import shutil # Ensure shutil is imported if used in __main__ for cleanup
+from pathlib import Path
+import shutil
 
 from .base import BaseRunner
 from .api_runner import APIRunner
 from .llama_cpp_runner import LlamaCppRunner
 from .awq_runner import AWQRunner
 from .exl2_runner import EXL2Runner
-from .speculative_runner import SpeculativeRunner # Added
+from .speculative_runner import SpeculativeRunner
+from .vllm_runner import VLLMRunner # Added
 from llm_context_os.caching.kv_cache_manager import KVCacheManager
 
 class ModelManager:
@@ -33,22 +34,32 @@ class ModelManager:
 
     def load(self,
              model_type: str,
-             model_path_or_name: str, # For 'speculative', this could be a config name or descriptive ID
+             model_path_or_name: str,
              idle_unload_sec: t.Optional[int] = None,
              default_prefix_text: t.Optional[str] = None,
-             **kwargs: t.Any) -> None: # runner_constructor_params are in kwargs
+             **kwargs: t.Any) -> None:
         """
         Loads a model runner, and optionally loads/generates/saves its KV cache for a default prefix.
         For 'speculative' type, expects 'draft_runner' and 'target_runner' in kwargs.
+        For 'vllm' and 'api', 'api_url' can be in kwargs.
         """
         print(f"\nAttempting to load model...")
         print(f"  Type: {model_type}")
-        print(f"  Path/Name/ID: {model_path_or_name}") # Changed label for clarity
+        print(f"  Path/Name/ID: {model_path_or_name}")
         if idle_unload_sec is not None:
             print(f"  Idle Unload Sec: {idle_unload_sec}")
         if default_prefix_text:
             print(f"  Default Prefix Text: '{default_prefix_text[:50]}...'")
-        print(f"  Runner Constructor Params (kwargs): { {k:type(v).__name__ if isinstance(v, BaseRunner) else v for k,v in kwargs.items()} }") # Print types for runners
+
+        # Print kwargs, showing BaseRunner instances by type name for readability
+        processed_kwargs_for_print = {}
+        for k, v in kwargs.items():
+            if isinstance(v, BaseRunner):
+                processed_kwargs_for_print[k] = type(v).__name__
+            else:
+                processed_kwargs_for_print[k] = v
+        print(f"  Runner Constructor Params (kwargs): {processed_kwargs_for_print}")
+
 
         if self.current_runner:
             self.unload()
@@ -59,7 +70,7 @@ class ModelManager:
 
             if mt_lower == 'api':
                 api_url = kwargs.pop('api_url', None)
-                api_key = kwargs.pop('api_key', None)
+                api_key = kwargs.pop('api_key', None) # Optional
                 if not api_url:
                     print("Error: 'api_url' is required for API runner.")
                     return
@@ -70,10 +81,14 @@ class ModelManager:
                 runner_to_load = AWQRunner(model_path_or_repo_id=model_path_or_name, **kwargs)
             elif mt_lower == 'exl2':
                 runner_to_load = EXL2Runner(model_path=model_path_or_name, **kwargs)
+            elif mt_lower == 'vllm': # Added vLLM
+                api_url = kwargs.pop('api_url', "http://localhost:8000") # Default in VLLMRunner itself
+                api_key = kwargs.pop('api_key', None) # Optional
+                runner_to_load = VLLMRunner(model_name=model_path_or_name, api_url=api_url, api_key=api_key, **kwargs)
             elif mt_lower == 'speculative':
                 draft_runner = kwargs.get('draft_runner')
                 target_runner = kwargs.get('target_runner')
-                speculative_k = kwargs.get('speculative_k', 5) # Default k if not provided
+                speculative_k = kwargs.get('speculative_k', 5)
 
                 if isinstance(draft_runner, BaseRunner) and isinstance(target_runner, BaseRunner):
                     runner_to_load = SpeculativeRunner(
@@ -81,8 +96,6 @@ class ModelManager:
                         target_runner=target_runner,
                         speculative_k=speculative_k
                     )
-                    # model_path_or_name for speculative could be a descriptive ID like "spec(draft_model_id,target_model_id)"
-                    # For now, we'll use the one passed.
                 else:
                     print("Error: SpeculativeRunner requires pre-instantiated 'draft_runner' and 'target_runner' (BaseRunner instances) in parameters.")
                     return
@@ -92,13 +105,15 @@ class ModelManager:
 
             self.current_runner = runner_to_load
             self.current_model_type = mt_lower
-            # For speculative, model_path_or_name might be a config name.
-            # A more detailed identifier could be constructed if needed.
+
             if mt_lower == 'speculative' and isinstance(self.current_runner, SpeculativeRunner):
                  self.current_model_identifier = (
-                    f"speculative(draft={type(self.current_runner.draft_runner).__name__}@{model_path_or_name},"
+                    f"speculative(draft={type(self.current_runner.draft_runner).__name__},"
                     f"target={type(self.current_runner.target_runner).__name__})"
+                    f"@{model_path_or_name}" # Use the provided ID for the spec config
                 )
+            elif mt_lower == 'vllm':
+                self.current_model_identifier = f'vllm_model({model_path_or_name} @ {self.current_runner.api_url})'
             else:
                 self.current_model_identifier = model_path_or_name
 
@@ -106,42 +121,36 @@ class ModelManager:
             self.last_accessed_time = time.time()
             print(f"Successfully instantiated {self.current_model_type} runner for: {self.current_model_identifier}")
 
-            # KV Cache handling (not typically used for the SpeculativeRunner itself, but for its components)
-            # If default_prefix_text is provided for a SpeculativeRunner, it will try to load/save
-            # cache for the *target_runner* as per SpeculativeRunner's export/import_kv_cache logic.
             if default_prefix_text and self.current_runner:
                 print(f'[ModelManager] Processing KV cache for prefix: "{default_prefix_text[:50]}..." for model {self.current_model_identifier}')
-                # For speculative, the model_identifier used for caching should ideally be unique to the target model,
-                # or the cache key should include target model info.
-                # KVCacheManager uses the model_identifier passed to it.
-                # If SpeculativeRunner's identifier is used, cache might clash if different target models are used
-                # with same speculative config name.
-                # For now, using self.current_model_identifier which is now more descriptive for speculative.
-                # Or, better: use target_runner's identifier if available (needs it to have one)
-                cache_id_for_speculative = self.current_model_identifier
-                if mt_lower == 'speculative' and hasattr(self.current_runner.target_runner, 'model_path_or_repo_id'):
-                    cache_id_for_speculative = self.current_runner.target_runner.model_path_or_repo_id
-                elif mt_lower == 'speculative' and hasattr(self.current_runner.target_runner, 'model_path'):
-                    cache_id_for_speculative = self.current_runner.target_runner.model_path
-                elif mt_lower == 'speculative' and hasattr(self.current_runner.target_runner, 'model_name'):
-                     cache_id_for_speculative = self.current_runner.target_runner.model_name
+
+                cache_id = self.current_model_identifier
+                if mt_lower == 'speculative' and isinstance(self.current_runner, SpeculativeRunner):
+                    # For speculative, cache operations target the 'target_runner'
+                    # Construct a unique ID for the target_runner for caching purposes
+                    target = self.current_runner.target_runner
+                    if hasattr(target, 'model_path_or_repo_id'): cache_id = target.model_path_or_repo_id
+                    elif hasattr(target, 'model_path'): cache_id = target.model_path
+                    elif hasattr(target, 'model_name'): cache_id = target.model_name
+                    else: cache_id = f"target_of_{self.current_model_identifier}" # Fallback cache ID
+                    print(f"[ModelManager] Speculative mode: using target runner ID for cache: {cache_id}")
 
 
-                loaded_cache = self.kv_cache_mgr.load_kv_cache(cache_id_for_speculative, default_prefix_text)
+                loaded_cache = self.kv_cache_mgr.load_kv_cache(cache_id, default_prefix_text)
 
                 if loaded_cache is not None:
-                    print(f'[ModelManager] Found existing KV cache for prefix. Importing into runner (delegated by SpeculativeRunner).')
-                    self.current_runner.import_kv_cache(loaded_cache) # SpeculativeRunner handles distributing this
+                    print(f'[ModelManager] Found existing KV cache for prefix. Importing into runner.')
+                    self.current_runner.import_kv_cache(loaded_cache)
                 else:
-                    print(f'[ModelManager] No existing KV cache. Preloading/generating in runner (delegated by SpeculativeRunner).')
+                    print(f'[ModelManager] No existing KV cache. Preloading/generating in runner.')
                     self.current_runner.preload_kv(default_prefix_text)
 
-                    exported_cache = self.current_runner.export_kv_cache() # SpeculativeRunner exports target's cache
+                    exported_cache = self.current_runner.export_kv_cache()
                     if exported_cache is not None:
-                        print(f'[ModelManager] Exported new KV cache from runner. Saving to disk for {cache_id_for_speculative}.')
-                        self.kv_cache_mgr.save_kv_cache(exported_cache, cache_id_for_speculative, default_prefix_text)
+                        print(f'[ModelManager] Exported new KV cache from runner. Saving to disk for {cache_id}.')
+                        self.kv_cache_mgr.save_kv_cache(exported_cache, cache_id, default_prefix_text)
                     else:
-                        print(f'[ModelManager] Runner did not provide an exportable KV cache after preload.')
+                        print(f'[ModelManager] Runner did not provide an exportable KV cache after preload (e.g., API/vLLM runners).')
 
             print(f"Model '{self.current_model_identifier}' fully ready.")
 
@@ -154,7 +163,6 @@ class ModelManager:
             self.last_accessed_time = None
 
     def get(self) -> t.Optional[BaseRunner]:
-        # (Previous get, unload, check_idle methods remain unchanged)
         if self.current_runner:
             self.last_accessed_time = time.time()
             return self.current_runner
@@ -187,80 +195,61 @@ class ModelManager:
         return False
 
 if __name__ == '__main__':
-    kv_cache_dir_for_demo = "data/kv_cache_manager_demo_main"
-    if Path(kv_cache_dir_for_demo).exists():
+    kv_cache_dir_for_demo = Path("data/kv_cache_manager_demo_main") # Ensure Path is available
+    if kv_cache_dir_for_demo.exists():
         shutil.rmtree(kv_cache_dir_for_demo)
         print(f"Cleaned up old demo cache dir: {kv_cache_dir_for_demo}")
 
     manager = ModelManager()
-    # Override KVCacheManager to use a specific test directory for this demo
-    manager.kv_cache_mgr = KVCacheManager(cache_dir=kv_cache_dir_for_demo)
+    manager.kv_cache_mgr = KVCacheManager(cache_dir=str(kv_cache_dir_for_demo))
 
     print(f"--- Initial state: Runner loaded? {manager.get() is not None} ---")
 
-    # --- Demonstrate Speculative Runner Loading ---
-    print("\n--- Loading Speculative Runner ---")
-    # 1. Instantiate draft and target runners (using placeholders for this demo)
-    # For real use, these would be actual LlamaCppRunner, AWQRunner, etc.
-    # Using APIRunner as a lightweight placeholder for draft/target for this demo.
-    draft_runner_instance = APIRunner(model_name="dummy-draft-model", api_url="http://dummy/draft")
-    target_runner_instance = LlamaCppRunner(model_path="dummy-target-model.gguf") # Target often a GGUF/EXL2
+    # --- Demonstrate vLLM Runner Loading ---
+    print("\n--- Loading vLLM Runner ---")
+    vllm_model_id = "Mistral-7B-Instruct-v0.1-vLLM" # This is the model_name for VLLMRunner
+    vllm_api_url = "http://localhost:2345/v1" # Example, if vLLM server is on non-default port or path
 
+    manager.load(
+        model_type='vllm',
+        model_path_or_name=vllm_model_id,
+        api_url=vllm_api_url, # Passed as kwarg, VLLMRunner's init will pick it up
+        # No default_prefix_text for vLLM as KV cache is not client managed in this way
+    )
+    vllm_runner = manager.get()
+    if vllm_runner:
+        print(f"VLLM Runner loaded: {isinstance(vllm_runner, VLLMRunner)}")
+        print(f"  VLLM Runner ID: {manager.current_model_identifier}")
+        vllm_runner.generate("Test prompt for vLLM runner.", max_new_tokens=5)
+    else:
+        print(f"Failed to load VLLMRunner with ID '{vllm_model_id}'.")
+
+    manager.unload() # Unload vLLM runner
+
+    # --- Demonstrate Speculative Runner Loading (as before) ---
+    print("\n--- Loading Speculative Runner ---")
+    draft_runner_instance = APIRunner(model_name="dummy-draft-model", api_url="http://dummy/draft")
+    target_runner_instance = LlamaCppRunner(model_path="dummy-target-model.gguf")
     speculative_id = "my_speculative_config"
     speculative_prefix = "This is the system prompt for the speculative model."
 
     manager.load(
         model_type='speculative',
-        model_path_or_name=speculative_id, # Name for this speculative configuration
-        default_prefix_text=speculative_prefix, # Prefix for KV caching (applies to target runner)
-        # Runner constructor params for SpeculativeRunner:
+        model_path_or_name=speculative_id,
+        default_prefix_text=speculative_prefix,
         draft_runner=draft_runner_instance,
         target_runner=target_runner_instance,
         speculative_k=3
     )
-
     spec_runner = manager.get()
     if spec_runner:
         print(f"SpeculativeRunner loaded: {isinstance(spec_runner, SpeculativeRunner)}")
-        print(f"  SpeculativeRunner ID: {manager.current_model_identifier}")
-        # Test generate with speculative runner
         spec_runner.generate("User asks a question to the speculative model.", max_new_tokens=10)
-
-        # Test KV cache export (delegates to target runner)
-        kv_exported = spec_runner.export_kv_cache()
-        print(f"KV cache exported from spec_runner (target's cache): {str(kv_exported)[:100]}...")
-
     else:
         print(f"Failed to load SpeculativeRunner with ID '{speculative_id}'.")
 
-    # --- Demonstrate KV Caching with Speculative Runner (interaction with target runner's cache) ---
-    print("\n--- Unloading and Reloading Speculative Runner to test KV cache for target ---")
-    manager.unload()
+    print("\nModelManager with vLLM and SpeculativeRunner demo complete.")
 
-    # Re-instantiate draft/target for a clean load test if their state was modified by first load
-    # (Our placeholder runners' states are modified, so re-instantiate)
-    draft_runner_instance_2 = APIRunner(model_name="dummy-draft-model", api_url="http://dummy/draft")
-    target_runner_instance_2 = LlamaCppRunner(model_path="dummy-target-model.gguf")
-
-
-    manager.load(
-        model_type='speculative',
-        model_path_or_name=speculative_id,
-        default_prefix_text=speculative_prefix, # Same prefix, should load target's cache
-        draft_runner=draft_runner_instance_2,
-        target_runner=target_runner_instance_2,
-        speculative_k=3
-    )
-    spec_runner_reloaded = manager.get()
-    if spec_runner_reloaded:
-        print(f"SpeculativeRunner reloaded: {isinstance(spec_runner_reloaded, SpeculativeRunner)}")
-        # Generate again; the LlamaCppRunner (target) should indicate if it used a preloaded/imported cache
-        spec_runner_reloaded.generate("Another user question after reloading.", max_new_tokens=10)
-    else:
-        print(f"Failed to reload SpeculativeRunner with ID '{speculative_id}'.")
-
-    print("\nModelManager with SpeculativeRunner demo complete.")
-
-    if Path(kv_cache_dir_for_demo).exists():
+    if kv_cache_dir_for_demo.exists(): # Cleanup
         shutil.rmtree(kv_cache_dir_for_demo)
         print(f"Cleaned up demo cache dir: {kv_cache_dir_for_demo}")

@@ -33,6 +33,10 @@ pydantic
 # httpx      # For making HTTP requests
 # openai     # If using the OpenAI Python client directly
 
+# For VLLMRunner
+# vllm       # Core VLLM library (for serving, if not just client)
+# httpx      # For asynchronous HTTP requests to the VLLM server (if APIRunner's httpx isn't reused/generic enough)
+
 # --- Retriever (RAG - Phase 4) ---
 # sentence-transformers
 # chromadb
