@@ -16,7 +16,7 @@ pydantic
 # sentencepiece
 # transformers[tokenizers] # For Hugging Face tokenizers
 
-# --- Model Runners ---
+# --- Model Runners & Related Libraries ---
 # For LlamaCppRunner (GGUF models)
 # llama-cpp-python
 
@@ -36,6 +36,10 @@ pydantic
 # For VLLMRunner
 # vllm       # Core VLLM library (for serving, if not just client)
 # httpx      # For asynchronous HTTP requests to the VLLM server (if APIRunner's httpx isn't reused/generic enough)
+
+# For LoRA and other Parameter-Efficient Fine-Tuning techniques
+# peft # Hugging Face PEFT library (used with Transformers for LoRA, etc.)
+# bitsandbytes # Often used with PEFT for quantization during training/loading
 
 # --- Retriever (RAG - Phase 4) ---
 # sentence-transformers
