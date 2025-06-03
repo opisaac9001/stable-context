@@ -19,7 +19,7 @@ python-multipart # For FastAPI File Uploads (used in /upload_document)
 
 # --- Model Runners & Related Libraries ---
 # For LlamaCppRunner (GGUF models)
-# llama-cpp-python
+llama-cpp-python>=0.2.20 # For running GGUF models locally
 
 # For AWQRunner (Transformers-based AWQ)
 # transformers # Also listed for tokenizers, but core for AWQ models

@@ -81,7 +81,15 @@ class KVCacheManager:
         filepath = self._get_cache_filepath(model_identifier, prefix_hash)
 
         print(f"[KVCacheManager] Saving KV cache for model '{model_identifier}' and prefix hash '{prefix_hash[:8]}...' to {filepath}")
-        print("  (Note: Using pickle for mock data. For real tensor data, consider safetensors or framework-specific methods.)")
+
+        # TODO: For LlamaCppRunner, 'cache_data' might be a filepath to a .kst session file.
+        # In that case, instead of pickling the path string, this method should copy the actual file
+        # from cache_data (the path) to self._get_cache_filepath(...).
+        # For now, it pickles the path string if cache_data is a string.
+        if isinstance(cache_data, str) and Path(cache_data).exists():
+            print(f"[KVCacheManager] Warning: Pickling a filepath string '{cache_data}' as cache data. Consider copying file content for portability.")
+
+        print("  (Note: Using pickle for serialization. For real tensor data from runners like LlamaCppRunner (session files) or HF/EXL2 (tensors), a direct file copy or safetensors/torch.save would be more appropriate than pickling the data/path itself.)")
 
         try:
             with open(filepath, 'wb') as f:
@@ -112,7 +120,10 @@ class KVCacheManager:
 
         if filepath.exists() and filepath.is_file():
             print(f"[KVCacheManager] Loading KV cache for model '{model_identifier}' and prefix hash '{prefix_hash[:8]}...' from {filepath}")
-            print("  (Note: Using pickle for mock data. Ensure compatibility if data was saved with a different method.)")
+            # TODO: If the saved cache for LlamaCppRunner was a file copy (as per future save_kv_cache logic),
+            # this should return the path to that copied file, or handle it accordingly.
+            # Currently, if a path string was pickled (due to current save_kv_cache logic), it unpickles that path string.
+            print("  (Note: Using pickle for deserialization. Ensure data was saved compatibly.)")
             try:
                 with open(filepath, 'rb') as f:
                     cache_data = pickle.load(f)
