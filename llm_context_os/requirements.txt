@@ -1,0 +1,47 @@
+# llm_context_os/requirements.txt
+
+# Core / General Dependencies (add as identified)
+# pydantic
+# fastapi
+# uvicorn
+# sse-starlette
+# python-dotenv
+# PyYAML (for config)
+# watchdog (for config hot-reloading, optional)
+
+# For Tokenizers (beyond basic char counting)
+# sentencepiece
+# transformers[tokenizers] # For Hugging Face tokenizers
+
+# For LlamaCppRunner (GGUF models)
+# llama-cpp-python
+
+# For AWQRunner (Transformers-based AWQ)
+# transformers # Already listed for tokenizers, but core for AWQ models
+# autoawq    # For AWQ quantization/models specifically
+# torch      # Required by transformers and autoawq
+
+# For EXL2Runner
+# exllamav2
+# torch      # Required by exllamav2
+
+# For APIRunner (example for OpenAI or other HTTP APIs)
+# httpx      # For making HTTP requests
+# openai     # If using the OpenAI Python client directly
+
+# For Retriever (SentenceTransformer + Chroma)
+# sentence-transformers
+# chromadb
+
+# For GUI (Tauri - Python part if any, or for helper scripts)
+# PyGObject (if GTK bindings are needed, less likely with Tauri direct webview)
+
+# For Testing
+# unittest (built-in)
+# pytest (optional, popular alternative)
+# pytest-cov (optional, for coverage)
+
+# For Development
+# ruff (linter/formatter)
+# mypy (type checking)
+# pre-commit (for git hooks)
