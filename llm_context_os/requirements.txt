@@ -32,9 +32,14 @@ pydantic
 # httpx      # For making HTTP requests
 # openai     # If using the OpenAI Python client directly
 
-# --- Retriever (Phase 4) ---
+# --- Retriever (RAG - Phase 4) ---
 # sentence-transformers
 # chromadb
+
+# --- Tool-Calling (Phase 4) ---
+# For MCP Adapters
+# langchain-mcp-adapters
+# Add other general tool-related dependencies here if any (e.g., for parsing specific tool inputs/outputs if not covered by basic types)
 
 # --- GUI (Phase 5) ---
 # PyGObject (if GTK bindings are needed, less likely with Tauri direct webview)

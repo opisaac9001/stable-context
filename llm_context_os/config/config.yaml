@@ -14,17 +14,25 @@ llm_context_os_config:
     max_tokens: 4096 # Default from blueprint, context window size
     # system_prompt: "You are a helpful AI assistant." # Example, could be loaded from here
 
-  # Settings for Retriever (Phase 4 - placeholders for now)
-  # rag:
-  #   embed_model: "all-MiniLM-L6-v2" # Default from blueprint
-  #   db_path: "data/chroma_db" # Example path
-  #   retrieval_budget_tokens: 512 # Default from blueprint
+  # Settings for Retriever (RAG - Phase 4)
+  rag:
+    embed_model: "all-MiniLM-L6-v2" # Default from blueprint
+    db_path: "data/chroma_db"       # Example path, can be relative to project root
+    retrieval_budget_tokens: 512    # Max tokens for retrieved snippets (blueprint default)
+    # top_k_results: 3              # Example: Number of snippets to retrieve initially
 
-  # Settings for API Runner (example structure)
+  # Settings for Tool Dispatcher (Phase 4)
+  # tools_config:
+  #   # Example: Configuration for specific local tools if needed
+  #   # builtin_weather:
+  #   #   api_key: "YOUR_WEATHER_API_KEY_IF_NEEDED" # If get_weather used an API key
+
+  # MCP Servers for Tool Calling (Phase 4)
+  mcp_servers:
+    - "https://mcp.mycorp.example.com/api/v1" # Example MCP server endpoint
+    # - "https://another.mcp.server/api"
+
+  # Settings for API Runner (example structure - preserved)
   # api_runner_defaults:
   #   openai_api_key: "YOUR_OPENAI_API_KEY_HERE_OR_USE_ENV_VAR"
   #   openai_base_url: "https://api.openai.com/v1"
-
-  # MCP Servers (Phase 4 - placeholder)
-  # mcp_servers:
-  #   - "https://mcp.mycorp.example"
