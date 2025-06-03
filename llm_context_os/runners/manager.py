@@ -1,56 +1,56 @@
 # llm_context_os/runners/manager.py
 import typing as t
-import time # Added for idle tracking
+import time
 
 from .base import BaseRunner
 from .api_runner import APIRunner
 from .llama_cpp_runner import LlamaCppRunner
 from .awq_runner import AWQRunner
 from .exl2_runner import EXL2Runner
+from llm_context_os.caching.kv_cache_manager import KVCacheManager # Added
 
 class ModelManager:
     """
     Manages the loading and retrieval of different model runners.
-    Includes basic idle auto-unload functionality.
+    Includes basic idle auto-unload and KV cache loading/saving functionality.
     """
     def __init__(self):
         self.current_runner: t.Optional[BaseRunner] = None
         self.current_model_type: t.Optional[str] = None
-        self.current_model_identifier: t.Optional[str] = None # Path or name
+        self.current_model_identifier: t.Optional[str] = None
 
         self.idle_unload_sec: t.Optional[int] = None
         self.last_accessed_time: t.Optional[float] = None
 
-        print("ModelManager initialized. No model loaded initially.")
+        self.kv_cache_mgr = KVCacheManager() # Instantiate KVCacheManager
+
+        print("ModelManager initialized.")
+        print(f"  KV Cache Manager using directory: {self.kv_cache_mgr.cache_dir.resolve()}")
+
 
     def load(self,
              model_type: str,
              model_path_or_name: str,
-             idle_unload_sec: t.Optional[int] = None, # New parameter
+             idle_unload_sec: t.Optional[int] = None,
+             default_prefix_text: t.Optional[str] = None, # New parameter
              **kwargs: t.Any) -> None:
         """
-        Loads a model runner based on the specified type and path/name.
-
-        Args:
-            model_type (str): The type of model to load
-                              (e.g., 'api', 'gguf', 'awq', 'exl2').
-            model_path_or_name (str): The path to the model file/directory or
-                                      a model identifier (e.g., repo_id for HF, name for API).
-            idle_unload_sec (t.Optional[int]): If provided, the model will be automatically
-                                               unloaded after this many seconds of inactivity.
-            **kwargs: Additional keyword arguments to pass to the runner's constructor.
+        Loads a model runner, and optionally loads/generates/saves its KV cache for a default prefix.
         """
         print(f"\nAttempting to load model...")
         print(f"  Type: {model_type}")
         print(f"  Path/Name: {model_path_or_name}")
         if idle_unload_sec is not None:
             print(f"  Idle Unload Sec: {idle_unload_sec}")
+        if default_prefix_text:
+            print(f"  Default Prefix Text: '{default_prefix_text[:50]}...'")
         print(f"  Additional args: {kwargs}")
 
         if self.current_runner:
-            self.unload() # Use the new unload method
+            self.unload()
 
         try:
+            # Instantiate the runner
             if model_type.lower() == 'api':
                 api_url = kwargs.pop('api_url', None)
                 api_key = kwargs.pop('api_key', None)
@@ -58,29 +58,49 @@ class ModelManager:
                     print("Error: 'api_url' is required for API runner.")
                     return
                 self.current_runner = APIRunner(model_name=model_path_or_name, api_url=api_url, api_key=api_key, **kwargs)
-
             elif model_type.lower() == 'gguf':
                 self.current_runner = LlamaCppRunner(model_path=model_path_or_name, **kwargs)
-
             elif model_type.lower() == 'awq':
                 self.current_runner = AWQRunner(model_path_or_repo_id=model_path_or_name, **kwargs)
-
             elif model_type.lower() == 'exl2':
                 self.current_runner = EXL2Runner(model_path=model_path_or_name, **kwargs)
-
             else:
                 print(f"Error: Unknown model type '{model_type}'. No model loaded.")
-                self.current_runner = None # Ensure it's None if type is unknown
+                self.current_runner = None
                 return
 
+            # Store model info
             self.current_model_type = model_type.lower()
             self.current_model_identifier = model_path_or_name
             self.idle_unload_sec = idle_unload_sec
-            self.last_accessed_time = time.time() # Set last accessed time on successful load
-            print(f"Successfully loaded {self.current_model_type} model: {self.current_model_identifier}")
+            self.last_accessed_time = time.time()
+            print(f"Successfully instantiated {self.current_model_type} runner for: {self.current_model_identifier}")
+
+            # KV Cache handling for the default_prefix_text
+            if default_prefix_text and self.current_runner:
+                print(f'[ModelManager] Processing KV cache for prefix: "{default_prefix_text[:50]}..."')
+                loaded_cache = self.kv_cache_mgr.load_kv_cache(self.current_model_identifier, default_prefix_text)
+
+                if loaded_cache is not None:
+                    print(f'[ModelManager] Found existing KV cache for prefix. Importing into runner.')
+                    self.current_runner.import_kv_cache(loaded_cache)
+                else:
+                    print(f'[ModelManager] No existing KV cache for prefix. Preloading/generating in runner.')
+                    self.current_runner.preload_kv(default_prefix_text) # Runner populates its internal KV cache
+
+                    exported_cache = self.current_runner.export_kv_cache()
+                    if exported_cache is not None:
+                        print(f'[ModelManager] Exported new KV cache from runner. Saving to disk.')
+                        self.kv_cache_mgr.save_kv_cache(exported_cache, self.current_model_identifier, default_prefix_text)
+                    else:
+                        print(f'[ModelManager] Runner did not provide an exportable KV cache after preload (common for API runners).')
+
+            print(f"Model '{self.current_model_identifier}' fully ready.")
+
 
         except Exception as e:
             print(f"Error during model loading or runner initialization: {e}")
+            # Ensure partial state is cleared
             self.current_runner = None
             self.current_model_type = None
             self.current_model_identifier = None
@@ -88,176 +108,128 @@ class ModelManager:
             self.last_accessed_time = None
 
     def get(self) -> t.Optional[BaseRunner]:
-        """
-        Retrieves the currently loaded model runner.
-        Updates the last_accessed_time if a runner is present.
-        """
         if self.current_runner:
-            print(f"\nRetrieved current runner: {self.current_model_identifier} ({self.current_model_type})")
-            self.last_accessed_time = time.time() # Update access time
+            # print(f"\nRetrieved current runner: {self.current_model_identifier} ({self.current_model_type})") # Less verbose for get
+            self.last_accessed_time = time.time()
             return self.current_runner
         else:
-            print("Error: No model is currently loaded. Call load() first.")
+            # print("Error: No model is currently loaded. Call load() first.") # Less verbose
             return None
 
     def unload(self) -> None:
-        """
-        Unloads the currently active model and resets associated state.
-        """
         if self.current_runner:
-            print(f"Unloading model: {self.current_model_identifier} ({self.current_model_type})")
-            # TODO: Add actual model resource cleanup here (e.g., del self.current_runner.model for HF, exl2; specific unload for llama-cpp)
-            # For placeholder runners, direct deletion is fine.
-            # If runners have specific cleanup methods (e.g., llama_instance.__del__ or similar), call them.
-            if hasattr(self.current_runner, '__del__'): # Basic check, might not be sufficient for all types
+            print(f"\nUnloading model: {self.current_model_identifier} ({self.current_model_type})")
+            if hasattr(self.current_runner, '__del__'):
                 try:
                     self.current_runner.__del__()
                 except Exception as e:
                     print(f"Error during explicit runner __del__: {e}")
         else:
-            print("No model to unload.")
+            # print("No model to unload.") # Less verbose if called when already None
+            pass
 
         self.current_runner = None
         self.current_model_type = None
         self.current_model_identifier = None
         self.idle_unload_sec = None
         self.last_accessed_time = None
-        print("Model unloaded and manager reset.")
+        # print("Model unloaded and manager state reset.") # Less verbose
 
     def check_idle(self) -> bool:
-        """
-        Checks if the current model has been idle for longer than its configured
-        idle_unload_sec. If so, unloads the model.
-
-        Returns:
-            bool: True if the model was unloaded due to idleness, False otherwise.
-        """
         if self.current_runner and \
-           self.idle_unload_sec is not None and \
+           self.idle_unload_sec is not None and self.idle_unload_sec > 0 and \
            self.last_accessed_time is not None:
 
             idle_time = time.time() - self.last_accessed_time
             if idle_time > self.idle_unload_sec:
-                print(f"Model '{self.current_model_identifier}' idle for {idle_time:.2f}s (limit: {self.idle_unload_sec}s), unloading.")
+                print(f"\nModel '{self.current_model_identifier}' idle for {idle_time:.2f}s (limit: {self.idle_unload_sec}s), unloading.")
                 self.unload()
                 return True
         return False
 
 if __name__ == '__main__':
+    # Use a test-specific cache directory for the demo
+    # Note: KVCacheManager constructor will create it.
+    # For repeated runs, you might want to clean this dir before/after.
+    kv_cache_dir_for_demo = "data/kv_cache_manager_demo"
+
+    # Clean up previous demo cache if it exists, for a clean run
+    import shutil
+    if Path(kv_cache_dir_for_demo).exists():
+        shutil.rmtree(kv_cache_dir_for_demo)
+        print(f"Cleaned up old demo cache dir: {kv_cache_dir_for_demo}")
+
     manager = ModelManager()
+    manager.kv_cache_mgr = KVCacheManager(cache_dir=kv_cache_dir_for_demo) # Override for demo
 
-    # Attempt to get runner when none is loaded
-    runner = manager.get()
-    print(f"Runner initially: {runner}")
+    print(f"--- Initial state: Runner loaded? {manager.get() is not None} ---")
 
-    # Load an API runner with idle unload
-    print("\n--- Testing Idle Unload ---")
-    idle_seconds = 2
-    manager.load(
-        model_type='api',
-        model_path_or_name='idle-test-api',
-        api_url='https://dummy.api/v1',
-        idle_unload_sec=idle_seconds
-    )
+    model_id_for_kv_test = "gguf_model_for_kv_test.gguf"
+    common_prefix = "The story of the three little pigs is a classic tale."
 
-    api_runner = manager.get() # Access to update last_accessed_time
-    self.assertIsNotNone(api_runner, "API runner should be loaded.")
-    print(f"API Runner '{api_runner.model_name if api_runner else None}' loaded. Waiting for {idle_seconds + 1} seconds...")
-
-    time.sleep(idle_seconds + 1)
-
-    unloaded = manager.check_idle()
-    self.assertTrue(unloaded, "Model should have been unloaded due to idle timeout.")
-
-    runner_after_idle = manager.get()
-    self.assertIsNone(runner_after_idle, "Runner should be None after idle unload.")
-    print("Idle unload test successful.")
-
-    # Load a GGUF (LlamaCpp) runner
-    print("\n--- Testing GGUF Load (no idle) ---")
+    # --- First Load: Cache should be generated and saved ---
+    print("\n--- First Load: Generating and Saving KV Cache ---")
     manager.load(
         model_type='gguf',
-        model_path_or_name='models/dummy-llama-7b.Q4_K_M.gguf',
-        n_gpu_layers=20,
-        n_ctx=2048
+        model_path_or_name=model_id_for_kv_test,
+        default_prefix_text=common_prefix,
+        n_gpu_layers=0 # Placeholder GGUF param
     )
-    gguf_runner = manager.get()
-    if gguf_runner:
-        gguf_runner.stream("Test stream for GGUF runner", temperature=0.5)
-    self.assertIsNotNone(gguf_runner, "GGUF runner should be loaded.")
-    self.assertIsInstance(gguf_runner, LlamaCppRunner, "Runner should be LlamaCppRunner.")
-
-
-    # Test manual unload
-    print("\n--- Testing Manual Unload ---")
-    self.assertIsNotNone(manager.get(), "Model should be loaded before manual unload.")
-    manager.unload()
-    self.assertIsNone(manager.get(), "Model should be None after manual unload.")
-    print("Manual unload test successful.")
-
-
-    # Attempt to load an unknown model type
-    print("\n--- Testing Unknown Model Type ---")
-    manager.load(model_type='unknown_type', model_path_or_name='some/path')
-    unknown_runner = manager.get()
-    self.assertIsNone(unknown_runner, "Runner should be None after attempting to load unknown type.")
-
-    print("\nModelManager demonstration complete.")
-
-# Need to wrap assertions in a unittest structure or remove for standalone script run
-# For now, replacing self.assertX with print and manual check for __main__
-if __name__ == '__main__':
-    manager = ModelManager()
-
-    runner = manager.get()
-    print(f"Runner initially: {runner is None}")
-
-    print("\n--- Testing Idle Unload ---")
-    idle_seconds = 2
-    manager.load(
-        model_type='api',
-        model_path_or_name='idle-test-api',
-        api_url='https://dummy.api/v1',
-        idle_unload_sec=idle_seconds
-    )
-
-    api_runner_obj = manager.get()
-    print(f"API Runner loaded: {api_runner_obj is not None}")
-    print(f"Waiting for {idle_seconds + 1} seconds for idle check...")
-
-    time.sleep(idle_seconds + 1)
-
-    unloaded = manager.check_idle()
-    print(f"Model unloaded due to idle: {unloaded}")
-
-    runner_after_idle_obj = manager.get()
-    print(f"Runner is None after idle unload: {runner_after_idle_obj is None}")
-    print("Idle unload test presumed successful if above is True.")
-
-    print("\n--- Testing GGUF Load (no idle) ---")
-    manager.load(
-        model_type='gguf',
-        model_path_or_name='models/dummy-llama-7b.Q4_K_M.gguf',
-        n_gpu_layers=20,
-        n_ctx=2048
-    )
-    gguf_runner_obj = manager.get()
-    if gguf_runner_obj:
-        # gguf_runner_obj.stream("Test stream for GGUF runner", temperature=0.5) # Placeholder would print
-        print(f"GGUF runner loaded: {isinstance(gguf_runner_obj, LlamaCppRunner)}")
+    runner1 = manager.get()
+    if runner1:
+        print(f"Runner1 loaded: {type(runner1)}")
+        # Simulate a generation that might use/confirm the preloaded cache
+        runner1.generate(common_prefix + " The first pig built his house of straw.", max_tokens=5)
     else:
-        print("GGUF runner failed to load.")
+        print("Failed to load runner1.")
 
-
-    print("\n--- Testing Manual Unload ---")
-    print(f"Model loaded before manual unload: {manager.get() is not None}")
+    # --- Unload the model ---
+    print("\n--- Unloading the model ---")
     manager.unload()
-    print(f"Model is None after manual unload: {manager.get() is None}")
-    print("Manual unload test presumed successful if above is True.")
+    print(f"Runner after unload: {manager.get() is None}")
 
-    print("\n--- Testing Unknown Model Type ---")
-    manager.load(model_type='unknown_type', model_path_or_name='some/path')
-    unknown_runner_obj = manager.get()
-    print(f"Runner is None after attempting unknown type: {unknown_runner_obj is None}")
+    # --- Second Load: Cache should be loaded from disk ---
+    print("\n--- Second Load: Loading KV Cache from Disk ---")
+    manager.load(
+        model_type='gguf',
+        model_path_or_name=model_id_for_kv_test,
+        default_prefix_text=common_prefix,
+        n_gpu_layers=0
+    )
+    runner2 = manager.get()
+    if runner2:
+        print(f"Runner2 loaded: {type(runner2)}")
+        # Simulate a generation. If KV cache was loaded, runner2 might log it (placeholder runners do).
+        runner2.generate(common_prefix + " The second pig built his house of sticks.", max_tokens=5)
+    else:
+        print("Failed to load runner2.")
 
-    print("\nModelManager demonstration complete.")
+    # --- Test Idle Unload with KV cache ---
+    print("\n--- Testing Idle Unload with KV Cache Model ---")
+    idle_test_model_id = "api_model_for_idle_kv.gguf" # Use API as it doesn't export cache
+    idle_prefix = "This is a system prompt for an idle test."
+    idle_wait_seconds = 1
+
+    manager.load(
+        model_type='api', # API runner does not export cache, so preload won't save.
+        model_path_or_name=idle_test_model_id,
+        api_url="http://dummy.api.kv/v1", # Required for APIRunner
+        default_prefix_text=idle_prefix,
+        idle_unload_sec=idle_wait_seconds
+    )
+    idle_runner = manager.get()
+    if idle_runner:
+        print(f"Idle Runner '{idle_runner.model_name if hasattr(idle_runner, 'model_name') else 'N/A'}' loaded. Waiting for {idle_wait_seconds + 1}s...")
+        time.sleep(idle_wait_seconds + 1)
+        unloaded = manager.check_idle()
+        print(f"Model unloaded due to idle: {unloaded}")
+        print(f"Runner after idle: {manager.get() is None}")
+    else:
+        print("Failed to load idle_runner.")
+
+    print("\nModelManager KV Cache and Idle demo complete.")
+
+    # Optional: Clean up the test cache directory after demo
+    # if Path(kv_cache_dir_for_demo).exists():
+    #     shutil.rmtree(kv_cache_dir_for_demo)
+    #     print(f"Cleaned up demo cache dir: {kv_cache_dir_for_demo}")

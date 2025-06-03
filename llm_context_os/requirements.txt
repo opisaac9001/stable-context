@@ -6,6 +6,7 @@ uvicorn[standard] # Includes pydantic, starlette, and standard uvicorn features
 pydantic
 
 # --- Other Core / General Dependencies (add as identified) ---
+# numpy         # For numerical operations, mock tensor data, and potential real tensor handling
 # sse-starlette # For streaming if needed beyond basic WebSocket/HTTP
 # python-dotenv # For managing environment variables
 # PyYAML        # For config file loading
