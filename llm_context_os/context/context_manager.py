@@ -16,10 +16,12 @@ class ContextManager:
         """
         Formats a list of messages into a single string.
         Each message is a dict e.g. {"r": role, "c": content, "image_path": path_or_none}.
+        The generic "role: content" formatting is currently used for all roles,
+        including special ones like 'tool_result', 'retrieved_context', 'retrieved_pdf_chunk'.
 
         Future enhancement: Could apply specific formatting for different roles
-        or structured content (like function calls/results, images) if the
-        underlying LLM requires a more structured format (e.g., ChatML, Llama3 format).
+        or structured content (like function calls/results, images, retrieved snippets)
+        if the underlying LLM requires a more structured format (e.g., ChatML, Llama3 format).
         """
         if not messages_to_format:
             return ""
@@ -67,6 +69,8 @@ class ContextManager:
             window_messages = self._messages[current_start_idx:]
 
         all_messages_to_format = (extra_messages or []) + window_messages
+        # Store for debugging/testing what actually went into prompt formatting
+        self._messages_for_prompt_build_debug: t.List[t.Dict[str, t.Any]] = all_messages_to_format
         current_messages_formatted = self._fmt(all_messages_to_format)
 
         if not self.system_prompt:
@@ -170,4 +174,19 @@ if __name__ == '__main__':
     print(f"\nAfter jump_to(0) and _fit:\n{manager.build_prompt()}")
     print(f"Manager window starts at: {manager._start}") # Expected: 4
 
-    print("\nContextManager multimodal demo complete.")
+    print("\n--- Testing prompt building with 'extra_messages' (e.g., RAG snippets) ---")
+    rag_snippets = [
+        {"r": "retrieved_pdf_chunk", "c": "Climate change refers to long-term shifts in temperatures and weather patterns. (Source: report.pdf, Page: 1)"},
+        {"r": "retrieved_context", "c": "User previously asked about mitigation strategies."}
+    ]
+    # Build prompt using current window (which is just the last message due to auto_scroll and fit)
+    # plus the extra RAG snippets.
+    # Current window (from _start=4): assistant: Okay, I see that text message following the image.
+    prompt_with_rag = manager.build_prompt(extra_messages=rag_snippets)
+    print(f"\nPrompt with RAG snippets (current window is last msg):\n{prompt_with_rag}")
+    # Expected: System prompt, then RAG snippets, then the last message from history.
+    assert "retrieved_pdf_chunk: Climate change refers to long-term shifts" in prompt_with_rag
+    assert "retrieved_context: User previously asked about mitigation strategies." in prompt_with_rag
+    assert "assistant: Okay, I see that text message following the image." in prompt_with_rag
+
+    print("\nContextManager multimodal and RAG snippet demo complete.")

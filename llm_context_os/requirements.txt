@@ -4,6 +4,7 @@
 fastapi
 uvicorn[standard] # Includes pydantic, starlette, and standard uvicorn features
 pydantic
+python-multipart # For FastAPI File Uploads (used in /upload_document)
 
 # --- Other Core / General Dependencies (add as identified) ---
 # numpy         # For numerical operations, mock tensor data, and potential real tensor handling
@@ -42,8 +43,13 @@ pydantic
 # bitsandbytes # Often used with PEFT for quantization during training/loading
 
 # --- Retriever (RAG - Phase 4) ---
-# sentence-transformers
-# chromadb
+# sentence-transformers # For embedding text
+# chromadb              # For vector storage and similarity search
+# For PDF Processing (in PdfRetriever)
+# pypdf2                # For PDF text extraction
+# pymupdf               # Alternative for PDF text extraction, often faster/more robust
+# langchain             # For text splitting and document loading (optional, can use custom)
+
 
 # --- Tool-Calling (Phase 4) ---
 # For MCP Adapters
