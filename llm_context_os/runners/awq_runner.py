@@ -3,9 +3,6 @@ import typing as t
 from .base import BaseRunner
 
 class AWQRunner(BaseRunner):
-    """
-    A placeholder runner for AWQ quantized models using Hugging Face Transformers.
-    """
     def __init__(self,
                  model_path_or_repo_id: str,
                  device: str = "cuda",
@@ -23,27 +20,36 @@ class AWQRunner(BaseRunner):
         # ... (rest of init prints)
         print("  (Note: Actual Transformers model and tokenizer not loaded in this placeholder)")
 
-    def generate(self, prompt: str, **kwargs: t.Any) -> str:
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> str:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Generating ---")
         print(f"Prompt: {prompt[:100]}...")
+        if image_paths:
+            print(f"  Image Paths: {image_paths} (Note: AWQRunner placeholder needs multimodal model like LLaVA for actual image processing with Transformers)")
         if self.active_loras: print(f"  Active LoRAs: {list(self.active_loras.keys())}")
         if self.is_merged: print("  (Model is LoRA-merged)")
-        # ... (rest of generate logic)
+
         response = f"[AWQ Response from {self.model_path_or_repo_id} to: {prompt[:50]}...]"
+        if image_paths:
+            response += f" (images: {', '.join(image_paths)})"
         self.mock_kv_cache_data = {"status": "populated_after_awq_generate", "length": len(prompt)}
         return response
 
-    def stream(self, prompt: str, **kwargs: t.Any) -> t.Generator[str, None, None]:
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[str, None, None]:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Streaming ---")
         print(f"Prompt: {prompt[:100]}...")
+        if image_paths:
+            print(f"  Image Paths: {image_paths} (Note: AWQRunner placeholder needs multimodal model for actual image processing with Transformers)")
         if self.active_loras: print(f"  Active LoRAs: {list(self.active_loras.keys())}")
         if self.is_merged: print("  (Model is LoRA-merged)")
-        # ... (rest of stream logic)
+
         yield f"[AWQ Chunk 1 for '{prompt[:30]}...'] "
+        if image_paths:
+            yield f"[AWQ Images seen: {len(image_paths)}] "
         self.mock_kv_cache_data = {"status": "populated_after_awq_stream", "length": len(prompt) + 20}
         yield f"[AWQ End of Stream]"
         print("Streaming complete.")
 
+    # --- KV Cache and LoRA methods remain the same ---
     def preload_kv(self, prompt: str, **kwargs: t.Any) -> None:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Preloading KV Cache ---")
         print(f"Prompt for KV: {prompt[:100]}...")
@@ -66,23 +72,20 @@ class AWQRunner(BaseRunner):
         else:
             print("  (No cache data provided to import)")
 
-    # --- LoRA Adapter Methods (Placeholders) ---
     def load_lora_adapter(self, adapter_id: str, adapter_path: str, **kwargs) -> bool:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Loading LoRA Adapter ---")
         print(f"  ID: {adapter_id}, Path: {adapter_path}, Params: {kwargs}")
-        # Real implementation: self.model.load_adapter(adapter_path, adapter_name=adapter_id, **kwargs)
         if adapter_id in self.active_loras:
             print(f"  Warning: LoRA adapter '{adapter_id}' already loaded.")
             return False
         self.active_loras[adapter_id] = {"path": adapter_path, **kwargs}
         print(f"  LoRA adapter '{adapter_id}' loaded successfully (placeholder).")
-        self.is_merged = False # If model was merged, loading new adapter might imply unmerged state or selective activation
+        self.is_merged = False
         return True
 
     def unload_lora_adapter(self, adapter_id: str, **kwargs) -> bool:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Unloading LoRA Adapter ---")
         print(f"  ID: {adapter_id}, Params: {kwargs}")
-        # Real implementation: self.model.delete_adapter(adapter_id) or manage adapter sets
         if adapter_id in self.active_loras:
             del self.active_loras[adapter_id]
             print(f"  LoRA adapter '{adapter_id}' unloaded successfully (placeholder).")
@@ -93,7 +96,6 @@ class AWQRunner(BaseRunner):
 
     def get_active_lora_adapters(self) -> t.List[str]:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Getting Active LoRA Adapters ---")
-        # Real: return list(self.model.active_adapters) if available, or manage manually
         adapter_ids = list(self.active_loras.keys())
         print(f"  Active adapters (placeholder): {adapter_ids}")
         return adapter_ids
@@ -101,8 +103,6 @@ class AWQRunner(BaseRunner):
     def merge_lora_adapters(self, adapter_ids: t.List[str], **kwargs) -> bool:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Merging LoRA Adapters ---")
         print(f"  IDs to merge: {adapter_ids}, Params: {kwargs}")
-        # Real: Iterate adapter_ids, call self.model.merge_adapter(adapter_id, **kwargs_for_merge)
-        # Or self.model.merge_and_unload()
         merged_any = False
         for aid in adapter_ids:
             if aid in self.active_loras:
@@ -120,7 +120,6 @@ class AWQRunner(BaseRunner):
     def unmerge_lora_adapters(self, **kwargs) -> bool:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Unmerging LoRA Adapters ---")
         print(f"  Params: {kwargs}")
-        # Real: self.model.unmerge_adapter(**kwargs) if available
         if not self.is_merged:
             print("  Model is not LoRA-merged. Nothing to unmerge.")
             return False
@@ -131,28 +130,12 @@ class AWQRunner(BaseRunner):
 if __name__ == '__main__':
     dummy_awq_model_id = "quantized/dummy-awq-model-7b"
     awq_model_runner = AWQRunner(model_path_or_repo_id=dummy_awq_model_id, device="cuda:0")
+    example_image_paths = ["/path/to/image_x.gif"]
 
-    # ... (existing generate, stream, KV cache demos) ...
-    awq_model_runner.generate("Test generate for AWQ.", temperature=0.1)
+    awq_model_runner.generate("Test generate for AWQ with image.", image_paths=example_image_paths, temperature=0.1)
 
-    print("\n--- LoRA Methods Demo for AWQRunner ---")
-    awq_lora1_id = "awq_lora_A"
-    awq_model_runner.load_lora_adapter(awq_lora1_id, "/path/to/awq_lora_A", lora_alpha=16)
+    print("\nStreaming with image for AWQ:")
+    stream_output_awq = list(awq_model_runner.stream("Test stream for AWQ with image.", image_paths=example_image_paths))
+    print(f"Stream output AWQ: {stream_output_awq}")
 
-    awq_lora2_id = "awq_lora_B"
-    awq_model_runner.load_lora_adapter(awq_lora2_id, "hub_user/awq_lora_B_repo")
-
-    print(f"Active LoRAs: {awq_model_runner.get_active_lora_adapters()}")
-    awq_model_runner.generate("Prompt with AWQ LoRAs active.")
-
-    awq_model_runner.merge_lora_adapters(adapter_ids=[awq_lora1_id, awq_lora2_id])
-    print(f"Active LoRAs after merge: {awq_model_runner.get_active_lora_adapters()}")
-    awq_model_runner.generate("Prompt after merging AWQ LoRAs.")
-
-    awq_model_runner.unmerge_lora_adapters()
-    print(f"Model merged status: {awq_model_runner.is_merged}")
-
-    awq_model_runner.unload_lora_adapter(awq_lora1_id) # Should fail as it was merged and removed
-    awq_model_runner.unload_lora_adapter(awq_lora2_id) # Should fail
-
-    print("\nAWQRunner placeholder demonstration complete.")
+    print("\nAWQRunner placeholder demonstration complete (including multimodal calls).")

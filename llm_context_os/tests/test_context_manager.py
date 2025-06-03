@@ -24,9 +24,9 @@ class TestContextManager(unittest.TestCase):
 
     def test_add_message_simple(self):
         cm = ContextManager(self.system_prompt, self.mock_tokenizer, max_tokens=100)
-        cm.add("user", "Hello") # "user: Hello\n" is 12 chars (role: content\n)
+        cm.add("user", "Hello") # image_path defaults to None
         self.assertEqual(len(cm._messages), 1)
-        self.assertEqual(cm._messages[0], {"r": "user", "c": "Hello"})
+        self.assertEqual(cm._messages[0], {"r": "user", "c": "Hello", "image_path": None})
         # _auto_scroll sets _start to len - 1, so 0.
         # _fit is called. Prompt: "SYSTEM:\nuser: Hello\n" (7+1+12 = 20 chars). Fits. _start remains 0.
         self.assertEqual(cm._start, 0)
@@ -264,6 +264,52 @@ class TestContextManager(unittest.TestCase):
         # 2. _start=1. Prompt (window=[m2]) tokens=19. <25. Loop ends. _start is 1.
         self.assertEqual(cm._start, 1) # item_A got pushed out of context window
         self.assertEqual(cm.build_prompt(), self.system_prompt + "\na: item_B\n")
+
+    def test_add_and_format_with_image_path(self):
+        cm = ContextManager("SysPrompt:", self.mock_tokenizer, max_tokens=200)
+        cm.add(role="user", content="Look at this picture of a cat.", image_path="path/to/cat.jpg")
+        cm.add(role="user", content="And this one of a dog.", image_path="path/to/dog.png")
+        cm.add(role="assistant", content="Interesting pictures!")
+        cm.add(role="user", content="What was the first picture about?")
+
+        # Current _auto_scroll behavior makes window only contain the last message if it fits.
+        # To test full formatting, we jump_to(0) to include all history.
+        cm.jump_to(0)
+
+        prompt = cm.build_prompt()
+        # print(f"\nPrompt for image test:\n{prompt}") # For debugging
+
+        # Check for presence of image placeholders and text in order
+        self.assertIn("SysPrompt:\n", prompt)
+        self.assertIn("user: [IMAGE: path/to/cat.jpg] Look at this picture of a cat.\n", prompt)
+        self.assertIn("user: [IMAGE: path/to/dog.png] And this one of a dog.\n", prompt)
+        self.assertIn("assistant: Interesting pictures!\n", prompt)
+        self.assertIn("user: What was the first picture about?\n", prompt)
+
+        # Test _fit logic with image path lengths
+        # SysPrompt: (10) + NL (1) = 11
+        # msg0: "user: [IMAGE: path/to/cat.jpg] Look at this picture of a cat.\n"
+        #       (6 + 28 + 1 + 30 + 1 = 66)
+        # msg1: "user: [IMAGE: path/to/dog.png] And this one of a dog.\n"
+        #       (6 + 28 + 1 + 23 + 1 = 59)
+        # msg2: "assistant: Interesting pictures!\n" (10 + 20 + 1 = 31)
+        # msg3: "user: What was the first picture about?\n" (6 + 33 + 1 = 40)
+        # Total with all messages from _start=0: 11 + 66 + 59 + 31 + 40 = 207
+
+        cm.max_tokens = 150 # Set a limit that will force truncation
+        cm.jump_to(0) # This will trigger _fit
+
+        # Expected: msg0 (cat.jpg) should be dropped.
+        # Window: msg1, msg2, msg3. Tokens: 11 + 59 + 31 + 40 = 141. This fits.
+        # So, _start should become 1.
+        self.assertEqual(cm._start, 1, "ContextManager _fit did not correctly adjust _start with image paths.")
+
+        prompt_after_fit = cm.build_prompt()
+        self.assertNotIn("[IMAGE: path/to/cat.jpg]", prompt_after_fit)
+        self.assertIn("[IMAGE: path/to/dog.png]", prompt_after_fit)
+        self.assertIn("Interesting pictures!", prompt_after_fit)
+        self.assertIn("What was the first picture about?", prompt_after_fit)
+        self.assertTrue(self.mock_tokenizer.count_tokens(prompt_after_fit) <= 150)
 
 
 if __name__ == '__main__':

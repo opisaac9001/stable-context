@@ -3,31 +3,36 @@ import typing as t
 from .base import BaseRunner
 
 class APIRunner(BaseRunner):
-    """
-    A placeholder runner for models accessed via an API (OpenAI-style).
-    """
     def __init__(self, model_name: str, api_url: str, api_key: t.Optional[str] = None, **kwargs: t.Any):
         self.model_name = model_name
         self.api_url = api_url
         self.api_key = api_key
-        # Note: No self.active_loras here as LoRA management is typically server-side for APIs
         print(f"APIRunner initialized for model '{self.model_name}' at URL: {self.api_url}")
         if self.api_key:
             print(f"API Key: {'*' * (len(self.api_key) - 4) + self.api_key[-4:] if len(self.api_key) > 4 else '****'}")
 
-    def generate(self, prompt: str, **kwargs: t.Any) -> str:
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> str:
         print(f"\n--- APIRunner ({self.model_name}) Generating ---")
         print(f"Target URL: {self.api_url}")
+        print(f"Prompt: {prompt}")
+        if image_paths:
+            print(f"  Image Paths: {image_paths} (Note: APIRunner placeholder doesn't process images with prompt text currently)")
         response = f"[API Response from {self.model_name} to: {prompt[:49]}...]"
+        if image_paths:
+            response += f" (images: {', '.join(image_paths)})"
         print(f"Full Response: {response}")
         return response
 
-    def stream(self, prompt: str, **kwargs: t.Any) -> t.Generator[str, None, None]:
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[str, None, None]:
         print(f"\n--- APIRunner ({self.model_name}) Streaming ---")
         print(f"Target URL: {self.api_url}")
         print(f"Prompt: {prompt}")
+        if image_paths:
+            print(f"  Image Paths: {image_paths} (Note: APIRunner placeholder doesn't process images with stream text currently)")
         print(f"Streaming Config: {kwargs}")
         yield f"[Chunk 1 from {self.model_name} for '{prompt[:25]}...'] "
+        if image_paths:
+            yield f"[Images received: {len(image_paths)}] "
         yield f"[Chunk 2 from {self.model_name}, params: {kwargs.get('temperature', 'default_temp')}] "
         yield f"[End of stream from {self.model_name}]"
         print("Streaming complete.")
@@ -49,33 +54,28 @@ class APIRunner(BaseRunner):
         if cache_data:
             print(f"  (Received cache_data of type: {type(cache_data)}, but it will not be used.)")
 
-    # --- LoRA Adapter Methods (Placeholders) ---
     def load_lora_adapter(self, adapter_id: str, adapter_path: str, **kwargs) -> bool:
         print(f"\n--- APIRunner ({self.model_name}) Loading LoRA Adapter ---")
-        print(f"  ID: {adapter_id}, Path: {adapter_path}, Params: {kwargs}")
         print("  LoRA management is typically server-side for API-based models. This call is a no-op for APIRunner.")
-        return False # Or True if the API supports some form of LoRA selection parameter
+        return False
 
     def unload_lora_adapter(self, adapter_id: str, **kwargs) -> bool:
         print(f"\n--- APIRunner ({self.model_name}) Unloading LoRA Adapter ---")
-        print(f"  ID: {adapter_id}, Params: {kwargs}")
         print("  LoRA management is typically server-side for API-based models. This call is a no-op for APIRunner.")
         return False
 
     def get_active_lora_adapters(self) -> t.List[str]:
         print(f"\n--- APIRunner ({self.model_name}) Getting Active LoRA Adapters ---")
-        print("  APIRunner does not manage LoRA adapters on the client-side. Assuming server handles this.")
+        print("  APIRunner does not manage LoRA adapters on the client-side.")
         return []
 
     def merge_lora_adapters(self, adapter_ids: t.List[str], **kwargs) -> bool:
         print(f"\n--- APIRunner ({self.model_name}) Merging LoRA Adapters ---")
-        print(f"  IDs to merge: {adapter_ids}, Params: {kwargs}")
         print("  Merging LoRAs is a server-side operation for API-based models. This call is a no-op for APIRunner.")
         return False
 
     def unmerge_lora_adapters(self, **kwargs) -> bool:
         print(f"\n--- APIRunner ({self.model_name}) Unmerging LoRA Adapters ---")
-        print(f"  Params: {kwargs}")
         print("  Unmerging LoRAs is a server-side operation for API-based models. This call is a no-op for APIRunner.")
         return False
 
@@ -85,24 +85,17 @@ if __name__ == '__main__':
     dummy_api_key = "sk-dummy_key_for_testing_1234"
     api_model = APIRunner(model_name="gpt-dummy-3.5", api_url=dummy_api_url, api_key=dummy_api_key)
 
-    # ... (existing generate, stream, KV cache demos) ...
-    response_text = api_model.generate("Test generate.", temperature=0.1)
+    generation_params = {"temperature": 0.8, "max_tokens": 100}
+    example_image_paths = ["/path/to/image1.jpg", "/path/to/image2.png"]
+
+    response_text = api_model.generate("Describe the weather and these images.", image_paths=example_image_paths, **generation_params)
     print(f"Generate call returned: '{response_text}'")
 
-    print("\n--- LoRA Methods Demo for APIRunner ---")
-    load_success = api_model.load_lora_adapter("style_transfer_lora", "/path/to/style_lora", alpha=0.8)
-    print(f"Load LoRA success: {load_success}")
-
-    active_loras = api_model.get_active_lora_adapters()
-    print(f"Active LoRAs: {active_loras}")
-
-    unload_success = api_model.unload_lora_adapter("style_transfer_lora")
-    print(f"Unload LoRA success: {unload_success}")
-
-    merge_success = api_model.merge_lora_adapters(["style_transfer_lora"], density=0.9)
-    print(f"Merge LoRAs success: {merge_success}")
-
-    unmerge_success = api_model.unmerge_lora_adapters()
-    print(f"Unmerge LoRAs success: {unmerge_success}")
+    print("\nCollecting stream from API Runner:")
+    full_api_streamed_response = []
+    for chunk in api_model.stream("Tell me a short story about these pictures.", image_paths=example_image_paths, **generation_params):
+        print(f"Received API chunk: '{chunk}'")
+        full_api_streamed_response.append(chunk)
+    print(f"Full API streamed response: {''.join(full_api_streamed_response)}")
 
     print("\nAPIRunner placeholder demonstration complete.")

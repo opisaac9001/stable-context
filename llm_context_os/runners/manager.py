@@ -11,12 +11,13 @@ from .awq_runner import AWQRunner
 from .exl2_runner import EXL2Runner
 from .speculative_runner import SpeculativeRunner
 from .vllm_runner import VLLMRunner
+from .llava_cpp_runner import LlavaCppRunner # Added
 from llm_context_os.caching.kv_cache_manager import KVCacheManager
 
 class ModelManager:
     """
     Manages the loading and retrieval of different model runners.
-    Includes basic idle auto-unload, KV cache, and LoRA management functionality.
+    Includes basic idle auto-unload and KV cache loading/saving functionality.
     """
     def __init__(self):
         self.current_runner: t.Optional[BaseRunner] = None
@@ -38,7 +39,15 @@ class ModelManager:
              idle_unload_sec: t.Optional[int] = None,
              default_prefix_text: t.Optional[str] = None,
              **kwargs: t.Any) -> None:
-        # ... (load method remains the same as the last version) ...
+        """
+        Loads a model runner.
+        **kwargs may include:
+          - For 'api': api_url (required), api_key (optional)
+          - For 'vllm': api_url (optional), api_key (optional)
+          - For 'speculative': draft_runner (BaseRunner, required), target_runner (BaseRunner, required), speculative_k (int, optional)
+          - For 'llava_cpp': mmproj_path (str, required)
+          - Common runner params like n_gpu_layers, n_ctx, etc. for relevant local model runners.
+        """
         print(f"\nAttempting to load model...")
         print(f"  Type: {model_type}")
         print(f"  Path/Name/ID: {model_path_or_name}")
@@ -79,16 +88,27 @@ class ModelManager:
                 api_url = kwargs.pop('api_url', "http://localhost:8000")
                 api_key = kwargs.pop('api_key', None)
                 runner_to_load = VLLMRunner(model_name=model_path_or_name, api_url=api_url, api_key=api_key, **kwargs)
+            elif mt_lower == 'llava_cpp': # Added LlavaCppRunner
+                mmproj_path = kwargs.pop('mmproj_path', None)
+                if not mmproj_path:
+                    print("Error: 'mmproj_path' is required for LlavaCppRunner.")
+                    return
+                runner_to_load = LlavaCppRunner(model_path=model_path_or_name, mmproj_path=mmproj_path, **kwargs)
             elif mt_lower == 'speculative':
                 draft_runner = kwargs.get('draft_runner')
                 target_runner = kwargs.get('target_runner')
                 speculative_k = kwargs.get('speculative_k', 5)
 
                 if isinstance(draft_runner, BaseRunner) and isinstance(target_runner, BaseRunner):
+                    # Pop them from kwargs so they are not passed down again if SpeculativeRunner uses **kwargs for super()
+                    kwargs.pop('draft_runner', None)
+                    kwargs.pop('target_runner', None)
+                    kwargs.pop('speculative_k', None)
                     runner_to_load = SpeculativeRunner(
                         draft_runner=draft_runner,
                         target_runner=target_runner,
-                        speculative_k=speculative_k
+                        speculative_k=speculative_k,
+                        **kwargs # Pass remaining kwargs to SpeculativeRunner's base if any
                     )
                 else:
                     print("Error: SpeculativeRunner requires pre-instantiated 'draft_runner' and 'target_runner' (BaseRunner instances) in parameters.")
@@ -100,24 +120,30 @@ class ModelManager:
             self.current_runner = runner_to_load
             self.current_model_type = mt_lower
 
+            # Construct a meaningful identifier
             if mt_lower == 'speculative' and isinstance(self.current_runner, SpeculativeRunner):
                  self.current_model_identifier = (
                     f"speculative(draft={type(self.current_runner.draft_runner).__name__},"
                     f"target={type(self.current_runner.target_runner).__name__})"
                     f"@{model_path_or_name}"
                 )
-            elif mt_lower == 'vllm' and hasattr(self.current_runner, 'api_url'):
-                self.current_model_identifier = f'vllm_model({model_path_or_name} @ {self.current_runner.api_url})'
-            else:
+            elif mt_lower == 'vllm' and hasattr(self.current_runner, 'api_url'): # VLLMRunner has api_url
+                self.current_model_identifier = f'vllm({model_path_or_name} @ {self.current_runner.api_url})'
+            elif mt_lower == 'api' and hasattr(self.current_runner, 'api_url'): # APIRunner has api_url
+                 self.current_model_identifier = f'api({model_path_or_name} @ {self.current_runner.api_url})'
+            elif mt_lower == 'llava_cpp' and hasattr(self.current_runner, 'mmproj_path'): # LlavaCppRunner
+                 self.current_model_identifier = f'llava_cpp({model_path_or_name} + {self.current_runner.mmproj_path})'
+            else: # For GGUF, AWQ, EXL2, model_path_or_name is usually sufficient
                 self.current_model_identifier = model_path_or_name
 
             self.idle_unload_sec = idle_unload_sec
             self.last_accessed_time = time.time()
             print(f"Successfully instantiated {self.current_model_type} runner for: {self.current_model_identifier}")
 
+            # KV Cache handling
             if default_prefix_text and self.current_runner:
                 print(f'[ModelManager] Processing KV cache for prefix: "{default_prefix_text[:50]}..." for model {self.current_model_identifier}')
-                cache_id = self.current_model_identifier
+                cache_id = self.current_model_identifier # Default cache ID
                 if mt_lower == 'speculative' and isinstance(self.current_runner, SpeculativeRunner):
                     target = self.current_runner.target_runner
                     if hasattr(target, 'model_path_or_repo_id'): cache_id = target.model_path_or_repo_id
@@ -177,13 +203,12 @@ class ModelManager:
                 return True
         return False
 
-    # --- LoRA Management Methods ---
     def load_lora_on_current_runner(self, adapter_id: str, adapter_path: str, **kwargs) -> bool:
         print(f"[ModelManager] Attempting to load LoRA '{adapter_id}' from '{adapter_path}' onto current runner.")
         if not self.current_runner:
             print("[ModelManager] Error: No model currently loaded. Cannot load LoRA.")
             return False
-        self.last_accessed_time = time.time() # Consider LoRA load an access
+        self.last_accessed_time = time.time()
         return self.current_runner.load_lora_adapter(adapter_id, adapter_path, **kwargs)
 
     def unload_lora_on_current_runner(self, adapter_id: str, **kwargs) -> bool:
@@ -230,59 +255,47 @@ if __name__ == '__main__':
 
     print(f"--- Initial state: Runner loaded? {manager.get() is not None} ---")
 
-    # --- Demonstrate LoRA Management with a compatible runner (e.g., LlamaCppRunner placeholder) ---
-    print("\n--- Loading LlamaCppRunner for LoRA Demo ---")
-    gguf_model_path = "dummy-lora-test-model.gguf"
+    # --- Demonstrate LlavaCppRunner Loading ---
+    print("\n--- Loading LlavaCppRunner ---")
+    llava_model_file = "dummy_llava_model.gguf"
+    llava_mmproj_file = "dummy_llava_mmproj.gguf"
     manager.load(
-        model_type='gguf',
-        model_path_or_name=gguf_model_path,
-        n_gpu_layers=0 # Example kwarg for LlamaCppRunner
+        model_type='llava_cpp',
+        model_path_or_name=llava_model_file,
+        mmproj_path=llava_mmproj_file, # Required kwarg for llava_cpp
+        n_gpu_layers=10 # Example other kwarg
     )
-
-    current_runner = manager.get()
-    if current_runner:
-        print(f"Runner for LoRA demo: {type(current_runner).__name__}")
-
-        lora_id1 = "style_adapter_1"
-        lora_path1 = "/path/to/style_adapter_1"
-        print(f"\nLoading LoRA: {lora_id1}")
-        load_ok = manager.load_lora_on_current_runner(lora_id1, lora_path1, alpha=0.7)
-        print(f"LoRA load status: {load_ok}")
-
-        active_loras = manager.get_active_loras_on_current_runner()
-        print(f"Active LoRAs: {active_loras}")
-        assert lora_id1 in active_loras if load_ok else lora_id1 not in active_loras
-
-        current_runner.generate("Test prompt with LoRA loaded.", max_tokens=5)
-
-        print(f"\nMerging LoRAs: {[lora_id1]}")
-        merge_ok = manager.merge_loras_on_current_runner([lora_id1])
-        print(f"LoRA merge status: {merge_ok}")
-        if merge_ok:
-             active_loras_after_merge = manager.get_active_loras_on_current_runner()
-             print(f"Active LoRAs after merge: {active_loras_after_merge}")
-             assert lora_id1 not in active_loras_after_merge # Assuming merge consumes it
-
-        current_runner.generate("Test prompt after LoRA merge.", max_tokens=5)
-
-        print(f"\nUnmerging LoRAs")
-        unmerge_ok = manager.unmerge_loras_on_current_runner()
-        print(f"LoRA unmerge status: {unmerge_ok}")
-
-        current_runner.generate("Test prompt after LoRA unmerge.", max_tokens=5)
-
-        print(f"\nUnloading LoRA: {lora_id1}") # Might fail if merge consumed it and unmerge doesn't restore
-        unload_ok = manager.unload_lora_on_current_runner(lora_id1)
-        print(f"LoRA unload status: {unload_ok}")
-        active_loras_final = manager.get_active_loras_on_current_runner()
-        print(f"Final active LoRAs: {active_loras_final}")
-        assert lora_id1 not in active_loras_final
-
+    llava_runner = manager.get()
+    if llava_runner:
+        print(f"LlavaCppRunner loaded: {isinstance(llava_runner, LlavaCppRunner)}")
+        print(f"  LlavaCppRunner ID: {manager.current_model_identifier}")
+        llava_runner.generate("Describe this image.", image_paths=["/path/to/dummy_image.jpg"], max_new_tokens=5)
     else:
-        print("Failed to load GGUF runner for LoRA demo.")
+        print(f"Failed to load LlavaCppRunner.")
+    manager.unload()
 
-    print("\nModelManager LoRA demo complete.")
 
-    if kv_cache_dir_for_demo.exists(): # Cleanup
+    # --- Demonstrate vLLM Runner Loading (as before) ---
+    print("\n--- Loading vLLM Runner ---")
+    # ... (vLLM demo code from previous version can be here) ...
+    vllm_model_id = "Mistral-7B-Instruct-v0.1-vLLM"
+    manager.load(model_type='vllm',model_path_or_name=vllm_model_id, api_url="http://localhost:2345/v1")
+    vllm_runner = manager.get()
+    if vllm_runner: vllm_runner.generate("Test vLLM.")
+    manager.unload()
+
+    # --- Demonstrate Speculative Runner Loading (as before) ---
+    print("\n--- Loading Speculative Runner ---")
+    # ... (Speculative demo code from previous version can be here) ...
+    draft_r = APIRunner(model_name="d", api_url="http://d")
+    target_r = LlamaCppRunner(model_path="t.gguf")
+    manager.load(model_type='speculative', model_path_or_name="s_conf", draft_runner=draft_r, target_runner=target_r)
+    spec_r = manager.get()
+    if spec_r: spec_r.generate("Test Speculative.")
+    manager.unload()
+
+    print("\nModelManager full demonstration complete.")
+
+    if kv_cache_dir_for_demo.exists():
         shutil.rmtree(kv_cache_dir_for_demo)
         print(f"Cleaned up demo cache dir: {kv_cache_dir_for_demo}")

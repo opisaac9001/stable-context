@@ -3,9 +3,6 @@ import typing as t
 from .base import BaseRunner
 
 class LlamaCppRunner(BaseRunner):
-    """
-    A placeholder runner for GGUF models using llama-cpp-python.
-    """
     def __init__(self,
                  model_path: str,
                  n_gpu_layers: int = 0,
@@ -22,34 +19,45 @@ class LlamaCppRunner(BaseRunner):
         self.verbose = verbose
         self.extra_llama_params = kwargs
         self.mock_kv_cache_data: t.Optional[t.Any] = None
-        self.active_loras: t.Dict[str, t.Dict[str, t.Any]] = {} # adapter_id: {path: ..., params...}
-        self.is_merged: bool = False # Simulates if LoRAs are merged
+        self.active_loras: t.Dict[str, t.Dict[str, t.Any]] = {}
+        self.is_merged: bool = False
 
         print(f"LlamaCppRunner initialized for model path: {self.model_path}")
-        # ... (rest of init prints)
+        print(f"  n_gpu_layers: {self.n_gpu_layers}, n_ctx: {self.n_ctx}, seed: {self.seed}, verbose: {self.verbose}")
+        # ... (other init prints)
         print("  (Note: Actual Llama instance not created in this placeholder)")
 
-    def generate(self, prompt: str, **kwargs: t.Any) -> str:
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> str:
         print(f"\n--- LlamaCppRunner ({self.model_path.split('/')[-1]}) Generating ---")
-        print(f"Prompt: {prompt[:100]}...") # Print shorter prompt
+        print(f"Prompt: {prompt[:100]}...")
+        if image_paths:
+            print(f"  Image Paths: {image_paths} (Note: LlamaCppRunner placeholder needs multimodal model like LLaVA for actual image processing)")
         # ... (rest of generate logic)
         if self.active_loras: print(f"  Active LoRAs: {list(self.active_loras.keys())}")
         if self.is_merged: print("  (Model is LoRA-merged)")
+
         response = f"[LlamaCpp Response from {self.model_path.split('/')[-1]} to: {prompt[:50]}...]"
+        if image_paths:
+            response += f" (images: {', '.join(image_paths)})"
         self.mock_kv_cache_data = {"status": "populated_after_generate", "prompt_processed": prompt[:20]}
         return response
 
-    def stream(self, prompt: str, **kwargs: t.Any) -> t.Generator[str, None, None]:
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[str, None, None]:
         print(f"\n--- LlamaCppRunner ({self.model_path.split('/')[-1]}) Streaming ---")
         print(f"Prompt: {prompt[:100]}...")
+        if image_paths:
+            print(f"  Image Paths: {image_paths} (Note: LlamaCppRunner placeholder needs multimodal model for actual image processing)")
         if self.active_loras: print(f"  Active LoRAs: {list(self.active_loras.keys())}")
         if self.is_merged: print("  (Model is LoRA-merged)")
-        # ... (rest of stream logic)
+
         yield f"[LlamaCpp Chunk 1 for '{prompt[:30]}...'] "
+        if image_paths:
+            yield f"[Images seen: {len(image_paths)}] "
         self.mock_kv_cache_data = {"status": "populated_after_stream", "prompt_processed": prompt[:30]}
         yield f"[LlamaCpp End of Stream]"
         print("Streaming complete.")
 
+    # --- KV Cache and LoRA methods remain the same ---
     def preload_kv(self, prompt: str, **kwargs: t.Any) -> None:
         print(f"\n--- LlamaCppRunner ({self.model_path.split('/')[-1]}) Preloading KV Cache ---")
         print(f"Prompt for KV: {prompt[:100]}...")
@@ -72,17 +80,15 @@ class LlamaCppRunner(BaseRunner):
         else:
             print("  (No cache data provided to import)")
 
-    # --- LoRA Adapter Methods (Placeholders) ---
     def load_lora_adapter(self, adapter_id: str, adapter_path: str, **kwargs) -> bool:
         print(f"\n--- LlamaCppRunner ({self.model_path.split('/')[-1]}) Loading LoRA Adapter ---")
         print(f"  ID: {adapter_id}, Path: {adapter_path}, Params: {kwargs}")
-        # In real llama-cpp-python, this would involve Llama(lora_path=...) or LlamaLora
         if adapter_id in self.active_loras:
             print(f"  Warning: LoRA adapter '{adapter_id}' already loaded or ID conflict.")
             return False
         self.active_loras[adapter_id] = {"path": adapter_path, **kwargs}
         print(f"  LoRA adapter '{adapter_id}' loaded successfully (placeholder).")
-        self.is_merged = False # Loading a new adapter implies unmerged state for this one
+        self.is_merged = False
         return True
 
     def unload_lora_adapter(self, adapter_id: str, **kwargs) -> bool:
@@ -91,7 +97,6 @@ class LlamaCppRunner(BaseRunner):
         if adapter_id in self.active_loras:
             del self.active_loras[adapter_id]
             print(f"  LoRA adapter '{adapter_id}' unloaded successfully (placeholder).")
-            # In real llama-cpp-python, may need to reload model without LoRA or use specific API
             return True
         else:
             print(f"  Warning: LoRA adapter '{adapter_id}' not found.")
@@ -106,13 +111,10 @@ class LlamaCppRunner(BaseRunner):
     def merge_lora_adapters(self, adapter_ids: t.List[str], **kwargs) -> bool:
         print(f"\n--- LlamaCppRunner ({self.model_path.split('/')[-1]}) Merging LoRA Adapters ---")
         print(f"  IDs to merge: {adapter_ids}, Params: {kwargs}")
-        # Placeholder: Assume merge is successful if any valid LoRAs are provided
         merged_any = False
         for aid in adapter_ids:
             if aid in self.active_loras:
                 print(f"  Simulating merge of '{aid}'.")
-                # In real scenario, actual merge operation occurs.
-                # For placeholder, remove from active and set merged flag.
                 del self.active_loras[aid]
                 merged_any = True
         if merged_any:
@@ -128,40 +130,20 @@ class LlamaCppRunner(BaseRunner):
         print(f"  Params: {kwargs}")
         if not self.is_merged:
             print("  Model is not LoRA-merged. Nothing to unmerge.")
-            return False # Or True if no-op is considered success
+            return False
         self.is_merged = False
-        # Real unmerge might require reloading base model weights.
         print("  Unmerge successful (simulated). Model is no longer LoRA-merged.")
         return True
 
 if __name__ == '__main__':
     dummy_gguf_path = "dummy_model.gguf"
     llama_model = LlamaCppRunner(model_path=dummy_gguf_path, n_gpu_layers=10)
+    example_image_paths = ["/path/to/image_a.jpg"]
 
-    # ... (existing generate, stream, KV cache demos) ...
-    llama_model.generate("Test generate.", temperature=0.1)
+    llama_model.generate("Test generate with image.", image_paths=example_image_paths, temperature=0.1)
 
-    print("\n--- LoRA Methods Demo for LlamaCppRunner ---")
-    lora1 = "lora_A_path"
-    lora1_id = "style_lora"
-    llama_model.load_lora_adapter(adapter_id=lora1_id, adapter_path=lora1, lora_scale=0.8)
+    print("\nStreaming with image:")
+    stream_output = list(llama_model.stream("Test stream with image.", image_paths=example_image_paths))
+    print(f"Stream output: {stream_output}")
 
-    lora2 = "lora_B_path"
-    lora2_id = "task_lora"
-    llama_model.load_lora_adapter(adapter_id=lora2_id, adapter_path=lora2)
-
-    print(f"Active LoRAs: {llama_model.get_active_lora_adapters()}")
-    llama_model.generate("Prompt with LoRAs active.")
-
-    llama_model.merge_lora_adapters(adapter_ids=[lora1_id]) # Merge one
-    print(f"Active LoRAs after merge: {llama_model.get_active_lora_adapters()}")
-    llama_model.generate("Prompt after merging style_lora.")
-
-    llama_model.unmerge_lora_adapters()
-    print(f"Model merged status: {llama_model.is_merged}")
-    llama_model.generate("Prompt after unmerging.")
-
-    llama_model.unload_lora_adapter(lora2_id) # Unload remaining
-    print(f"Active LoRAs after unload: {llama_model.get_active_lora_adapters()}")
-
-    print("\nLlamaCppRunner placeholder demonstration complete.")
+    print("\nLlamaCppRunner placeholder demonstration complete (including multimodal calls).")
