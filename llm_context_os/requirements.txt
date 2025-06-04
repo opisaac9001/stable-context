@@ -22,9 +22,10 @@ python-multipart # For FastAPI File Uploads (used in /upload_document)
 llama-cpp-python>=0.2.20 # For running GGUF models locally
 
 # For AWQRunner (Transformers-based AWQ)
-# transformers # Also listed for tokenizers, but core for AWQ models
-# autoawq    # For AWQ quantization/models specifically
-# torch      # Required by transformers and autoawq
+transformers>=4.30.0       # For loading AWQ models via AutoModelForCausalLM
+autoawq>=0.1.6             # Core AutoAWQ library for AWQ models
+torch>=2.0.0               # Required by transformers and autoawq
+accelerate>=0.20.0         # For device mapping and optimized inference with Hugging Face
 
 # For EXL2Runner
 # exllamav2

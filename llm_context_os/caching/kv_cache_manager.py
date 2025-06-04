@@ -64,6 +64,11 @@ class KVCacheManager:
         else:
             pickle_filepath = self._get_pickle_filepath(model_identifier, prefix_hash)
             print(f"[KVCacheManager] Saving KV cache (pickling data) for model '{model_identifier}' to {pickle_filepath}")
+            # TODO: For complex objects like Transformers past_key_values (tuples of tensors),
+            # consider using torch.save/torch.load or safetensors for better efficiency,
+            # portability, and to avoid potential issues with pickling tensors directly,
+            # especially across different PyTorch versions or environments.
+            # For now, using pickle as a general fallback.
             try:
                 pickle_filepath.parent.mkdir(parents=True, exist_ok=True) # Ensure target dir exists
                 with open(pickle_filepath, 'wb') as f:
@@ -91,6 +96,7 @@ class KVCacheManager:
         pickle_filepath = self._get_pickle_filepath(model_identifier, prefix_hash)
         if pickle_filepath.exists() and pickle_filepath.is_file():
             print(f"[KVCacheManager] Loading pickled KV cache from {pickle_filepath}")
+            # TODO: If this .pkl file contains complex objects like Transformers past_key_values, consider if torch.load or safetensors would be more appropriate if issues arise with pickle.
             try:
                 with open(pickle_filepath, 'rb') as f:
                     loaded_data = pickle.load(f)
