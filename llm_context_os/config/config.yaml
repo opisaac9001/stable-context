@@ -16,6 +16,7 @@ pdf_retriever:
   embedding_model_name: "sentence-transformers/all-MiniLM-L12-v2" # Example different model
   chunk_size: 750
   chunk_overlap: 75
+  recall_budget_tokens: 1536 # Example for PDF retriever
 
 model_manager:
   default_idle_unload_sec: 1200 # e.g., 20 minutes

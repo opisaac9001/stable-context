@@ -51,8 +51,9 @@ sentence-transformers>=2.2.0 # For embedding text
 chromadb>=0.4.15              # For vector storage and similarity search
 tiktoken>=0.5.0               # For token counting, often used with embedding/retrieval
 # For PDF Processing (in PdfRetriever)
-# pypdf2                # For PDF text extraction
+pypdf2>=3.0.0                 # For PDF text extraction
 # pymupdf               # Alternative for PDF text extraction, often faster/more robust
+langchain-text-splitters>=0.0.1 # For RecursiveCharacterTextSplitter
 # langchain             # For text splitting and document loading (optional, can use custom)
 
 
