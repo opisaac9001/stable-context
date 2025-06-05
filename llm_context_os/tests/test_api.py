@@ -329,5 +329,123 @@ class TestChatStreamingAPI(unittest.TestCase):
         self.assertIn("No model is currently loaded", response.json().get("detail"))
 
 
+# --- Settings API Tests ---
+from llm_context_os.api.schemas import GlobalSettings, UpdateSettingsRequest
+from llm_context_os.api import main as api_main # To access and restore global CONFIG
+from copy import deepcopy
+
+class TestSettingsAPI(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        # Store a deep copy of the original CONFIG to restore in tearDown
+        self.original_config = deepcopy(api_main.CONFIG)
+
+        # It's crucial that these mocks target where they are *used* by the /settings endpoint,
+        # which is directly the global instances in api_main.
+        self.patch_ctx_mgr = patch('llm_context_os.api.main.ctx_mgr', MagicMock())
+        self.patch_model_mgr = patch('llm_context_os.api.main.model_mgr', MagicMock())
+        self.patch_chat_history_retriever = patch('llm_context_os.api.main.chat_history_retriever', MagicMock())
+        self.patch_pdf_retriever = patch('llm_context_os.api.main.pdf_retriever', MagicMock())
+        # rag_tokenizer is also global, but its direct modification effects are complex (requires re-init of others)
+        # For these tests, we'll assume rag_tokenizer itself isn't directly modified by PUT /settings,
+        # but rather the CONFIG values that *would* create it are changed (requiring restart).
+
+        self.mock_ctx_mgr = self.patch_ctx_mgr.start()
+        self.mock_model_mgr = self.patch_model_mgr.start()
+        self.mock_chat_history_retriever = self.patch_chat_history_retriever.start()
+        self.mock_pdf_retriever = self.patch_pdf_retriever.start()
+
+        # Set initial values on mocks based on original_config to simulate a loaded state
+        self.mock_ctx_mgr.max_tokens = self.original_config.get('context_manager', {}).get('max_tokens')
+        self.mock_ctx_mgr.system_prompt = self.original_config.get('context_manager', {}).get('system_prompt')
+        self.mock_model_mgr.default_idle_unload_sec = self.original_config.get('model_manager', {}).get('default_idle_unload_sec')
+        self.mock_chat_history_retriever.recall_budget_tokens = self.original_config.get('chat_history_retriever', {}).get('recall_budget_tokens')
+
+
+    def tearDown(self):
+        # Restore the global CONFIG to its original state
+        api_main.CONFIG = self.original_config
+        # Stop the patches
+        self.patch_ctx_mgr.stop()
+        self.patch_model_mgr.stop()
+        self.patch_chat_history_retriever.stop()
+        self.patch_pdf_retriever.stop()
+
+
+    def test_get_settings(self):
+        response = self.client.get("/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        # Check a few key fields to ensure they match the current CONFIG
+        self.assertEqual(data['context_manager']['max_tokens'], api_main.CONFIG['context_manager']['max_tokens'])
+        self.assertEqual(data['model_manager']['default_idle_unload_sec'], api_main.CONFIG['model_manager']['default_idle_unload_sec'])
+        if 'generation_defaults' in data and data['generation_defaults'] is not None: # generation_defaults can be None
+             self.assertEqual(data['generation_defaults']['temperature'], api_main.CONFIG.get('generation_defaults', {}).get('temperature'))
+
+
+    def test_update_settings_partial_success_and_propagate(self):
+        update_payload = {
+            "context_manager": {"max_tokens": 1234, "system_prompt": "New prompt!"},
+            "model_manager": {"default_idle_unload_sec": 555},
+            "chat_history_retriever": {"embedding_model_name": "new_embed_model"} # This requires restart
+        }
+
+        response = self.client.put("/settings", json=update_payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["status"], "ok")
+
+        # Check that specific messages are present
+        self.assertIn("ContextManager max_tokens updated to 1234", json_response["message"])
+        self.assertIn("ContextManager system_prompt updated", json_response["message"])
+        self.assertIn("ModelManager default_idle_unload_sec updated to 555", json_response["message"])
+        self.assertIn("ChatHistoryRetriever 'embedding_model_name' or 'vector_db_path' changes require a restart", json_response["message"])
+
+        # Verify CONFIG update
+        self.assertEqual(api_main.CONFIG['context_manager']['max_tokens'], 1234)
+        self.assertEqual(api_main.CONFIG['context_manager']['system_prompt'], "New prompt!")
+        self.assertEqual(api_main.CONFIG['model_manager']['default_idle_unload_sec'], 555)
+        self.assertEqual(api_main.CONFIG['chat_history_retriever']['embedding_model_name'], "new_embed_model")
+
+        # Verify propagation to mocked live instances
+        self.assertEqual(self.mock_ctx_mgr.max_tokens, 1234)
+        self.assertEqual(self.mock_ctx_mgr.system_prompt, "New prompt!")
+        self.assertEqual(self.mock_model_mgr.default_idle_unload_sec, 555)
+        # embedding_model_name for chat_history_retriever is not set directly on instance
+        self.assertNotEqual(self.mock_chat_history_retriever.embedding_model_name, "new_embed_model",
+                            "embedding_model_name should not be updated on live instance directly.")
+
+
+    def test_update_settings_no_changes(self):
+        response = self.client.put("/settings", json={})
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["status"], "ok")
+        self.assertIn("No settings provided to update", json_response["message"])
+        # Ensure CONFIG remains unchanged from its original state (deepcopied in setUp)
+        self.assertEqual(api_main.CONFIG, self.original_config)
+
+
+    def test_update_settings_only_restart_required(self):
+        update_payload = {"token_estimator_for_rag_budgeting": {"type": "new_type_requires_restart"}}
+
+        # Store current values of some live-updated attributes to check they weren't changed
+        original_ctx_max_tokens = self.mock_ctx_mgr.max_tokens
+
+        response = self.client.put("/settings", json=update_payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["status"], "ok")
+        self.assertIn("Changes to 'token_estimator_for_rag_budgeting' require an application restart", json_response["message"])
+        self.assertNotIn("Applied live:", json_response["message"]) # Check that no live updates were claimed
+
+        # Verify CONFIG is updated
+        self.assertEqual(api_main.CONFIG['token_estimator_for_rag_budgeting']['type'], "new_type_requires_restart")
+
+        # Verify that live-updatable attributes on mocks were NOT changed
+        self.assertEqual(self.mock_ctx_mgr.max_tokens, original_ctx_max_tokens)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -16,9 +16,19 @@ from llm_context_os.api.schemas import (
     LoadModelRequest,
     ChatRequest,
     StatusResponse,
+    ChatRequest,
+    StatusResponse,
     ChatResponse,
     UploadPdfResponse,
-    GenerationParams
+    GenerationParams,
+    GlobalSettings, # For GET /settings
+    UpdateSettingsRequest, # For PUT /settings
+    # Import individual settings models for type hints during propagation
+    ContextManagerSettings,
+    ChatHistoryRetrieverSettings,
+    PdfRetrieverSettings,
+    ModelManagerSettings,
+    TokenEstimatorConfigSettings
 )
 from llm_context_os.context.context_manager import ContextManager, MockTokenizer
 from llm_context_os.context.token_estimator import TikTokenEstimator, HFTokenEstimator # For RAG tokenizer
@@ -140,7 +150,120 @@ print(f"ModelManager initialized with default_idle_unload_sec={model_mgr_config[
 tool_dispatcher = ToolDispatcher()
 print("ToolDispatcher initialized.")
 
+# --- Helper for deep merging dictionaries for settings updates ---
+def deep_merge_dicts(source: dict, updates: dict) -> dict:
+    for key, value in updates.items():
+        if isinstance(value, dict) and key in source and isinstance(source[key], dict):
+            source[key] = deep_merge_dicts(source[key], value)
+        else:
+            source[key] = value
+    return source
+
 # --- API Endpoints ---
+
+@app.get("/settings", response_model=GlobalSettings)
+async def get_settings():
+    """
+    Retrieves the current application settings as loaded from config.yaml and defaults.
+    Note: This endpoint returns the configuration values as understood by the application.
+    It does not include sensitive information like API keys if they were handled solely by runners.
+    """
+    # Construct GlobalSettings Pydantic model from the CONFIG dictionary
+    # This ensures that only fields defined in GlobalSettings schema are returned
+    # and that they are validated.
+
+    # Default GenerationParams needs to be constructed if present in CONFIG
+    gen_defaults_dict = CONFIG.get('generation_defaults')
+    gen_defaults_model = GenerationParams(**gen_defaults_dict) if gen_defaults_dict else None
+
+    settings_to_return = GlobalSettings(
+        context_manager=CONFIG.get('context_manager'),
+        chat_history_retriever=CONFIG.get('chat_history_retriever'),
+        pdf_retriever=CONFIG.get('pdf_retriever'),
+        model_manager=CONFIG.get('model_manager'),
+        token_estimator_for_rag_budgeting=CONFIG.get('token_estimator_for_rag_budgeting'),
+        generation_defaults=gen_defaults_model # Use the Pydantic model instance
+    )
+    return settings_to_return
+
+@app.put("/settings", response_model=StatusResponse)
+async def update_settings_endpoint(updated_values: UpdateSettingsRequest):
+    """
+    Updates global application settings.
+    Changes are applied to the in-memory CONFIG and propagated to live service instances where possible.
+    Some changes (e.g., vector_db_path, embedding_model_name for retrievers, RAG tokenizer type)
+    may require an application restart to take full effect on existing components.
+    """
+    global CONFIG # Ensure we are modifying the global CONFIG
+
+    update_data = updated_values.model_dump(exclude_unset=True)
+    if not update_data:
+        return StatusResponse(status="ok", message="No settings provided to update.")
+
+    print(f"Received /settings PUT request with data: {update_data}")
+
+    # Perform a deep merge of the new settings into the existing CONFIG
+    CONFIG = deep_merge_dicts(CONFIG, update_data)
+    print("Global CONFIG updated in memory.")
+
+    applied_notes = []
+    restart_notes = []
+
+    # Propagate changes to live instances
+    if "context_manager" in update_data:
+        cm_updates = CONFIG.get('context_manager', {})
+        if "max_tokens" in cm_updates and ctx_mgr.max_tokens != cm_updates["max_tokens"]:
+            ctx_mgr.max_tokens = cm_updates["max_tokens"]
+            applied_notes.append(f"ContextManager max_tokens updated to {ctx_mgr.max_tokens}.")
+        if "system_prompt" in cm_updates and ctx_mgr.system_prompt != cm_updates["system_prompt"]:
+            ctx_mgr.system_prompt = cm_updates["system_prompt"]
+            applied_notes.append("ContextManager system_prompt updated.")
+
+    if "model_manager" in update_data:
+        mm_updates = CONFIG.get('model_manager', {})
+        if "default_idle_unload_sec" in mm_updates and model_mgr.default_idle_unload_sec != mm_updates["default_idle_unload_sec"]:
+            model_mgr.default_idle_unload_sec = mm_updates["default_idle_unload_sec"]
+            # If a runner is active, its idle_unload_sec might also need updating if it was set from default
+            if model_mgr.current_runner and model_mgr.current_runner_config:
+                 # Assuming current_runner_config stores the originally set idle_unload_sec for that runner
+                 # If the runner was loaded with its own specific idle_unload_sec, this global default change might not affect it.
+                 # For simplicity, we update the manager's default. New models loaded without specific idle time will use this.
+                 pass # Current runner's idle time is set at its load time.
+            applied_notes.append(f"ModelManager default_idle_unload_sec updated to {model_mgr.default_idle_unload_sec}.")
+
+    if "chat_history_retriever" in update_data:
+        chr_updates = CONFIG.get('chat_history_retriever', {})
+        if "recall_budget_tokens" in chr_updates and chat_history_retriever.recall_budget_tokens != chr_updates["recall_budget_tokens"]:
+            chat_history_retriever.recall_budget_tokens = chr_updates["recall_budget_tokens"]
+            applied_notes.append(f"ChatHistoryRetriever recall_budget_tokens updated to {chat_history_retriever.recall_budget_tokens}.")
+        if "embedding_model_name" in chr_updates or "vector_db_path" in chr_updates:
+            restart_notes.append("ChatHistoryRetriever 'embedding_model_name' or 'vector_db_path' changes require a restart or re-initialization to take full effect on the running instance.")
+
+    if "pdf_retriever" in update_data:
+        pr_updates = CONFIG.get('pdf_retriever', {})
+        if "chunk_size" in pr_updates and pdf_retriever.chunk_size != pr_updates["chunk_size"]:
+            pdf_retriever.chunk_size = pr_updates["chunk_size"]
+            applied_notes.append(f"PdfRetriever chunk_size updated to {pdf_retriever.chunk_size}.")
+        if "chunk_overlap" in pr_updates and pdf_retriever.chunk_overlap != pr_updates["chunk_overlap"]:
+            pdf_retriever.chunk_overlap = pr_updates["chunk_overlap"]
+            applied_notes.append(f"PdfRetriever chunk_overlap updated to {pdf_retriever.chunk_overlap}.")
+        if "embedding_model_name" in pr_updates or "vector_db_path" in pr_updates:
+            restart_notes.append("PdfRetriever 'embedding_model_name' or 'vector_db_path' changes require a restart or re-initialization to take full effect on the running instance.")
+
+    if "token_estimator_for_rag_budgeting" in update_data:
+        restart_notes.append("Changes to 'token_estimator_for_rag_budgeting' require an application restart to affect ContextManager, ChatHistoryRetriever, and PdfRetriever.")
+
+    if "generation_defaults" in update_data:
+        applied_notes.append("Default generation parameters updated. New chat sessions will use these defaults if not overridden in the request.")
+
+    message = "Settings updated."
+    if applied_notes:
+        message += " Applied live: " + "; ".join(applied_notes)
+    if restart_notes:
+        message += " Require restart/re-init for full effect: " + "; ".join(list(set(restart_notes))) # list(set()) to remove duplicates
+
+    return StatusResponse(status="ok", message=message)
+
 
 @app.post("/load_model", response_model=StatusResponse)
 async def load_model_endpoint(req: LoadModelRequest):
@@ -475,6 +598,20 @@ if __name__ == "__main__":
     #   "use_rag": false
     # }'
     # (This assumes the LLM is prompted or fine-tuned to use a get_weather tool when appropriate)
+    #
+    # 6. Get current settings:
+    # curl -X GET http://localhost:8000/settings
+    #
+    # 7. Update some settings:
+    # curl -X PUT http://localhost:8000/settings -H "Content-Type: application/json" -d \
+    # '{
+    #   "context_manager": {"max_tokens": 3000, "system_prompt": "You are a concise assistant."},
+    #   "model_manager": {"default_idle_unload_sec": 600},
+    #   "chat_history_retriever": {"recall_budget_tokens": 256}
+    # }'
+    #
+    # Check settings again after update:
+    # curl -X GET http://localhost:8000/settings
 
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

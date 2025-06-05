@@ -39,6 +39,42 @@ class UploadPdfResponse(BaseModel):
     num_chunks_processed: Optional[int] = Field(None, description="Number of text chunks processed from the PDF.")
     status: str = Field("success", description="Overall status ('success' or 'error').")
 
+# --- Global Application Settings Schemas ---
+
+class ContextManagerSettings(BaseModel):
+    system_prompt: Optional[str] = Field(None, description="Default system prompt for the context manager.")
+    max_tokens: Optional[int] = Field(None, description="Default maximum context tokens for the context manager.")
+
+class ChatHistoryRetrieverSettings(BaseModel):
+    recall_budget_tokens: Optional[int] = Field(None, description="Token budget for retrieved chat history snippets.")
+    embedding_model_name: Optional[str] = Field(None, description="SentenceTransformer model name for chat history embeddings.")
+    vector_db_path: Optional[str] = Field(None, description="Path to the vector database for chat history.")
+
+class PdfRetrieverSettings(BaseModel):
+    vector_db_path: Optional[str] = Field(None, description="Path to the vector database for PDF RAG.")
+    embedding_model_name: Optional[str] = Field(None, description="SentenceTransformer model name for PDF embeddings.")
+    chunk_size: Optional[int] = Field(None, description="Chunk size for PDF text processing.")
+    chunk_overlap: Optional[int] = Field(None, description="Chunk overlap for PDF text processing.")
+
+class ModelManagerSettings(BaseModel):
+    default_idle_unload_sec: Optional[int] = Field(None, description="Default idle time in seconds before unloading a model.")
+
+class TokenEstimatorConfigSettings(BaseModel):
+    type: Optional[str] = Field(None, description="Type of token estimator ('tiktoken' or 'hf').")
+    model_name: Optional[str] = Field(None, description="Model name for the token estimator (e.g., 'cl100k_base' for tiktoken, 'gpt2' for hf).")
+
+class GlobalSettings(BaseModel):
+    context_manager: Optional[ContextManagerSettings] = None
+    chat_history_retriever: Optional[ChatHistoryRetrieverSettings] = None
+    pdf_retriever: Optional[PdfRetrieverSettings] = None
+    model_manager: Optional[ModelManagerSettings] = None
+    token_estimator_for_rag_budgeting: Optional[TokenEstimatorConfigSettings] = None
+    generation_defaults: Optional[GenerationParams] = Field(None, description="Default generation parameters for chat operations.")
+    # Add other top-level config sections here if they exist in config.yaml
+
+# For API endpoint to update settings
+UpdateSettingsRequest = GlobalSettings
+
 
 if __name__ == '__main__':
     print("\n--- ChatRequest with PDF RAG and Stream---")
@@ -92,3 +128,30 @@ if __name__ == '__main__':
     assert chat_resp.request_details.pdf_doc_ids_for_rag == ["climate_change_overview", "another_report"]
 
     print("\nSchema definitions and examples updated.")
+
+    print("\n--- GlobalSettings Example (Partial) ---")
+    partial_settings = GlobalSettings(
+        context_manager={"max_tokens": 2048}, # Pass as dict
+        model_manager=ModelManagerSettings(default_idle_unload_sec=600) # Pass as model instance
+    )
+    print(partial_settings.model_dump_json(indent=2, exclude_unset=True))
+    # Example of how to access nested values:
+    if partial_settings.context_manager:
+        assert partial_settings.context_manager.max_tokens == 2048
+    if partial_settings.model_manager:
+        assert partial_settings.model_manager.default_idle_unload_sec == 600
+
+
+    print("\n--- UpdateSettingsRequest Example (showing partial update structure) ---")
+    update_req = UpdateSettingsRequest(
+        chat_history_retriever=ChatHistoryRetrieverSettings(recall_budget_tokens=256, embedding_model_name="new_embed_model")
+    )
+    print(update_req.model_dump_json(indent=2, exclude_unset=True))
+    if update_req.chat_history_retriever:
+        assert update_req.chat_history_retriever.recall_budget_tokens == 256
+        assert update_req.chat_history_retriever.embedding_model_name == "new_embed_model"
+
+    print("\n--- Empty GlobalSettings (all fields None) ---")
+    empty_settings = GlobalSettings()
+    print(empty_settings.model_dump_json(indent=2, exclude_unset=True)) # Should be {}
+    assert empty_settings.model_dump(exclude_unset=True) == {}
