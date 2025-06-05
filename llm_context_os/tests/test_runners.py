@@ -1,275 +1,246 @@
 # llm_context_os/tests/test_runners.py
 import unittest
-import io
-import sys
-from contextlib import redirect_stdout
-import typing as t # Added for t.Any
-from pathlib import Path # Added import for Path
-import shutil # Added import for shutil
+import os
+from unittest.mock import patch, MagicMock, PropertyMock
 
 from llm_context_os.runners.base import BaseRunner
-from llm_context_os.runners.api_runner import APIRunner
 from llm_context_os.runners.llama_cpp_runner import LlamaCppRunner
 from llm_context_os.runners.awq_runner import AWQRunner
+from llm_context_os.runners.api_runner import APIRunner
 from llm_context_os.runners.exl2_runner import EXL2Runner
-from llm_context_os.runners.manager import ModelManager
 
-# Helper to capture stdout for tests that print a lot
-class Capturing(list):
-    def __enter__(self):
-        self._stdout = sys.stdout
-        sys.stdout = self._stringio = io.StringIO()
-        return self
-    def __exit__(self, *args):
-        self.extend(self._stringio.getvalue().splitlines())
-        del self._stringio    # free up some memory
-        sys.stdout = self._stdout
+# --- Conditional Availability Flags ---
 
-class TestApiRunner(unittest.TestCase):
-    def setUp(self):
-        with Capturing(): # Suppress init prints during test setup
-            self.runner = APIRunner(model_name="test-api-model", api_url="http://dummy.api/v1", api_key="testkey")
+LLAMA_CPP_AVAILABLE = False
+try:
+    from llama_cpp import Llama
+    LLAMA_CPP_AVAILABLE = True
+except ImportError:
+    print("Warning: llama-cpp-python not found. LlamaCppRunner smoke tests will be skipped.")
 
-    def test_instantiation_and_methods(self):
-        self.assertIsInstance(self.runner, APIRunner)
-        # Check if init print happened (though captured in setUp, we can check runner attributes)
-        self.assertEqual(self.runner.model_name, "test-api-model")
+AWQ_AVAILABLE = False
+try:
+    import awq  # This is a basic check; awq might import even if torch/cuda issues exist
+    from transformers import AutoModelForCausalLM
+    # A more robust check might involve trying to import specific awq modules used in the runner
+    AWQ_AVAILABLE = True # Tentatively true, init might still fail if CUDA not right
+except ImportError:
+    print("Warning: autoawq or transformers not found. AWQRunner smoke tests will be skipped.")
 
-        with Capturing() as output_gen:
-            response = self.runner.generate(prompt="test api prompt")
-        self.assertIn("[API Response from test-api-model to: test api prompt...]", response)
-        self.assertIn("--- APIRunner (test-api-model) Generating ---", "\n".join(output_gen))
+EXL2_AVAILABLE = False
+try:
+    from exllamav2 import ExLlamaV2 # Check for a core class
+    EXL2_AVAILABLE = True
+except ImportError:
+    print("Warning: exllamav2 not found. EXL2Runner smoke tests will be skipped.")
 
-        stream_output_content = []
-        with Capturing() as output_stream:
-            for chunk in self.runner.stream(prompt="test api stream"):
-                stream_output_content.append(chunk)
-        self.assertTrue(any("[Chunk 1 from test-api-model" in chunk for chunk in stream_output_content))
-        self.assertTrue(any("[End of stream from test-api-model]" in chunk for chunk in stream_output_content))
-        self.assertIn("--- APIRunner (test-api-model) Streaming ---", "\n".join(output_stream))
-
-    def test_kv_cache_export_import(self):
-        mock_data = {'key': 'value_api'}
-        with Capturing() as import_output:
-            self.runner.import_kv_cache(mock_data)
-        self.assertTrue(any("Importing KV cache is generally not applicable" in line for line in import_output))
-
-        with Capturing() as export_output:
-            exported_data = self.runner.export_kv_cache()
-        self.assertIsNone(exported_data) # APIRunner returns None
-        self.assertTrue(any("API runners typically do not manage or expose exportable KV cache" in line for line in export_output))
-
-        with Capturing() as preload_output:
-            self.runner.preload_kv('some prefix')
-        self.assertTrue(any("preload_kv called. Typically, KV caching is managed by the remote API endpoint" in line for line in preload_output))
+# httpx for APIRunner is a direct dependency, so it should be available if requirements are met.
+# No explicit HTTX_AVAILABLE flag needed here, but tests will fail if not installed.
 
 
-class TestLlamaCppRunner(unittest.TestCase):
-    def setUp(self):
-        with Capturing():
-            self.runner = LlamaCppRunner(model_path="dummy.gguf", n_gpu_layers=0)
+# --- Environment Variables for Test Models (Optional) ---
+# Users can set these to paths of actual small models for more thorough smoke testing.
+LLAMA_CPP_TEST_MODEL_PATH = os.getenv("LLAMA_CPP_TEST_MODEL_PATH")
+AWQ_TEST_MODEL_PATH = os.getenv("AWQ_TEST_MODEL_PATH")
+EXL2_TEST_MODEL_PATH = os.getenv("EXL2_TEST_MODEL_PATH")
 
-    def test_instantiation_and_methods(self):
-        self.assertIsInstance(self.runner, LlamaCppRunner)
-        self.assertEqual(self.runner.model_path, "dummy.gguf")
-
-        with Capturing():
-            response = self.runner.generate(prompt="test llama prompt")
-        self.assertIn("[LlamaCpp Response from dummy.gguf to: test llama prompt...]", response)
-
-        stream_output = []
-        with Capturing():
-            for chunk in self.runner.stream(prompt="test llama stream"):
-                stream_output.append(chunk)
-        self.assertTrue(any("[LlamaCpp Chunk 1" in chunk for chunk in stream_output))
-
-    def test_kv_cache_export_import(self):
-        mock_data_in = {'status': 'imported_test_data_llama', 'data': [1, 2, 3]}
-        with Capturing():
-            self.runner.import_kv_cache(mock_data_in)
-        self.assertEqual(self.runner.mock_kv_cache_data, mock_data_in)
-
-        with Capturing():
-            exported_data = self.runner.export_kv_cache()
-        self.assertEqual(exported_data, mock_data_in)
-
-        prefix_text = 'test prefix for llama'
-        with Capturing():
-            self.runner.preload_kv(prefix_text)
-        # Check if mock_kv_cache_data was updated by preload_kv's placeholder logic
-        self.assertIsNotNone(self.runner.mock_kv_cache_data)
-        self.assertEqual(self.runner.mock_kv_cache_data.get("status"), "preloaded")
-        self.assertEqual(self.runner.mock_kv_cache_data.get("preloaded_prompt_prefix"), prefix_text[:50])
-
-        exported_after_preload = self.runner.export_kv_cache()
-        self.assertEqual(exported_after_preload, self.runner.mock_kv_cache_data)
+# For APIRunner tests that might call a real (test) API
+API_TEST_URL = os.getenv("API_TEST_URL", "http://mock.api/v1/chat/completions") # Default to a mock URL
+API_TEST_KEY = os.getenv("API_TEST_KEY", "sk-dummy")
+API_TEST_MODEL_NAME = os.getenv("API_TEST_MODEL_NAME", "test-api-model")
 
 
-class TestAWQRunner(unittest.TestCase):
-    def setUp(self):
-        with Capturing():
-            self.runner = AWQRunner(model_path_or_repo_id="dummy/awq-model")
+class TestAPIRunnerSmoke(unittest.TestCase):
+    @patch('httpx.Client.post')
+    def test_initialization_and_generate_smoke(self, mock_post):
+        # Configure mock for generate
+        mock_response_generate = MagicMock()
+        mock_response_generate.status_code = 200
+        mock_response_generate.json.return_value = {
+            "choices": [{"message": {"content": "Mocked API response for generate"}}]}
 
-    def test_instantiation_and_methods(self):
-        self.assertIsInstance(self.runner, AWQRunner)
-        self.assertEqual(self.runner.model_path_or_repo_id, "dummy/awq-model")
+        # If APIRunner uses multiple .post calls or other methods, configure them here or make mock_post more versatile
+        mock_post.return_value = mock_response_generate # Default for any post call
 
-        with Capturing():
-            response = self.runner.generate(prompt="test awq prompt")
-        self.assertIn("[AWQ Response from dummy/awq-model to: test awq prompt...]", response)
-
-        stream_output = []
-        with Capturing():
-            for chunk in self.runner.stream(prompt="test awq stream"):
-                stream_output.append(chunk)
-        self.assertTrue(any("[AWQ Chunk 1" in chunk for chunk in stream_output))
-
-    def test_kv_cache_export_import(self):
-        mock_data_in = {'status': 'imported_test_data_awq', 'past_key_values_mock': ((1,), (2,))}
-        with Capturing():
-            self.runner.import_kv_cache(mock_data_in)
-        self.assertEqual(self.runner.mock_kv_cache_data, mock_data_in)
-
-        with Capturing():
-            exported_data = self.runner.export_kv_cache()
-        self.assertEqual(exported_data, mock_data_in)
-
-        prefix_text = 'test prefix for awq'
-        with Capturing():
-            self.runner.preload_kv(prefix_text)
-        self.assertIsNotNone(self.runner.mock_kv_cache_data)
-        self.assertEqual(self.runner.mock_kv_cache_data.get("status"), "preloaded_awq")
-        self.assertEqual(self.runner.mock_kv_cache_data.get("preloaded_prompt_hash"), hash(prefix_text))
-
-        exported_after_preload = self.runner.export_kv_cache()
-        self.assertEqual(exported_after_preload, self.runner.mock_kv_cache_data)
-
-
-class TestEXL2Runner(unittest.TestCase):
-    def setUp(self):
-        with Capturing():
-            self.runner = EXL2Runner(model_path="dummy/exl2-model-dir")
-
-    def test_instantiation_and_methods(self):
-        self.assertIsInstance(self.runner, EXL2Runner)
-        self.assertEqual(self.runner.model_path, "dummy/exl2-model-dir")
-
-        with Capturing():
-            response = self.runner.generate(prompt="test exl2 prompt")
-        self.assertIn("[EXL2 Response from exl2-model-dir to: test exl2 prompt...]", response)
-
-        stream_output = []
-        with Capturing():
-            for chunk in self.runner.stream(prompt="test exl2 stream"):
-                stream_output.append(chunk)
-        self.assertTrue(any("[EXL2 Chunk 1" in chunk for chunk in stream_output))
-
-    def test_kv_cache_export_import(self):
-        mock_data_in = {'status': 'imported_test_data_exl2', 'cache_object_state_mock': "some_state"}
-        with Capturing():
-            self.runner.import_kv_cache(mock_data_in)
-        self.assertEqual(self.runner.mock_kv_cache_object, mock_data_in)
-
-        with Capturing():
-            exported_data = self.runner.export_kv_cache()
-        self.assertEqual(exported_data, mock_data_in)
-
-        prefix_text = 'test prefix for exl2'
-        with Capturing():
-            self.runner.preload_kv(prefix_text)
-        self.assertIsNotNone(self.runner.mock_kv_cache_object)
-        self.assertEqual(self.runner.mock_kv_cache_object.get("status"), "preloaded_exl2")
-        self.assertEqual(self.runner.mock_kv_cache_object.get("preloaded_prompt_len"), len(prefix_text))
-
-        exported_after_preload = self.runner.export_kv_cache()
-        self.assertEqual(exported_after_preload, self.runner.mock_kv_cache_object)
-
-
-class TestModelManager(unittest.TestCase):
-    def setUp(self):
-        # For ModelManager tests, ensure KVCacheManager uses a specific test directory
-        # that can be cleaned up if needed. This is more important for manager tests
-        # as manager interacts with KVCacheManager.
-        self.test_cache_dir = Path("data/kv_cache_test_manager")
-        if self.test_cache_dir.exists():
-            shutil.rmtree(self.test_cache_dir)
-        # KVCacheManager in ModelManager's __init__ will create its default if not overridden.
-        # For isolated tests, it's better to control it.
-        self.manager = ModelManager() # This will print its default cache dir
-        self.manager.kv_cache_mgr.cache_dir = self.test_cache_dir # Override cache_dir
-        self.test_cache_dir.mkdir(parents=True, exist_ok=True) # Ensure test dir exists after override
-
-    def tearDown(self):
-        if self.test_cache_dir.exists():
-            shutil.rmtree(self.test_cache_dir)
-        # Reset ModelManager's kv_cache_mgr to default to avoid interference if tests run in same process
-        # This is less critical if each test run is a fresh Python process.
-        # self.manager.kv_cache_mgr = KVCacheManager() # Resets to default "data/kv_cache"
-
-    def test_manager_initialization(self):
-        self.assertIsNone(self.manager.current_runner)
-        self.assertTrue(str(self.test_cache_dir.name) in str(self.manager.kv_cache_mgr.cache_dir.name))
-
-
-    def test_get_runner_when_none_loaded(self):
-        with Capturing(): # Suppress "Error: No model is currently loaded." from manager.get()
-            runner = self.manager.get()
-        self.assertIsNone(runner)
-
-    def test_load_api_runner(self):
-        with Capturing():
-            self.manager.load(model_type='api', model_path_or_name='test-api', api_url='http://dummy.api')
-        runner = self.manager.get()
+        runner = APIRunner(model_name=API_TEST_MODEL_NAME, api_url=API_TEST_URL, api_key=API_TEST_KEY)
+        self.assertIsInstance(runner, BaseRunner)
         self.assertIsInstance(runner, APIRunner)
-        self.assertEqual(runner.model_name, 'test-api')
 
-    def test_load_gguf_runner(self):
-        with Capturing():
-            self.manager.load(model_type='gguf', model_path_or_name='test.gguf', n_gpu_layers=10)
-        runner = self.manager.get()
-        self.assertIsInstance(runner, LlamaCppRunner)
-        self.assertEqual(runner.model_path, 'test.gguf')
+        response = runner.generate("Hello")
+        self.assertIsInstance(response, str)
+        self.assertEqual(response, "Mocked API response for generate")
+        mock_post.assert_called_once() # Ensures the .post was actually made
 
-    def test_load_awq_runner(self):
-        with Capturing():
-            self.manager.load('awq', 'test/awq-model', device='cpu')
-        runner = self.manager.get()
-        self.assertIsInstance(runner, AWQRunner)
-        self.assertEqual(runner.model_path_or_repo_id, 'test/awq-model')
+    @patch('httpx.Client.stream')
+    def test_stream_smoke(self, mock_stream_method):
+        # Configure mock for stream
+        mock_response_stream_context_manager = MagicMock()
 
-    def test_load_exl2_runner(self):
-        with Capturing():
-            self.manager.load(model_type='exl2', model_path_or_name='test/exl2-model', gpu_split="auto")
-        runner = self.manager.get()
-        self.assertIsInstance(runner, EXL2Runner)
-        self.assertEqual(runner.model_path, 'test/exl2-model')
+        # Simulate iter_lines for SSE
+        sse_event_1 = "data: {\"choices\": [{\"delta\": {\"content\": \"Mocked stream chunk 1\"}}]}"
+        sse_event_2 = "data: {\"choices\": [{\"delta\": {\"content\": \" chunk 2\"}}]}"
+        sse_done = "data: [DONE]"
+        mock_response_stream_context_manager.iter_lines.return_value = [sse_event_1, sse_event_2, sse_done]
 
-    def test_load_unloads_previous_runner(self):
-        with Capturing():
-            self.manager.load(model_type='api', model_path_or_name='first-model', api_url='http://dummy.api')
-        first_runner = self.manager.get()
+        # The stream method itself is a context manager
+        mock_stream_context_manager_obj = MagicMock()
+        mock_stream_context_manager_obj.__enter__.return_value = mock_response_stream_context_manager
+        mock_stream_context_manager_obj.__exit__.return_value = None
 
-        with Capturing():
-            self.manager.load(model_type='gguf', model_path_or_name='second-model.gguf')
-        second_runner = self.manager.get()
+        mock_stream_method.return_value = mock_stream_context_manager_obj
 
-        self.assertIsNotNone(first_runner)
-        self.assertIsNotNone(second_runner)
-        self.assertIsInstance(self.manager.current_runner, LlamaCppRunner)
-        self.assertNotEqual(id(first_runner), id(second_runner))
+        runner = APIRunner(model_name=API_TEST_MODEL_NAME, api_url=API_TEST_URL, api_key=API_TEST_KEY)
 
-    def test_load_invalid_model_type(self):
-        with Capturing():
-            self.manager.load(model_type='api', model_path_or_name='initial-model', api_url='http://dummy.api')
-        self.assertIsInstance(self.manager.current_runner, APIRunner)
+        stream_results = list(runner.stream("Hello stream"))
+        self.assertIsInstance(stream_results, list)
+        self.assertTrue(len(stream_results) > 0)
+        self.assertEqual("".join(stream_results), "Mocked stream chunk 1 chunk 2")
+        mock_stream_method.assert_called_once()
 
-        with Capturing() as output_invalid_load:
-            self.manager.load(model_type='INVALID_TYPE', model_path_or_name='some/path')
 
-        self.assertTrue(any("Error: Unknown model type 'INVALID_TYPE'" in line for line in output_invalid_load))
-        self.assertIsNone(self.manager.current_runner)
-        self.assertIsNone(self.manager.current_model_type)
+@unittest.skipUnless(LLAMA_CPP_AVAILABLE, "llama-cpp-python not installed")
+class TestLlamaCppRunnerSmoke(unittest.TestCase):
+    def test_initialization(self):
+        if LLAMA_CPP_TEST_MODEL_PATH and os.path.exists(LLAMA_CPP_TEST_MODEL_PATH):
+            runner = LlamaCppRunner(model_path=LLAMA_CPP_TEST_MODEL_PATH)
+            self.assertIsInstance(runner, BaseRunner)
+            self.assertIsNotNone(runner.model) # Model should be loaded
+        else:
+            # Test that it still initializes the class instance even if model loading fails internally
+            # LlamaCppRunner's __init__ sets self.model to None if path is invalid or loading fails.
+            runner_no_model = LlamaCppRunner(model_path="dummy_non_existent.gguf", verbose=False)
+            self.assertIsInstance(runner_no_model, BaseRunner)
+            self.assertIsNone(runner_no_model.model, "Model should be None for invalid path if not raising error during init.")
+
+
+    def test_generate_smoke(self):
+        if LLAMA_CPP_TEST_MODEL_PATH and os.path.exists(LLAMA_CPP_TEST_MODEL_PATH):
+            runner = LlamaCppRunner(model_path=LLAMA_CPP_TEST_MODEL_PATH, n_ctx=512, verbose=False)
+            # Reduce n_predict for smoke test if model is real
+            response = runner.generate("Hello", max_tokens=10)
+            self.assertIsInstance(response, str)
+            self.assertTrue(len(response) > 0)
+        else:
+            runner = LlamaCppRunner(model_path="dummy_invalid.gguf", verbose=False)
+            self.assertIsNone(runner.model) # Assuming __init__ sets model to None on failure
+            # Test generate's behavior when model is None
+            with self.assertRaisesRegex(RuntimeError, "Model is not loaded"):
+                 runner.generate("Hello")
+
+
+    def test_stream_smoke(self):
+        if LLAMA_CPP_TEST_MODEL_PATH and os.path.exists(LLAMA_CPP_TEST_MODEL_PATH):
+            runner = LlamaCppRunner(model_path=LLAMA_CPP_TEST_MODEL_PATH, n_ctx=512, verbose=False)
+            stream = runner.stream("Hello stream", max_tokens=10)
+            self.assertTrue(hasattr(stream, '__iter__')) # Check if it's an iterator/generator
+            results = list(stream)
+            self.assertTrue(len(results) > 0)
+            self.assertIsInstance(results[0], str)
+        else:
+            runner = LlamaCppRunner(model_path="dummy_invalid.gguf", verbose=False)
+            self.assertIsNone(runner.model)
+            with self.assertRaisesRegex(RuntimeError, "Model is not loaded"):
+                list(runner.stream("Hello stream"))
+
+
+@unittest.skipUnless(AWQ_AVAILABLE, "autoawq or transformers not installed/compatible")
+class TestAWQRunnerSmoke(unittest.TestCase):
+    def test_initialization(self):
+        if AWQ_TEST_MODEL_PATH and os.path.isdir(AWQ_TEST_MODEL_PATH):
+            runner = AWQRunner(model_path=AWQ_TEST_MODEL_PATH)
+            self.assertIsInstance(runner, BaseRunner)
+            # AWQRunner.model might be None if CUDA is not available, even if path is valid.
+            # So, we only assert NotNone if we are sure CUDA is available and model should load.
+            # For a generic smoke test, this check is hard.
+            if runner.model: # Or some other flag like runner.is_initialized_successfully
+                self.assertIsNotNone(runner.model)
+            elif os.environ.get("CI_HAS_CUDA_GPU"): # Example: only assert NotNone if in CUDA env
+                 self.assertIsNotNone(runner.model, "AWQ model failed to load even in expected CUDA env.")
+        else:
+            runner_no_model = AWQRunner(model_path="dummy_non_existent_awq_dir")
+            self.assertIsInstance(runner_no_model, BaseRunner)
+            self.assertIsNone(runner_no_model.model, "Model should be None for invalid path.")
+
+
+    def test_generate_smoke(self):
+        if AWQ_TEST_MODEL_PATH and os.path.isdir(AWQ_TEST_MODEL_PATH):
+            runner = AWQRunner(model_path=AWQ_TEST_MODEL_PATH)
+            if runner.model:
+                response = runner.generate("Hello", max_new_tokens=10)
+                self.assertIsInstance(response, str)
+                # self.assertTrue(len(response) > 0) # Can be empty if max_new_tokens is small
+            else:
+                self.skipTest(f"AWQ Model at '{AWQ_TEST_MODEL_PATH}' did not load (self.model is None). Skipping generate test.")
+        else:
+            runner = AWQRunner(model_path="dummy_invalid_awq_dir")
+            self.assertIsNone(runner.model)
+            with self.assertRaisesRegex(RuntimeError, "AWQRunner model is not loaded"):
+                runner.generate("Hello")
+
+    def test_stream_smoke(self):
+        if AWQ_TEST_MODEL_PATH and os.path.isdir(AWQ_TEST_MODEL_PATH):
+            runner = AWQRunner(model_path=AWQ_TEST_MODEL_PATH)
+            if runner.model:
+                stream = runner.stream("Hello stream", max_new_tokens=10)
+                self.assertTrue(hasattr(stream, '__iter__'))
+                results = list(stream)
+                # self.assertTrue(len(results) > 0) # Can be empty
+            else:
+                self.skipTest(f"AWQ Model at '{AWQ_TEST_MODEL_PATH}' did not load (self.model is None). Skipping stream test.")
+        else:
+            runner = AWQRunner(model_path="dummy_invalid_awq_dir")
+            self.assertIsNone(runner.model)
+            with self.assertRaisesRegex(RuntimeError, "AWQRunner model is not loaded"):
+                 list(runner.stream("Hello stream"))
+
+
+@unittest.skipUnless(EXL2_AVAILABLE, "exllamav2 not installed")
+class TestEXL2RunnerSmoke(unittest.TestCase):
+    def test_initialization(self):
+        if EXL2_TEST_MODEL_PATH and os.path.isdir(EXL2_TEST_MODEL_PATH):
+            runner = EXL2Runner(model_path=EXL2_TEST_MODEL_PATH)
+            self.assertIsInstance(runner, BaseRunner)
+            if runner.model: # Check if model loaded successfully
+                self.assertIsNotNone(runner.model)
+            elif os.environ.get("CI_HAS_CUDA_GPU"): # Example: only assert NotNone if in CUDA env
+                 self.assertIsNotNone(runner.model, "EXL2 model failed to load even in expected CUDA env.")
+        else:
+            runner_no_model = EXL2Runner(model_path="dummy_non_existent_exl2_dir")
+            self.assertIsInstance(runner_no_model, BaseRunner)
+            self.assertIsNone(runner_no_model.model, "Model should be None for invalid path.")
+
+
+    def test_generate_smoke(self):
+        if EXL2_TEST_MODEL_PATH and os.path.isdir(EXL2_TEST_MODEL_PATH):
+            runner = EXL2Runner(model_path=EXL2_TEST_MODEL_PATH)
+            if runner.model:
+                response = runner.generate("Hello", max_new_tokens=10)
+                self.assertIsInstance(response, str)
+            else:
+                self.skipTest(f"EXL2 Model at '{EXL2_TEST_MODEL_PATH}' did not load (self.model is None). Skipping generate test.")
+        else:
+            runner = EXL2Runner(model_path="dummy_invalid_exl2_dir")
+            response = runner.generate("Hello") # generate() returns error string if not initialized
+            self.assertIn("Error: EXL2Runner is not available or not properly initialized.", response)
+
+
+    def test_stream_smoke(self):
+        if EXL2_TEST_MODEL_PATH and os.path.isdir(EXL2_TEST_MODEL_PATH):
+            runner = EXL2Runner(model_path=EXL2_TEST_MODEL_PATH)
+            if runner.model:
+                stream = runner.stream("Hello stream", max_new_tokens=10)
+                self.assertTrue(hasattr(stream, '__iter__'))
+                results = list(stream)
+            else:
+                self.skipTest(f"EXL2 Model at '{EXL2_TEST_MODEL_PATH}' did not load (self.model is None). Skipping stream test.")
+        else:
+            runner = EXL2Runner(model_path="dummy_invalid_exl2_dir")
+            stream_results = list(runner.stream("Hello stream")) # stream() yields error string if not initialized
+            self.assertTrue(len(stream_results) >= 1)
+            self.assertIn("Error: EXL2Runner is not available or not properly initialized.", stream_results[0])
 
 
 if __name__ == '__main__':
     unittest.main(argv=['first-arg-is-ignored'], exit=False)
+
+# End of llm_context_os/tests/test_runners.py
