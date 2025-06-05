@@ -8,6 +8,9 @@ from llm_context_os.runners.llama_cpp_runner import LlamaCppRunner
 from llm_context_os.runners.awq_runner import AWQRunner
 from llm_context_os.runners.api_runner import APIRunner
 from llm_context_os.runners.exl2_runner import EXL2Runner
+from llm_context_os.runners.llava_cpp_runner import LlavaCppRunner, LLAVA_CPP_AVAILABLE as LLAVA_RUNNER_FLAG # Alias to avoid clash
+from pathlib import Path
+
 
 # --- Conditional Availability Flags ---
 
@@ -33,6 +36,9 @@ try:
     EXL2_AVAILABLE = True
 except ImportError:
     print("Warning: exllamav2 not found. EXL2Runner smoke tests will be skipped.")
+
+# LLAVA_CPP_AVAILABLE is imported as LLAVA_RUNNER_FLAG from llava_cpp_runner.py
+# No need to redefine it here, just use LLAVA_RUNNER_FLAG
 
 # httpx for APIRunner is a direct dependency, so it should be available if requirements are met.
 # No explicit HTTX_AVAILABLE flag needed here, but tests will fail if not installed.
@@ -299,6 +305,181 @@ class TestEXL2RunnerSmoke(unittest.TestCase):
             runner = EXL2Runner(model_path="dummy_invalid_exl2_dir")
             self.assertIsNone(runner.tokenizer) # If init fails, tokenizer should be None
             self.assertIsNone(runner.count_tokens("Hello world"))
+
+
+@unittest.skipUnless(LLAVA_RUNNER_FLAG, "llava-cpp-python library not available or failed to import.")
+@patch('llm_context_os.runners.llava_cpp_runner.LlavaImageEmbed')
+@patch('llm_context_os.runners.llava_cpp_runner.LlavaLlama')
+class TestLlavaCppRunnerSmoke(unittest.TestCase):
+
+    def setUp(self, MockLlavaLlama, MockLlavaImageEmbed): # Mocks are passed by class decorators order
+        # Store mock classes themselves if needed, or their instances
+        self.MockLlavaLlamaClass = MockLlavaLlama
+        self.MockLlavaImageEmbedClass = MockLlavaImageEmbed
+
+        self.mock_llava_model_instance = MockLlavaLlama.return_value
+        self.mock_image_embedder_instance = MockLlavaImageEmbed.return_value
+
+        # Configure default behaviors for successful loading
+        MockLlavaLlama.create_from_gguf.return_value = self.mock_llava_model_instance
+        MockLlavaImageEmbed.load_from_gguf.return_value = self.mock_image_embedder_instance
+
+        self.mock_llava_model_instance.generate.return_value = "Mocked LLaVA generation"
+        self.mock_llava_model_instance.tokenize.return_value = [1,2,3,4,5] # For count_tokens
+
+        # Default runner instance for tests
+        # We pass mock classes to individual tests that need to assert calls on the class itself (like create_from_gguf)
+        self.runner = LlavaCppRunner(model_path="fake/llava.gguf", mmproj_path="fake/mmproj.gguf")
+        # Check if mocks were correctly assigned during init by the runner
+        self.assertEqual(self.runner.model, self.mock_llava_model_instance)
+        self.assertEqual(self.runner.image_embedder, self.mock_image_embedder_instance)
+
+    def test_llava_runner_initialization_success(self, MockLlavaLlama, MockLlavaImageEmbed):
+        # Runner is already initialized in setUp, so we check calls based on that
+        MockLlavaLlama.create_from_gguf.assert_called_once_with(
+            gguf_path="fake/llava.gguf",
+            n_gpu_layers=0,
+            n_ctx=2048,
+            verbose=False,
+            # Kwargs for llama.cpp specific params would be checked here if passed in init
+            # Using **{} for the additional_params part of the call check.
+            **{k:v for k,v in {} if k in [
+                    'seed', 'n_threads', 'n_batch', 'n_ubatch', 'logits_all',
+                    'embedding', 'rope_freq_base', 'rope_freq_scale', 'yarn_ext_factor',
+                    'yarn_attn_factor', 'yarn_beta_fast', 'yarn_beta_slow', 'yarn_orig_ctx',
+                    'mul_mat_q', 'offload_kqv']}
+        )
+        MockLlavaImageEmbed.load_from_gguf.assert_called_once_with(
+            gguf_path="fake/mmproj.gguf",
+            llama=self.mock_llava_model_instance
+        )
+        self.assertIsNotNone(self.runner.model)
+        self.assertIsNotNone(self.runner.image_embedder)
+
+    def test_llava_runner_initialization_model_load_failure(self, MockLlavaLlama, MockLlavaImageEmbed):
+        MockLlavaLlama.create_from_gguf.side_effect = Exception("Model load error")
+        runner = LlavaCppRunner(model_path="fake/llava.gguf", mmproj_path="fake/mmproj.gguf")
+        self.assertIsNone(runner.model)
+        self.assertIsNone(runner.image_embedder) # Projector loading shouldn't be attempted if model fails
+
+    def test_llava_runner_initialization_projector_load_failure(self, MockLlavaLlama, MockLlavaImageEmbed):
+        # Reset model loading mock to success for this test case
+        MockLlavaLlama.create_from_gguf.side_effect = None
+        MockLlavaLlama.create_from_gguf.return_value = self.mock_llava_model_instance
+
+        MockLlavaImageEmbed.load_from_gguf.side_effect = Exception("Projector load error")
+        runner = LlavaCppRunner(model_path="fake/llava.gguf", mmproj_path="fake/mmproj.gguf")
+
+        self.assertIsNotNone(runner.model, "Model should be loaded before projector loading is attempted")
+        self.assertIsNone(runner.image_embedder, "Image embedder should be None after projector load failure")
+
+
+    def test_llava_runner_generate_text_only(self, MockLlavaLlama, MockLlavaImageEmbed):
+        response = self.runner.generate("Text prompt")
+        self.mock_llava_model_instance.generate.assert_called_once_with(
+            text="Text prompt",
+            image_embeds=None, # No images passed
+            temp=0.8, top_p=0.95, max_new_tokens=512, stop=[]
+            # Other default generation params from self.additional_params would be here
+        )
+        self.assertEqual(response, "Mocked LLaVA generation")
+
+    @patch('llm_context_os.runners.llava_cpp_runner.Path')
+    def test_llava_runner_generate_with_images(self, MockPath, MockLlavaLlama, MockLlavaImageEmbed):
+        mock_path_instance = MockPath.return_value
+        mock_path_instance.exists.return_value = True # Simulate image file exists
+
+        mock_embedded_image = MagicMock(spec_set=True) # Use spec_set for stricter mocking if type is known
+        self.mock_image_embedder_instance.embed_image.return_value = mock_embedded_image
+
+        mock_image_file = "dummy_image.png"
+        response = self.runner.generate("Describe <image>", image_paths=[mock_image_file])
+
+        MockPath.assert_called_with(mock_image_file) # Check Path was instantiated with the file
+        mock_path_instance.exists.assert_called_once()
+        self.mock_image_embedder_instance.embed_image.assert_called_with(mock_path_instance)
+        self.mock_llava_model_instance.generate.assert_called_once_with(
+            text="Describe <image>",
+            image_embeds=[mock_embedded_image],
+            temp=0.8, top_p=0.95, max_new_tokens=512, stop=[]
+        )
+        self.assertEqual(response, "Mocked LLaVA generation")
+
+    def test_llava_runner_stream_text_only(self, MockLlavaLlama, MockLlavaImageEmbed):
+        # Current LlavaCppRunner simulates stream by calling generate if model.generate doesn't have 'stream' param
+        self.mock_llava_model_instance.generate.return_value = "Full streamed text"
+
+        # Simulate that self.model.generate does not have 'stream' in its signature
+        # to test the fallback path in LlavaCppRunner.stream()
+        del self.mock_llava_model_instance.generate._mock_extra_kwargs['stream'] # If it was added by mistake
+
+        # To properly test the inspect.signature part, we'd need a more complex mock for generate itself
+        # or ensure the default mock_llava_model_instance.generate doesn't have 'stream' in its signature.
+        # For simplicity, we assume the fallback is hit if 'stream' is not in sig.
+
+        with patch('inspect.signature') as mock_inspect_signature:
+            mock_signature = MagicMock()
+            mock_signature.parameters = {} # Empty dict means no 'stream' parameter
+            mock_inspect_signature.return_value = mock_signature
+
+            chunks = list(self.runner.stream("Stream prompt"))
+
+            self.mock_llava_model_instance.generate.assert_called_once_with(
+                text="Stream prompt",
+                image_embeds=None,
+                temp=0.8, top_p=0.95, max_new_tokens=512, stop=[]
+            )
+            self.assertEqual(chunks, ["Full streamed text"])
+
+    @patch('llm_context_os.runners.llava_cpp_runner.Path')
+    def test_llava_runner_stream_with_images(self, MockPath, MockLlavaLlama, MockLlavaImageEmbed):
+        mock_path_instance = MockPath.return_value
+        mock_path_instance.exists.return_value = True
+        mock_embedded_image = MagicMock(spec_set=True)
+        self.mock_image_embedder_instance.embed_image.return_value = mock_embedded_image
+
+        self.mock_llava_model_instance.generate.return_value = "Full streamed text with image"
+
+        with patch('inspect.signature') as mock_inspect_signature:
+            mock_signature = MagicMock()
+            mock_signature.parameters = {} # No 'stream' parameter
+            mock_inspect_signature.return_value = mock_signature
+
+            mock_image_file = "dummy_image.png"
+            chunks = list(self.runner.stream("Stream <image>", image_paths=[mock_image_file]))
+
+            self.mock_image_embedder_instance.embed_image.assert_called_with(mock_path_instance)
+            self.mock_llava_model_instance.generate.assert_called_once_with(
+                text="Stream <image>",
+                image_embeds=[mock_embedded_image],
+                temp=0.8, top_p=0.95, max_new_tokens=512, stop=[]
+            )
+            self.assertEqual(chunks, ["Full streamed text with image"])
+
+
+    def test_llava_runner_count_tokens(self, MockLlavaLlama, MockLlavaImageEmbed):
+        count = self.runner.count_tokens("Count this text")
+        # The runner encodes with utf-8. llava-cpp-python's tokenize expects bytes.
+        self.mock_llava_model_instance.tokenize.assert_called_with("Count this text".encode('utf-8'))
+        self.assertEqual(count, 5) # Based on setUp mock: [1,2,3,4,5]
+
+    def test_llava_runner_kv_cache_save_session(self, MockLlavaLlama, MockLlavaImageEmbed):
+        self.runner.save_kv_cache_session("test_session.bin")
+        self.mock_llava_model_instance.save_session.assert_called_once_with("test_session.bin".encode('utf-8'))
+
+    def test_llava_runner_kv_cache_load_session(self, MockLlavaLlama, MockLlavaImageEmbed):
+        self.runner.load_kv_cache_session("test_session.bin")
+        self.mock_llava_model_instance.load_session.assert_called_once_with("test_session.bin".encode('utf-8'))
+
+    def test_llava_runner_apply_lora(self, MockLlavaLlama, MockLlavaImageEmbed):
+        self.runner.apply_lora("lora_path.gguf", scale=0.8)
+        self.mock_llava_model_instance.apply_lora_from_file.assert_called_once_with(
+            lora_path="lora_path.gguf", scale=0.8
+        )
+
+    def test_llava_runner_remove_lora(self, MockLlavaLlama, MockLlavaImageEmbed):
+        self.runner.remove_lora()
+        self.mock_llava_model_instance.disable_lora.assert_called_once()
 
 
 if __name__ == '__main__':
