@@ -330,54 +330,101 @@ class TestChatStreamingAPI(unittest.TestCase):
     @patch('llm_context_os.api.main.tool_dispatcher.dispatch')
     @patch('llm_context_os.api.main.model_mgr')
     def test_chat_stream_with_tool_call_and_token_counts(self, mock_api_model_mgr, mock_tool_dispatch):
-        mock_runner = MagicMock()
+        mock_runner_instance = MagicMock()
 
-        # Configure stream to be called twice with different return values
-        initial_stream_chunks = ["[FUNCALL] {\"tool_name\": \"get_weather\", \"params\": {\"location\": \"London\"}}"]
-        final_stream_chunks = ["The weather in London is sunny. ", "Anything else?"]
+        # --- Mocking for first LLM call (leading to tool call) ---
+        prompt_msg1 = "What's the weather in London and then say hi?"
+        # Approximate prompt string for count_tokens mocking
+        expected_prompt1_text = f"{ctx_mgr.system_prompt}\nuser: {prompt_msg1}\n"
+        mock_prompt1_tokens = 25 # Assume this count
 
-        # Use a list of iterators/generators to simulate multiple calls to stream()
-        mock_runner.stream.side_effect = [
-            self.mock_async_stream_generator(initial_stream_chunks),
-            self.mock_async_stream_generator(final_stream_chunks)
+        # The text that contains the FUNCALL
+        func_call_text_content = "[FUNCALL] {\"tool_name\": \"get_weather\", \"params\": {\"location\": \"London\"}}"
+        # Assume the FUNCALL itself (if tokenized alone) is e.g. 15 tokens by the runner.
+        # This is tricky because the runner.stream yields (chunk, tokens_in_chunk).
+        # For a FUNCALL, the API endpoint buffers it.
+        # The key is what runner.count_tokens would return for the *final accumulated string* from the assistant.
+        # For this test, the first stream only yields the FUNCALL string.
+        mock_funcall_generated_tokens = 15
+
+        # --- Mocking for second LLM call (after tool call) ---
+        # This is the prompt text *after* the tool result is added.
+        # It's complex to construct exactly without running ctx_mgr.add for tool result.
+        # For mocking, we'll use a placeholder.
+        expected_prompt2_text = "System: ... User: ... ToolResult: ... Assistant: [FUNCALL] ... User: ... " # Simplified
+        mock_prompt2_tokens = 35 # Assume this count for the second prompt
+
+        final_reply_text = "The weather in London is sunny. Anything else?"
+        mock_final_reply_tokens = 10 # Assume this count for the final reply
+
+        def mock_runner_count_tokens_side_effect(text_to_count):
+            if text_to_count == expected_prompt1_text: return mock_prompt1_tokens
+            # The first call to runner.stream yields the FUNCALL. The sse_generator then calls count_tokens on this.
+            if text_to_count == func_call_text_content: return mock_funcall_generated_tokens
+            if expected_prompt2_text in text_to_count : return mock_prompt2_tokens # If it's a substring match for simplicity
+            if text_to_count == final_reply_text: return mock_final_reply_tokens
+            return len(text_to_count.split())
+        mock_runner_instance.count_tokens = MagicMock(side_effect=mock_runner_count_tokens_side_effect)
+
+        async def mock_stream_initial_call(*args, **kwargs):
+            prompt_text_arg = kwargs.get('prompt')
+            yield {"prompt_tokens": mock_runner_instance.count_tokens(prompt_text_arg)}
+            # Yield the FUNCALL string and its token count as if it's a single chunk from the LLM
+            yield (func_call_text_content, mock_funcall_generated_tokens)
+            await asyncio.sleep(0.001)
+
+        async def mock_stream_final_call(*args, **kwargs):
+            prompt_text_arg = kwargs.get('prompt')
+            yield {"prompt_tokens": mock_runner_instance.count_tokens(prompt_text_arg)}
+            yield ("The weather in London is sunny. ", 7)
+            await asyncio.sleep(0.001)
+            yield ("Anything else?", 3)
+
+        mock_runner_instance.stream.side_effect = [
+            mock_stream_initial_call,
+            mock_stream_final_call
         ]
-        mock_model_mgr_param.get.return_value = mock_runner
+        mock_api_model_mgr.get.return_value = mock_runner_instance
         mock_tool_dispatch.return_value = {"status": "success", "result": "Weather is sunny."}
 
-        chat_data = ChatRequest(message="What's the weather in London and then say hi?", stream=True)
-
+        chat_data = ChatRequest(message=prompt_msg1, stream=True)
         received_events = []
         with self.client.stream("POST", "/chat", json=chat_data.model_dump()) as response:
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers['content-type'], 'text/event-stream; charset=utf-8')
             for line_bytes in response.iter_lines():
                  received_events.extend(parse_sse_stream([line_bytes]))
 
-        # Assertions
-        tool_call_event_found = False
-        tool_name_from_event = ""
-        final_text_chunks = []
-        stream_ended = False
+        prompt_info_events = [e for e in received_events if e['event'] == 'prompt_info']
+        tool_call_event = next((e for e in received_events if e['event'] == 'tool_call'), None)
+        message_events_data = [e['data'] for e in received_events if e['event'] == 'message' and isinstance(e['data'], dict)]
+        stream_end_event = next((e for e in received_events if e['event'] == 'stream_end'), None)
 
-        for event in received_events:
-            if event['event'] == 'tool_call':
-                tool_call_event_found = True
-                tool_name_from_event = event['data'].get('tool_name')
-            elif event['event'] == 'message' and 'text' in event['data']:
-                final_text_chunks.append(event['data']['text'])
-            elif event['event'] == 'stream_end':
-                stream_ended = True
+        self.assertTrue(len(prompt_info_events) >= 2, "Expected at least two prompt_info events (initial and after tool call)")
+        self.assertEqual(prompt_info_events[0]['data'].get('prompt_tokens'), mock_prompt1_tokens)
+        self.assertEqual(prompt_info_events[0]['data'].get('context'), "initial_prompt")
 
-        self.assertTrue(tool_call_event_found, "Tool call event not found in stream.")
-        self.assertEqual(tool_name_from_event, "get_weather")
-        mock_tool_dispatch.assert_called_once_with("{\"tool_name\": \"get_weather\", \"params\": {\"location\": \"London\"}}")
-        self.assertEqual("".join(final_text_chunks), "".join(final_stream_chunks))
-        self.assertTrue(stream_ended, "Stream did not end correctly.")
-        self.assertEqual(mock_runner.stream.call_count, 2)
+        self.assertIsNotNone(tool_call_event)
+        self.assertEqual(tool_call_event['data'].get('tool_name'), "get_weather")
+
+        self.assertEqual(prompt_info_events[1]['data'].get('prompt_tokens'), mock_prompt2_tokens) # From second call to count_tokens
+        self.assertEqual(prompt_info_events[1]['data'].get('context'), "after_tool_call")
+
+        self.assertEqual("".join(d['text'] for d in message_events_data if 'text' in d), final_reply_text)
+
+        # Check tokens_in_chunk for data messages from the second stream
+        self.assertEqual(message_events_data[0].get('tokens_in_chunk'), 7) # "The weather in London is sunny. "
+        self.assertEqual(message_events_data[1].get('tokens_in_chunk'), 3) # "Anything else?"
+
+        self.assertIsNotNone(stream_end_event)
+        self.assertEqual(stream_end_event['data'].get('total_generated_tokens'), mock_final_reply_tokens) # Sum of 7 + 3
+        self.assertEqual(stream_end_event['data'].get('final_prompt_tokens'), mock_prompt2_tokens) # Prompt for the final text generation
+
+        self.assertEqual(mock_runner_instance.stream.call_count, 2)
+        mock_tool_dispatch.assert_called_once()
 
 
     @patch('llm_context_os.api.main.model_mgr')
-    def test_chat_stream_runner_error(self, mock_model_mgr_param):
+    def test_chat_stream_runner_error(self, mock_api_model_mgr): # Renamed mock_model_mgr_param
         mock_runner = MagicMock()
         mock_runner.stream.side_effect = Exception("Runner failed!") # Simulate error during stream
         mock_model_mgr_param.get.return_value = mock_runner

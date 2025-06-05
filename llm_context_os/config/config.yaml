@@ -36,3 +36,20 @@ model_scan_directories:
   # - "/path/to/another/model_collection" # Absolute path example
   # - "models/ggufs"
   # - "models/awq_models"
+
+# --- Model Downloading Settings ---
+model_download_dir: "models/downloaded/"  # Default local directory for downloaded models
+hf_token: null                            # Optional: Your Hugging Face API token (string or null)
+                                          # Can also be set via HUGGING_FACE_HUB_TOKEN env var
+# For snapshot_download:
+# These are examples; a very broad ignore list is often used initially,
+# or allow_patterns for specific file types like *.safetensors, *.json, tokenizer.model
+hf_snapshot_ignore_patterns:              # Optional: List of patterns to ignore when downloading a whole repo
+  - "*.md"
+  - "LICENSE"
+  - ".gitattributes"
+  - "docs/*"
+  - "examples/*"
+  # Add more patterns like "*.pt", "*.bin" if you usually only want specific formats (e.g. safetensors or gguf)
+hf_snapshot_allow_patterns: null          # Optional: List of patterns to exclusively download (takes precedence over ignore). E.g., ["*.gguf", "*.json", "*.safetensors", "tokenizer.model"]
+hf_repo_type: null                        # Optional: Type of the repo, e.g., "model", "dataset", "space". Auto-detected if null.
