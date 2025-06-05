@@ -18,6 +18,7 @@ class ChatRequest(BaseModel):
     image_paths: Optional[List[str]] = Field(None, description="Optional list of image paths or URLs relevant to the message.")
     use_rag: bool = Field(False, description="Whether to use RAG from chat history or PDFs.")
     pdf_doc_ids_for_rag: Optional[List[str]] = Field(None, description="Optional list of document IDs (e.g., PDF filenames without extension) to use for PDF RAG.") # Added
+    stream: bool = Field(False, description="Enable Server-Sent Events streaming for the response.")
     generation_params: GenerationParams = Field(default_factory=GenerationParams, description="Parameters for text generation.")
 
 class StatusResponse(BaseModel):
@@ -40,14 +41,21 @@ class UploadPdfResponse(BaseModel):
 
 
 if __name__ == '__main__':
-    print("--- ChatRequest with PDF RAG ---")
+    print("\n--- ChatRequest with PDF RAG and Stream---")
     chat_req_pdf_rag = ChatRequest(
         message="What did the climate report say about mitigation?",
         use_rag=True,
-        pdf_doc_ids_for_rag=["climate_change_overview", "another_report"]
+        pdf_doc_ids_for_rag=["climate_change_overview", "another_report"],
+        stream=True
     )
-    print(f"Chat with PDF RAG: {chat_req_pdf_rag.model_dump_json(indent=2)}")
+    print(f"Chat with PDF RAG and Stream: {chat_req_pdf_rag.model_dump_json(indent=2)}")
     assert chat_req_pdf_rag.pdf_doc_ids_for_rag == ["climate_change_overview", "another_report"]
+    assert chat_req_pdf_rag.stream is True
+
+    # Test default for stream
+    chat_req_no_stream = ChatRequest(message="Hello")
+    assert chat_req_no_stream.stream is False
+
 
     print("\n--- UploadPdfResponse ---")
     upload_resp_success = UploadPdfResponse(
