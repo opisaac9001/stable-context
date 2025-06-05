@@ -28,7 +28,10 @@ from llm_context_os.api.schemas import (
     ChatHistoryRetrieverSettings,
     PdfRetrieverSettings,
     ModelManagerSettings,
-    TokenEstimatorConfigSettings
+    TokenEstimatorConfigSettings,
+    ModelListResponse, # For /models/available
+    ToolInfo, ToolListResponse, ToggleToolRequest, # Added for tool management
+    DownloadModelRequest # Added for model download
 )
 from llm_context_os.context.context_manager import ContextManager, MockTokenizer
 from llm_context_os.context.token_estimator import TikTokenEstimator, HFTokenEstimator # For RAG tokenizer
@@ -60,7 +63,10 @@ DEFAULT_CONFIG = {
         "chunk_overlap": 50
     },
     "model_manager": {"default_idle_unload_sec": 900},
-    "token_estimator_for_rag_budgeting": {"type": "tiktoken", "model_name": "cl100k_base"}
+    "token_estimator_for_rag_budgeting": {"type": "tiktoken", "model_name": "cl100k_base"},
+    "model_discovery": { # Added model_discovery default
+        "scan_directories": [] # Default to no scan directories
+    }
 }
 CONFIG = DEFAULT_CONFIG.copy() # Start with defaults
 try:
@@ -150,6 +156,10 @@ print(f"ModelManager initialized with default_idle_unload_sec={model_mgr_config[
 tool_dispatcher = ToolDispatcher()
 print("ToolDispatcher initialized.")
 
+# --- Project Root for resolving relative paths in config ---
+PROJECT_ROOT = Path(__file__).resolve().parent.parent # llm_context_os directory
+print(f"Project root determined for resolving relative paths: {PROJECT_ROOT}")
+
 # --- Helper for deep merging dictionaries for settings updates ---
 def deep_merge_dicts(source: dict, updates: dict) -> dict:
     for key, value in updates.items():
@@ -223,12 +233,8 @@ async def update_settings_endpoint(updated_values: UpdateSettingsRequest):
         mm_updates = CONFIG.get('model_manager', {})
         if "default_idle_unload_sec" in mm_updates and model_mgr.default_idle_unload_sec != mm_updates["default_idle_unload_sec"]:
             model_mgr.default_idle_unload_sec = mm_updates["default_idle_unload_sec"]
-            # If a runner is active, its idle_unload_sec might also need updating if it was set from default
             if model_mgr.current_runner and model_mgr.current_runner_config:
-                 # Assuming current_runner_config stores the originally set idle_unload_sec for that runner
-                 # If the runner was loaded with its own specific idle_unload_sec, this global default change might not affect it.
-                 # For simplicity, we update the manager's default. New models loaded without specific idle time will use this.
-                 pass # Current runner's idle time is set at its load time.
+                 pass
             applied_notes.append(f"ModelManager default_idle_unload_sec updated to {model_mgr.default_idle_unload_sec}.")
 
     if "chat_history_retriever" in update_data:
@@ -260,9 +266,106 @@ async def update_settings_endpoint(updated_values: UpdateSettingsRequest):
     if applied_notes:
         message += " Applied live: " + "; ".join(applied_notes)
     if restart_notes:
-        message += " Require restart/re-init for full effect: " + "; ".join(list(set(restart_notes))) # list(set()) to remove duplicates
+        message += " Require restart/re-init for full effect: " + "; ".join(list(set(restart_notes)))
 
     return StatusResponse(status="ok", message=message)
+
+@app.post("/models/download", response_model=StatusResponse)
+async def download_model_endpoint(req: DownloadModelRequest):
+    """
+    (Placeholder) Initiates a model download from a Hugging Face repository.
+    Actual download logic to be implemented later.
+    """
+    print(f"Received download request for model repo: {req.repo_id}, filename: {req.filename or 'all files (repo)'}")
+    print(f"  Requested model type: {req.model_type or 'any'}")
+    print(f"  Requested target path: {req.target_path or 'default location'}")
+
+    # Placeholder: In a real implementation, this would trigger an async download task
+    # from huggingface_hub import hf_hub_download
+    # For now, just acknowledge the request.
+
+    # Determine a default target path if not provided, e.g., based on model_type and repo_id
+    # For example: models/<model_type>/<repo_id_user>/<repo_id_name>
+    # Ensure this path is within allowed configurable base model directories.
+
+    return StatusResponse(
+        status="ok",
+        message=f"Download request for '{req.repo_id}' (file: {req.filename or 'all files'}) received. "
+                f"Simulated download initiated. Model would appear at a predefined location based on target_path or defaults."
+    )
+
+@app.get("/models/available", response_model=ModelListResponse)
+async def get_available_models_endpoint():
+    """
+    Scans configured local directories for models and returns a list of available models.
+    """
+    model_discovery_config = CONFIG.get('model_discovery', {}) # Ensure this key exists in CONFIG/DEFAULT_CONFIG
+    scan_paths_from_config = model_discovery_config.get('scan_directories', []) # Use the correct key based on config
+
+    absolute_scan_paths = []
+    if scan_paths_from_config:
+        for p_str in scan_paths_from_config:
+            path_obj = Path(p_str)
+            if not path_obj.is_absolute():
+                path_obj = PROJECT_ROOT / p_str
+
+            if path_obj.exists() and path_obj.is_dir():
+                absolute_scan_paths.append(str(path_obj.resolve()))
+            else:
+                print(f"Warning: Configured scan directory does not exist or is not a directory: {path_obj}")
+
+    if not absolute_scan_paths:
+        print("No valid scan directories configured or found.")
+        return ModelListResponse(models=[])
+
+    try:
+        # Assuming model_scanner is imported correctly
+        from llm_context_os.utils import model_scanner # Ensure this import is at the top
+        found_models = model_scanner.scan_model_directories(absolute_scan_paths)
+        return ModelListResponse(models=found_models)
+    except Exception as e:
+        print(f"Error during model scanning: {e}")
+        # import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to scan model directories: {str(e)}")
+
+
+@app.get("/tools", response_model=ToolListResponse)
+async def list_tools_endpoint():
+    """
+    Lists all available tools (local and potentially MCP) and their current states.
+    """
+    tools = tool_dispatcher.list_tools()
+    return ToolListResponse(tools=tools)
+
+@app.post("/tools/toggle", response_model=StatusResponse)
+async def toggle_tool_endpoint(req: ToggleToolRequest):
+    """
+    Enables or disables a specified tool.
+    """
+    tool_name = req.tool_name
+    action_taken_msg = ""
+    success = False
+
+    if req.enable:
+        success = tool_dispatcher.enable_tool(tool_name)
+        action_taken_msg = f"Tool '{tool_name}' enabled."
+    else:
+        success = tool_dispatcher.disable_tool(tool_name)
+        action_taken_msg = f"Tool '{tool_name}' disabled."
+
+    # The current enable/disable_tool always returns True as it just updates state.
+    # A more robust check might involve seeing if tool_name is in list_tools().
+    # For now, we assume success in setting the state.
+    if success: # This will always be true with current implementation
+        # Check if the tool is known (i.e., was listed) to provide more context.
+        # This requires calling list_tools() again, or modifying enable/disable to return more info.
+        # For simplicity, we'll keep the message generic.
+        # If the tool was not previously known (e.g. a new MCP tool name being toggled),
+        # its state is now recorded.
+        return StatusResponse(status="ok", message=action_taken_msg)
+    else:
+        # This path is not reachable with current enable/disable_tool logic.
+        return StatusResponse(status="error", message=f"Failed to toggle tool '{tool_name}'. It might not be a known tool type that can be toggled.")
 
 
 @app.post("/load_model", response_model=StatusResponse)
@@ -386,10 +489,10 @@ async def chat_endpoint(req: ChatRequest):
 
     # --- Shared logic for handling tool calls ---
     def _handle_tool_call(
-        tool_call_str: str, # The raw "[FUNCALL]..." string
-        current_ctx_mgr: ContextManager,         # Now global, but passed for explicitness
-        current_tool_dispatcher: ToolDispatcher  # Now global, but passed for explicitness
-    ) -> tuple[str, str, str]: # Returns (second_prompt_text, tool_name, tool_params_json_str)
+        tool_call_str: str,
+        current_ctx_mgr: ContextManager,
+        current_tool_dispatcher: ToolDispatcher
+    ) -> tuple[str, str, str, t.Optional[Dict[str, int]]]: # Added dummy token counts for tool call itself
         print(f'[API /chat] Detected function call: {tool_call_str}')
         function_call_json_str = tool_call_str.replace('[FUNCALL]', '').strip()
 
@@ -412,16 +515,21 @@ async def chat_endpoint(req: ChatRequest):
         print('[API /chat] Added tool result to context. Building second prompt...')
         second_prompt_text = current_ctx_mgr.build_prompt()
         print(f"Built second prompt for model (len {len(second_prompt_text)} chars):\n{second_prompt_text[:500]}...")
-        return second_prompt_text, tool_name_for_event, function_call_json_str
+        # Tool execution itself doesn't directly consume LLM tokens in the same way.
+        # For now, returning None for token counts related to tool execution phase.
+        # If internal LLM calls were made by tools, that'd be different.
+        return second_prompt_text, tool_name_for_event, function_call_json_str, None
 
 
     # --- Streaming Response Logic ---
     if req.stream:
         async def sse_generator() -> AsyncGenerator[str, None]:
-            full_assistant_reply_for_history = [] # Accumulate chunks for CHR
+            full_assistant_reply_for_history = []
+            accumulated_completion_tokens = 0
+            prompt_tokens_for_final_response = 0 # Will hold prompt tokens for the call that generated text
+
             prompt_for_model = ""
             try:
-                # Use global instances directly in the generator context
                 prompt_for_model = _prepare_context_and_initial_prompt(req, ctx_mgr, chat_history_retriever, pdf_retriever)
             except HTTPException as e:
                 error_content = json.dumps({"error": e.detail, "status_code": e.status_code})
@@ -463,85 +571,126 @@ async def chat_endpoint(req: ChatRequest):
                         func_call_str_detected = current_buffered_text
                         break # Stop accumulating initial response, proceed to tool call
 
-                    # If no FUNCALL detected yet, yield the chunk
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
-                    await asyncio.sleep(0.01) # Small sleep to allow other tasks, if any
+                    # If no FUNCALL detected yet, yield the chunk with its token count
+                    # This assumes runner.stream() first yields prompt_tokens dict, then (chunk, count) tuples
+                    item = next(stream_iterator, None) # Priming yield for prompt_tokens
+                    if isinstance(item, dict) and "prompt_tokens" in item:
+                        prompt_tokens_for_final_response = item["prompt_tokens"]
+                        yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': prompt_tokens_for_final_response})}\n\n"
+                        # Now iterate for text chunks
+                        for text_chunk, tokens_in_chunk in stream_iterator: # type: ignore
+                            full_assistant_reply_for_history.append(text_chunk)
+                            accumulated_completion_tokens += tokens_in_chunk
+                            yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
+                            await asyncio.sleep(0.01)
+                    else: # Should not happen if runner adheres to new stream interface
+                        print(f"Warning: First item from runner.stream() was not prompt_tokens dict: {item}")
+                        # Handle as a normal chunk if it's a tuple, otherwise might be an error or unexpected
+                        if isinstance(item, tuple) and len(item) == 2:
+                             text_chunk, tokens_in_chunk = item
+                             full_assistant_reply_for_history.append(text_chunk)
+                             accumulated_completion_tokens += tokens_in_chunk
+                             yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
+                        # Continue with the rest of the stream
+                        for text_chunk, tokens_in_chunk in stream_iterator: # type: ignore
+                            full_assistant_reply_for_history.append(text_chunk)
+                            accumulated_completion_tokens += tokens_in_chunk
+                            yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
+                            await asyncio.sleep(0.01)
+
 
                 if func_call_str_detected:
-                    # We have a function call
-                    # The part of the FUNCALL string before "[FUNCALL]" is considered preceding text.
                     preceding_text, _, actual_func_call_payload = func_call_str_detected.partition("[FUNCALL]")
-                    if preceding_text: # Yield any text that came before the [FUNCALL] marker
-                        yield f"data: {json.dumps({'text': preceding_text})}\n\n"
+                    # Note: preceding_text was already yielded by the loop above before FUNCALL was fully processed.
+                    # We might need to adjust how preceding_text is handled if it's vital to separate it perfectly.
+                    # For now, the main goal is to ensure the FUNCALL itself is processed.
 
-                    # Reconstruct the "[FUNCALL]..." string for the handler
                     full_func_call_command = f"[FUNCALL]{actual_func_call_payload}"
-
-                    # Use global instances here too
-                    second_prompt, tool_name, tool_params_json_str = _handle_tool_call(full_func_call_command, ctx_mgr, tool_dispatcher)
+                    second_prompt, tool_name, tool_params_json_str, _ = _handle_tool_call(full_func_call_command, ctx_mgr, tool_dispatcher)
                     parsed_tool_params = {}
                     try: parsed_tool_params = json.loads(tool_params_json_str)
-                    except: pass # Keep it empty if not valid JSON for some reason
+                    except: pass
 
                     yield f"event: tool_call\ndata: {json.dumps({'tool_name': tool_name, 'tool_params': parsed_tool_params})}\n\n"
 
-                    # Stream the final response after tool call
-                    for final_chunk in runner.stream(prompt=second_prompt, **req.generation_params.model_dump()):
+                    # Clear history for the second LLM call's text accumulation
+                    full_assistant_reply_for_history.clear()
+                    accumulated_completion_tokens = 0 # Reset for the second stream
+
+                    stream_iterator_after_tool = runner.stream(prompt=second_prompt, **req.generation_params.model_dump())
+                    prompt_token_info_after_tool = next(stream_iterator_after_tool, None)
+                    if isinstance(prompt_token_info_after_tool, dict) and "prompt_tokens" in prompt_token_info_after_tool:
+                         # Could optionally send this new prompt_token count if relevant, e.g. as another prompt_info event
+                         # For now, we focus on the completion tokens from this second stream.
+                         prompt_tokens_for_final_response = prompt_token_info_after_tool["prompt_tokens"] # Update with second prompt's tokens
+                         yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': prompt_tokens_for_final_response, 'context': 'after_tool_call'})}\n\n"
+
+                    for final_chunk, tokens_in_chunk_final in stream_iterator_after_tool: # type: ignore
                         full_assistant_reply_for_history.append(final_chunk)
-                        yield f"data: {json.dumps({'text': final_chunk})}\n\n"
+                        accumulated_completion_tokens += tokens_in_chunk_final
+                        yield f"data: {json.dumps({'text': final_chunk, 'tokens_in_chunk': tokens_in_chunk_final})}\n\n"
                         await asyncio.sleep(0.01)
-                else: # No tool call, initial stream is the final response
-                    full_assistant_reply_for_history = initial_response_buffer # Already contains all chunks
+                # else: No tool call, initial stream is the final response. All chunks yielded.
 
             except Exception as e_stream:
                 print(f"Error during streaming: {e_stream}")
                 error_content = json.dumps({"error": str(e_stream)})
                 yield f"event: error\ndata: {error_content}\n\n"
             finally:
-                # Add accumulated assistant reply to history AFTER stream is fully processed
                 if full_assistant_reply_for_history:
                     try:
                         chat_history_retriever.add_message(message_text="".join(full_assistant_reply_for_history), role="assistant")
                     except Exception as e_chr_add_assist:
                         print(f"Warning: Failed to add assistant's streamed reply to ChatHistoryRetriever: {e_chr_add_assist}")
 
-                yield f"event: stream_end\ndata: {json.dumps({'message': 'Stream ended.'})}\n\n"
+                # Send final token counts for the generated text part
+                final_token_summary = {
+                    "message": "Stream ended.",
+                    "final_prompt_tokens": prompt_tokens_for_final_response, # Tokens for the prompt that led to text response
+                    "total_generated_tokens": accumulated_completion_tokens # Sum of tokens_in_chunk
+                }
+                yield f"event: stream_end\ndata: {json.dumps(final_token_summary)}\n\n"
 
         return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
     # --- Synchronous (Non-Streaming) Response Logic ---
     else:
         start_time = time.time()
-        final_reply_text = "" # Ensure it's always defined
+        final_reply_text = ""
+        prompt_tokens_count = 0
+        generated_tokens_count = 0
 
         try:
-            # Use global instances
             prompt_for_model = _prepare_context_and_initial_prompt(req, ctx_mgr, chat_history_retriever, pdf_retriever)
 
-            reply_text = runner.generate(
+            reply_text, token_counts1 = runner.generate(
                 prompt=prompt_for_model,
                 image_paths=req.image_paths,
                 **req.generation_params.model_dump()
             )
             final_reply_text = reply_text
+            prompt_tokens_count = token_counts1.get("prompt_tokens", 0)
+            generated_tokens_count = token_counts1.get("completion_tokens", 0)
 
             if reply_text.startswith('[FUNCALL]'):
-                second_prompt, _, _ = _handle_tool_call(reply_text, ctx_mgr, tool_dispatcher)
-                final_reply_text = runner.generate(second_prompt, **req.generation_params.model_dump())
+                second_prompt, _, _, _ = _handle_tool_call(reply_text, ctx_mgr, tool_dispatcher)
+                # For sync, the second call's tokens overwrite the first for simplicity of reporting one set.
+                # Or, one could sum them if that's more meaningful. Here, we report tokens for the final text-generating call.
+                final_reply_text, token_counts2 = runner.generate(second_prompt, **req.generation_params.model_dump())
+                prompt_tokens_count = token_counts2.get("prompt_tokens", 0) # Update with second prompt's tokens
+                generated_tokens_count = token_counts2.get("completion_tokens", 0) # Update with second call's completion
                 print(f"[API /chat] Final reply after tool call: {final_reply_text[:100]}...")
 
-            # Add final assistant reply to chat history retriever
-            if final_reply_text: # Ensure there is a reply to add
+            if final_reply_text:
                 try:
                     chat_history_retriever.add_message(message_text=final_reply_text, role="assistant")
                 except Exception as e_chr_add_assist_sync:
                     print(f"Warning: Failed to add assistant's sync reply to ChatHistoryRetriever: {e_chr_add_assist_sync}")
 
-        except HTTPException: # Re-raise HTTPExceptions from helpers
+        except HTTPException:
             raise
         except Exception as e:
             print(f"Error during model generation or tool call: {e}")
-            # import traceback; traceback.print_exc() # For debugging
             raise HTTPException(status_code=500, detail=f"Error during processing: {str(e)}")
 
         end_time = time.time()
@@ -549,8 +698,9 @@ async def chat_endpoint(req: ChatRequest):
 
         return ChatResponse(
             reply=final_reply_text,
-            request_details=req, # req now includes 'stream' field, which is fine
-            tokens_generated=None, # Placeholder, could be filled if runner returns count
+            request_details=req,
+            generated_tokens=generated_tokens_count,
+            prompt_tokens=prompt_tokens_count,
             latency_ms=round(latency_ms, 2)
         )
 
@@ -612,6 +762,32 @@ if __name__ == "__main__":
     #
     # Check settings again after update:
     # curl -X GET http://localhost:8000/settings
+    #
+    # 8. List available models (after configuring scan_directories and placing models)
+    # curl -X GET http://localhost:8000/models/available
+    # Remember to create dummy files like ./models/gguf_files/dummy.gguf
+    # or dirs like ./models/awq_model_dirs/my_awq_model_dir for the scan to find anything based on default config.
+    #
+    # 9. List available tools:
+    # curl -X GET http://localhost:8000/tools
+    #
+    # 10. Disable a tool (e.g., get_weather):
+    # curl -X POST http://localhost:8000/tools/toggle -H "Content-Type: application/json" -d '{"tool_name": "get_weather", "enable": false}'
+    #
+    # 11. Attempt to use the disabled tool via /chat (should result in an error or different behavior):
+    # curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"message": "What is the weather in London? [FUNCALL] {\"name\": \"get_weather\", \"arguments\": {\"location\": \"London\"}}", "stream": false}'
+    # (Note: The above curl for chat with FUNCALL is conceptual; normally the LLM generates the FUNCALL string.)
+    #
+    # 12. Re-enable the tool:
+    # curl -X POST http://localhost:8000/tools/toggle -H "Content-Type: application/json" -d '{"tool_name": "get_weather", "enable": true}'
+    #
+    # 13. Request a model download (placeholder):
+    # curl -X POST http://localhost:8000/models/download -H "Content-Type: application/json" -d \
+    # '{
+    #   "repo_id": "TheBloke/Mistral-7B-Instruct-v0.1-GGUF",
+    #   "filename": "mistral-7b-instruct-v0.1.Q4_K_M.gguf",
+    #   "model_type": "gguf"
+    # }'
 
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

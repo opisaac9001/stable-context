@@ -97,6 +97,26 @@ class TestAPIRunnerSmoke(unittest.TestCase):
         self.assertEqual("".join(stream_results), "Mocked stream chunk 1 chunk 2")
         mock_stream_method.assert_called_once()
 
+    def test_count_tokens(self):
+        runner = APIRunner(model_name=API_TEST_MODEL_NAME, api_url=API_TEST_URL, api_key=API_TEST_KEY)
+        self.assertIsInstance(runner, APIRunner)
+
+        text = "Hello, world!"
+        count = runner.count_tokens(text)
+        self.assertIsInstance(count, int)
+
+        # APIRunner's count_tokens uses tiktoken if available, else word split.
+        # This checks if tiktoken was likely used (more than word count for this specific phrase)
+        # or falls back to checking exact word count.
+        # "Hello," (1), " world" (1), "!" (1) -> 3 tokens for cl100k_base (used by APIRunner's tiktoken)
+        expected_tiktoken_count = 3
+        if runner.tokenizer is not None: # Indicates tiktoken was available and loaded
+             self.assertEqual(count, expected_tiktoken_count)
+        else: # Fallback to word count
+            self.assertEqual(count, len(text.split()))
+
+        self.assertEqual(runner.count_tokens(""), 0)
+
 
 @unittest.skipUnless(LLAMA_CPP_AVAILABLE, "llama-cpp-python not installed")
 class TestLlamaCppRunnerSmoke(unittest.TestCase):
@@ -142,6 +162,22 @@ class TestLlamaCppRunnerSmoke(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Model is not loaded"):
                 list(runner.stream("Hello stream"))
 
+    def test_count_tokens(self):
+        if LLAMA_CPP_TEST_MODEL_PATH and os.path.exists(LLAMA_CPP_TEST_MODEL_PATH):
+            runner = LlamaCppRunner(model_path=LLAMA_CPP_TEST_MODEL_PATH, verbose=False)
+            if runner.model:
+                self.assertIsInstance(runner.count_tokens("Hello world"), int)
+                # For Llama.cpp, "" might be tokenized to a BOS token if add_bos_token is true (default false)
+                # or empty list. If BOS is added, count is 1. If not, 0.
+                # Assuming default (no auto BOS on tokenize method):
+                self.assertEqual(runner.count_tokens(""), 0)
+            else:
+                self.skipTest(f"LlamaCPP Model at '{LLAMA_CPP_TEST_MODEL_PATH}' did not load. Skipping count_tokens test.")
+        else:
+            runner = LlamaCppRunner(model_path="dummy_invalid.gguf", verbose=False)
+            self.assertIsNone(runner.model)
+            self.assertIsNone(runner.count_tokens("Hello world")) # No model, should return None
+
 
 @unittest.skipUnless(AWQ_AVAILABLE, "autoawq or transformers not installed/compatible")
 class TestAWQRunnerSmoke(unittest.TestCase):
@@ -149,18 +185,14 @@ class TestAWQRunnerSmoke(unittest.TestCase):
         if AWQ_TEST_MODEL_PATH and os.path.isdir(AWQ_TEST_MODEL_PATH):
             runner = AWQRunner(model_path=AWQ_TEST_MODEL_PATH)
             self.assertIsInstance(runner, BaseRunner)
-            # AWQRunner.model might be None if CUDA is not available, even if path is valid.
-            # So, we only assert NotNone if we are sure CUDA is available and model should load.
-            # For a generic smoke test, this check is hard.
-            if runner.model: # Or some other flag like runner.is_initialized_successfully
+            if runner.model:
                 self.assertIsNotNone(runner.model)
-            elif os.environ.get("CI_HAS_CUDA_GPU"): # Example: only assert NotNone if in CUDA env
+            elif os.environ.get("CI_HAS_CUDA_GPU"):
                  self.assertIsNotNone(runner.model, "AWQ model failed to load even in expected CUDA env.")
         else:
             runner_no_model = AWQRunner(model_path="dummy_non_existent_awq_dir")
             self.assertIsInstance(runner_no_model, BaseRunner)
             self.assertIsNone(runner_no_model.model, "Model should be None for invalid path.")
-
 
     def test_generate_smoke(self):
         if AWQ_TEST_MODEL_PATH and os.path.isdir(AWQ_TEST_MODEL_PATH):
@@ -193,6 +225,22 @@ class TestAWQRunnerSmoke(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "AWQRunner model is not loaded"):
                  list(runner.stream("Hello stream"))
 
+    def test_count_tokens(self):
+        if AWQ_TEST_MODEL_PATH and os.path.isdir(AWQ_TEST_MODEL_PATH):
+            runner = AWQRunner(model_path=AWQ_TEST_MODEL_PATH)
+            if runner.tokenizer: # AWQRunner initialization sets self.tokenizer
+                self.assertIsInstance(runner.count_tokens("Hello world"), int)
+                # Most Hugging Face tokenizers return 0 for empty string if no special tokens are added.
+                # Some might add BOS/EOS by default in encode(), so this might vary.
+                # For a generic test, checking type is safer if specific count isn't known for ""
+                self.assertGreaterEqual(runner.count_tokens(""), 0)
+            else:
+                self.skipTest(f"AWQ Tokenizer for '{AWQ_TEST_MODEL_PATH}' did not load. Skipping count_tokens test.")
+        else:
+            runner = AWQRunner(model_path="dummy_invalid_awq_dir")
+            self.assertIsNone(runner.tokenizer)
+            self.assertIsNone(runner.count_tokens("Hello world"))
+
 
 @unittest.skipUnless(EXL2_AVAILABLE, "exllamav2 not installed")
 class TestEXL2RunnerSmoke(unittest.TestCase):
@@ -200,15 +248,14 @@ class TestEXL2RunnerSmoke(unittest.TestCase):
         if EXL2_TEST_MODEL_PATH and os.path.isdir(EXL2_TEST_MODEL_PATH):
             runner = EXL2Runner(model_path=EXL2_TEST_MODEL_PATH)
             self.assertIsInstance(runner, BaseRunner)
-            if runner.model: # Check if model loaded successfully
+            if runner.model:
                 self.assertIsNotNone(runner.model)
-            elif os.environ.get("CI_HAS_CUDA_GPU"): # Example: only assert NotNone if in CUDA env
+            elif os.environ.get("CI_HAS_CUDA_GPU"):
                  self.assertIsNotNone(runner.model, "EXL2 model failed to load even in expected CUDA env.")
         else:
             runner_no_model = EXL2Runner(model_path="dummy_non_existent_exl2_dir")
             self.assertIsInstance(runner_no_model, BaseRunner)
             self.assertIsNone(runner_no_model.model, "Model should be None for invalid path.")
-
 
     def test_generate_smoke(self):
         if EXL2_TEST_MODEL_PATH and os.path.isdir(EXL2_TEST_MODEL_PATH):
@@ -238,6 +285,20 @@ class TestEXL2RunnerSmoke(unittest.TestCase):
             stream_results = list(runner.stream("Hello stream")) # stream() yields error string if not initialized
             self.assertTrue(len(stream_results) >= 1)
             self.assertIn("Error: EXL2Runner is not available or not properly initialized.", stream_results[0])
+
+    def test_count_tokens(self):
+        if EXL2_TEST_MODEL_PATH and os.path.isdir(EXL2_TEST_MODEL_PATH):
+            runner = EXL2Runner(model_path=EXL2_TEST_MODEL_PATH)
+            if runner.tokenizer: # EXL2Runner initialization sets self.tokenizer
+                self.assertIsInstance(runner.count_tokens("Hello world"), int)
+                # ExLlamaV2Tokenizer.encode("") often returns a tensor like tensor([[2]]) (EOS token), so length 1.
+                self.assertEqual(runner.count_tokens(""), 1)
+            else:
+                self.skipTest(f"EXL2 Tokenizer for '{EXL2_TEST_MODEL_PATH}' did not load. Skipping count_tokens test.")
+        else:
+            runner = EXL2Runner(model_path="dummy_invalid_exl2_dir")
+            self.assertIsNone(runner.tokenizer) # If init fails, tokenizer should be None
+            self.assertIsNone(runner.count_tokens("Hello world"))
 
 
 if __name__ == '__main__':

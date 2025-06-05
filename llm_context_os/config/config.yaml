@@ -26,3 +26,13 @@ token_estimator_for_rag_budgeting:
   # model_name for tiktoken: e.g., "cl100k_base", "p50k_base"
   # model_name for hf: e.g., "gpt2", "facebook/opt-125m"
   model_name: "cl100k_base"
+
+# --- Model Discovery Configuration ---
+# Define a list of directories to scan for local models.
+# Paths can be absolute or relative to the project root (where llm_context_os is located).
+# For dockerized environments, these paths should correspond to paths within the container.
+model_scan_directories:
+  - "models/" # Default local models directory, relative to project root
+  # - "/path/to/another/model_collection" # Absolute path example
+  # - "models/ggufs"
+  # - "models/awq_models"

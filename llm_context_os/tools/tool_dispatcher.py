@@ -1,43 +1,135 @@
 # llm_context_os/tools/tool_dispatcher.py
 import json
+import inspect # For tool parameter and docstring inspection
 from llm_context_os.tools import builtin_weather
 import typing as t
-import os # Potentially for MCP config later
+from llm_context_os.api.schemas import ToolInfo # For listing tools
 
 # Attempt to import langchain_mcp_adapters
 MCP_ADAPTERS_AVAILABLE = False
-McpClient = None
+McpClient = None # Define McpClient for type hinting even if import fails
 try:
     from langchain_mcp_adapters import McpClient # Assuming this is the client class
     MCP_ADAPTERS_AVAILABLE = True
     print("Successfully imported McpClient from langchain_mcp_adapters.")
 except ImportError:
     print("Warning: langchain-mcp-adapters not found. MCP tool dispatching will be unavailable.")
-except Exception as e: # Catch other potential errors during import
+except Exception as e:
     print(f"Warning: Error importing McpClient from langchain-mcp-adapters: {e}. MCP tool dispatching will be unavailable.")
 
 
 class ToolDispatcher:
     def __init__(self):
-        self.local_tools = {
+        self.local_tools: t.Dict[str, t.Callable] = {
             "get_weather": builtin_weather.get_weather
         }
-        self.mcp_client: t.Optional[McpClient] = None
+        self.tool_states: t.Dict[str, bool] = {name: True for name in self.local_tools} # Default all local tools to enabled
 
+        self.mcp_client: t.Optional[McpClient] = None
         if MCP_ADAPTERS_AVAILABLE:
             try:
-                # Initialize McpClient.
-                # For this task, assuming default constructor works or it uses env vars.
-                # Real-world usage might involve passing server_urls from a config file:
-                # e.g., mcp_server_url = os.getenv("MCP_SERVER_URL", "http://default_mcp_server/api")
-                # self.mcp_client = McpClient(base_url=mcp_server_url)
                 self.mcp_client = McpClient()
                 print("[ToolDispatcher] McpClient initialized successfully.")
+                # Potentially pre-fetch available MCP tools and populate self.tool_states
+                # For now, MCP tools are implicitly enabled if client is up and tool is called.
+                # Toggling them would require knowing their names beforehand.
             except Exception as e:
                 print(f"[ToolDispatcher] Error initializing McpClient: {e}. MCP tools will be unavailable.")
                 self.mcp_client = None
         else:
             print("[ToolDispatcher] langchain-mcp-adapters not available. MCP tools will not be dispatched.")
+
+    def _get_tool_parameters(self, func: t.Callable) -> t.Dict[str, t.Any]:
+        params_schema = {"type": "object", "properties": {}, "required": []}
+        try:
+            sig = inspect.signature(func)
+            for name, param in sig.parameters.items():
+                param_info = {}
+                # Type annotation
+                if param.annotation != inspect.Parameter.empty:
+                    if hasattr(param.annotation, '__name__'):
+                        param_info["type"] = param.annotation.__name__.lower() # Simplified type
+                    elif hasattr(param.annotation, '__origin__') and param.annotation.__origin__ in [t.Union, t.Optional]:
+                         # Handle Optional[type] or Union[type, None]
+                        args = t.get_args(param.annotation)
+                        type_args = [a for a in args if a is not type(None)]
+                        if type_args and hasattr(type_args[0], '__name__'):
+                             param_info["type"] = type_args[0].__name__.lower()
+                        else: # Fallback for complex Unions or other types
+                             param_info["type"] = str(param.annotation)
+
+                # Default value
+                if param.default != inspect.Parameter.empty:
+                    param_info["default"] = param.default
+                else:
+                    params_schema["required"].append(name)
+
+                params_schema["properties"][name] = param_info
+        except Exception as e:
+            print(f"Warning: Could not generate detailed schema for tool {func.__name__}: {e}")
+            # Return a generic schema or indicate schema generation failure
+            return {"type": "object", "properties": {}, "description": "Parameter schema unavailable."}
+        return params_schema
+
+    def list_tools(self) -> t.List[ToolInfo]:
+        tool_info_list = []
+        # Local Tools
+        for tool_name, func in self.local_tools.items():
+            description = inspect.getdoc(func)
+            params = self._get_tool_parameters(func)
+            is_enabled = self.tool_states.get(tool_name, True) # Default to True
+            tool_info_list.append(ToolInfo(
+                name=tool_name,
+                type="local",
+                description=description,
+                is_enabled=is_enabled,
+                parameters=params
+            ))
+
+        # MCP Tools - Conceptual (Requires McpClient to have a method to list tools)
+        # if self.mcp_client:
+        #     try:
+        #         mcp_tool_list = self.mcp_client.list_available_tools() # Hypothetical method
+        #         for mcp_tool in mcp_tool_list:
+        #             is_enabled = self.tool_states.get(mcp_tool.name, True) # Default to True
+        #             tool_info_list.append(ToolInfo(
+        #                 name=mcp_tool.name,
+        #                 type="mcp",
+        #                 description=mcp_tool.description, # Assuming these attributes exist
+        #                 is_enabled=is_enabled,
+        #                 parameters=mcp_tool.parameters_schema # Assuming this attribute exists
+        #             ))
+        #     except Exception as e:
+        #         print(f"Warning: Could not retrieve tool list from MCP client: {e}")
+        # For now, MCP tools are not proactively listed, only discovered upon dispatch attempt.
+        # If an MCP tool state was set via enable/disable, it would be reflected if we listed it.
+
+        # Add any MCP tools whose state was explicitly set, even if not discoverable
+        if self.mcp_client: # Only relevant if MCP client exists
+            for tool_name, is_enabled_state in self.tool_states.items():
+                if tool_name not in self.local_tools: # It's an MCP tool we've learned about by toggle
+                    # We don't have description or params here, so list with minimal info
+                     if not any(t.name == tool_name for t in tool_info_list): # Avoid duplicates if discoverable later
+                        tool_info_list.append(ToolInfo(
+                            name=tool_name,
+                            type="mcp",
+                            description="Description not available (MCP tool state managed).",
+                            is_enabled=is_enabled_state,
+                            parameters={"type": "object", "properties": {}, "description": "Parameters not available."}
+                        ))
+        return tool_info_list
+
+    def enable_tool(self, tool_name: str) -> bool:
+        # This enables the tool for dispatch. If it's not a known local tool,
+        # it's assumed to be an MCP tool whose state is being managed.
+        self.tool_states[tool_name] = True
+        print(f"[ToolDispatcher] Tool '{tool_name}' enabled.")
+        return True # Always succeeds in setting the state
+
+    def disable_tool(self, tool_name: str) -> bool:
+        self.tool_states[tool_name] = False
+        print(f"[ToolDispatcher] Tool '{tool_name}' disabled.")
+        return True # Always succeeds in setting the state
 
     def dispatch(self, function_call_json: str) -> t.Dict[str, t.Any]:
         """
@@ -56,8 +148,13 @@ class ToolDispatcher:
             if not isinstance(tool_args, dict):
                  return {"tool_name": tool_name, "error": "Tool arguments must be a dictionary (JSON object).", "status": "error"}
 
-
             print(f"[ToolDispatcher] Parsed Tool Name: {tool_name}, Arguments: {tool_args}")
+
+            # Check if tool is enabled before dispatching
+            # Defaults to True if tool_name not in self.tool_states (e.g. a new MCP tool not yet toggled)
+            if not self.tool_states.get(tool_name, True):
+                print(f"[ToolDispatcher] Tool '{tool_name}' is disabled. Not dispatching.")
+                return {"tool_name": tool_name, "error": f"Tool '{tool_name}' is currently disabled.", "status": "error_disabled"}
 
             if tool_name in self.local_tools:
                 tool_function = self.local_tools[tool_name]
@@ -69,27 +166,19 @@ class ToolDispatcher:
                 except Exception as e:
                     return {"tool_name": tool_name, "error": f"Error executing local tool {tool_name}: {str(e)}", "status": "error"}
 
-            # If not a local tool, try MCP if available
             elif self.mcp_client:
                 print(f"[ToolDispatcher] Attempting to dispatch '{tool_name}' to MCP client with args: {tool_args}")
                 try:
-                    # Assuming McpClient has an 'invoke' or similar method.
-                    # The structure of the response from mcp_client.invoke needs to be known.
-                    # For now, assume it returns the direct result of the tool.
-                    # If it returns a more complex object, adaptation will be needed.
-                    mcp_result = self.mcp_client.invoke(tool_name, tool_args) # Or e.g. tool_args if it expects a dict
-                    # Example: mcp_result = self.mcp_client.invoke({"tool_name": tool_name, "tool_input": tool_args})
-
+                    mcp_result = self.mcp_client.invoke(tool_name, tool_args)
                     print(f"[ToolDispatcher] MCP tool '{tool_name}' executed. Result: {mcp_result}")
+                    # Update tool_states to mark this MCP tool as known and enabled by default if it was successful
+                    if tool_name not in self.tool_states: self.tool_states[tool_name] = True
                     return {"tool_name": tool_name, "result": mcp_result, "status": "success"}
                 except Exception as e:
-                    # This could be various errors: tool not found on MCP, execution error on MCP, network error.
-                    # langchain_mcp_adapters might raise specific exceptions to distinguish these.
                     error_message = f"MCP Error for tool {tool_name}: {str(e)}"
                     print(f"[ToolDispatcher] {error_message}")
                     return {"tool_name": tool_name, "error": error_message, "status": "error"}
 
-            # If not local and MCP client not available or tool not found by MCP (if McpClient raises specific error caught above)
             else:
                 return {"tool_name": tool_name, "error": f"Unknown tool: {tool_name}. Not found in local tools or MCP (client unavailable/tool not found).", "status": "error"}
 
@@ -190,3 +279,50 @@ if __name__ == '__main__':
     # Expected: {'tool_name': None, 'error': 'Missing tool name in function call.', 'status': 'error'}
 
     print("\nToolDispatcher demo complete.")
+
+    print("\n--- Testing Tool Listing and Management ---")
+    print("Initial tool list:")
+    for tool_info in dispatcher.list_tools():
+        print(f"  - {tool_info.name} (Enabled: {tool_info.is_enabled}, Type: {tool_info.type}, Params: {tool_info.parameters})")
+
+    print("\nDisabling 'get_weather' tool...")
+    dispatcher.disable_tool("get_weather")
+    print("Tool list after disabling 'get_weather':")
+    for tool_info in dispatcher.list_tools():
+        if tool_info.name == "get_weather":
+            print(f"  - {tool_info.name} (Enabled: {tool_info.is_enabled})") # Should be False
+            assert not tool_info.is_enabled
+
+    print("\nAttempting to dispatch disabled 'get_weather':")
+    weather_call_disabled = '{"name": "get_weather", "arguments": {"location": "New York"}}'
+    result_disabled = dispatcher.dispatch(weather_call_disabled)
+    print(f"Dispatch result (disabled): {result_disabled}")
+    assert result_disabled['status'] == 'error_disabled'
+    assert "disabled" in result_disabled['error']
+
+    print("\nEnabling 'get_weather' tool...")
+    dispatcher.enable_tool("get_weather")
+    print("Tool list after re-enabling 'get_weather':")
+    for tool_info in dispatcher.list_tools():
+        if tool_info.name == "get_weather":
+            print(f"  - {tool_info.name} (Enabled: {tool_info.is_enabled})") # Should be True
+            assert tool_info.is_enabled
+
+    print("\nAttempting to dispatch enabled 'get_weather':")
+    result_enabled_again = dispatcher.dispatch(weather_call_valid) # Use valid call from earlier
+    print(f"Dispatch result (enabled again): {result_enabled_again}")
+    assert result_enabled_again['status'] == 'success'
+
+    print("\nTesting enabling/disabling a non-local (presumed MCP) tool:")
+    dispatcher.disable_tool("mcp_hypothetical_tool")
+    self.assertFalse(dispatcher.tool_states.get("mcp_hypothetical_tool"))
+    mcp_tool_info = next((t for t in dispatcher.list_tools() if t.name == "mcp_hypothetical_tool"), None)
+    self.assertIsNotNone(mcp_tool_info)
+    self.assertFalse(mcp_tool_info.is_enabled)
+
+    dispatcher.enable_tool("mcp_hypothetical_tool")
+    self.assertTrue(dispatcher.tool_states.get("mcp_hypothetical_tool"))
+    mcp_tool_info_enabled = next((t for t in dispatcher.list_tools() if t.name == "mcp_hypothetical_tool"), None)
+    self.assertTrue(mcp_tool_info_enabled.is_enabled)
+
+    print("\nTool Management Demo complete.")

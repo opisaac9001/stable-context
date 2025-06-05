@@ -14,9 +14,11 @@ from .vllm_runner import VLLMRunner
 from .llava_cpp_runner import LlavaCppRunner
 from llm_context_os.caching.kv_cache_manager import KVCacheManager
 from llm_context_os.tuning.auto_tuner import AutoTuner
+from llm_context_os.api.schemas import AvailableModel # For model listing
+import glob # For model scanning
 
 class ModelManager:
-    def __init__(self):
+    def __init__(self, default_idle_unload_sec: t.Optional[int] = None): # Added default for consistency with api/main
         self.current_runner: t.Optional[BaseRunner] = None
         self.current_model_type: t.Optional[str] = None
         self.current_model_identifier: t.Optional[str] = None
@@ -186,6 +188,98 @@ class ModelManager:
     def unmerge_loras_on_current_runner(self, **kwargs) -> bool:
         if not self.current_runner: print("[ModelManager] Error: No model loaded."); return False
         self.last_accessed_time = time.time(); return self.current_runner.unmerge_lora_adapters(**kwargs)
+
+    def list_available_local_models(self, scan_configs: t.List[t.Dict[str, str]], project_root_dir: Path) -> t.List[AvailableModel]:
+        available_models_list: t.List[AvailableModel] = []
+        if not scan_configs:
+            print("[ModelManager] No scan_directories configured for model discovery.")
+            return available_models_list
+
+        for config_entry in scan_configs:
+            try:
+                scan_path_str = config_entry.get("path")
+                model_type = config_entry.get("type")
+                if not scan_path_str or not model_type:
+                    print(f"[ModelManager] Skipping invalid scan_config (missing path or type): {config_entry}")
+                    continue
+
+                # Resolve path: if relative, assume it's relative to project_root_dir
+                scan_path = Path(scan_path_str)
+                if not scan_path.is_absolute():
+                    scan_path = (project_root_dir / scan_path).resolve()
+                else:
+                    scan_path = scan_path.resolve() # Ensure absolute paths are also resolved (e.g. for symlinks)
+
+                print(f"[ModelManager] Scanning path: {scan_path} for type: {model_type}")
+
+                if not scan_path.exists():
+                    print(f"[ModelManager] Path does not exist, skipping: {scan_path}")
+                    continue
+
+                if model_type == "gguf":
+                    glob_pattern = config_entry.get("glob_pattern", "*.gguf")
+                    # Use rglob for recursive search if desired, or glob for non-recursive
+                    for filepath in scan_path.glob(glob_pattern):
+                        if filepath.is_file():
+                            try:
+                                model_details = {"size_bytes": filepath.stat().st_size}
+                                # Potential: Add more details by trying to read GGUF metadata if a library allows it easily
+                                available_models_list.append(AvailableModel(
+                                    model_id=f"gguf_{filepath.stem.replace('.', '_')}", # Make ID more FS/URL friendly
+                                    model_type="gguf",
+                                    path_or_identifier=str(filepath),
+                                    name=filepath.name,
+                                    details=model_details
+                                ))
+                            except Exception as e_file:
+                                print(f"[ModelManager] Error processing GGUF file {filepath}: {e_file}")
+                elif model_type in ["awq_dir", "exl2_dir"]:
+                    # For these types, scan_path is expected to be a parent directory containing model subdirectories
+                    # Or, if scan_path itself is a model dir, it should be handled.
+                    # Current logic assumes scan_path is a directory *containing* model dirs.
+                    # If scan_path IS the model dir:
+                    # Option 1: User points directly to model dir in config.
+                    # Option 2: Scan subdirectories of scan_path.
+                    # Let's assume Option 2: scan_path is a container for model dirs.
+
+                    for model_dir_path in scan_path.iterdir():
+                        if model_dir_path.is_dir():
+                            actual_model_type = model_type.replace("_dir", "")
+                            is_valid_model_dir = False
+                            if actual_model_type == "awq":
+                                # Common AWQ marker files: "quant_config.json", "model.safetensors" (or "pytorch_model.bin")
+                                if (model_dir_path / "quant_config.json").exists() and \
+                                   ((model_dir_path / "model.safetensors").exists() or \
+                                    (model_dir_path / "pytorch_model.bin").exists()):
+                                    is_valid_model_dir = True
+                                else:
+                                    print(f"[ModelManager] AWQ directory {model_dir_path} missing common marker files (quant_config.json and model file).")
+                            elif actual_model_type == "exl2":
+                                # Common EXL2 marker file: "config.json" (and others like .safetensors files)
+                                if (model_dir_path / "config.json").exists():
+                                    is_valid_model_dir = True
+                                else:
+                                    print(f"[ModelManager] EXL2 directory {model_dir_path} missing common marker file (config.json).")
+
+                            if is_valid_model_dir:
+                                try:
+                                    available_models_list.append(AvailableModel(
+                                        model_id=f"{actual_model_type}_{model_dir_path.name.replace('.', '_')}",
+                                        model_type=actual_model_type,
+                                        path_or_identifier=str(model_dir_path),
+                                        name=model_dir_path.name
+                                        # Details could include listing files or checking specific config.json values
+                                    ))
+                                except Exception as e_dir:
+                                     print(f"[ModelManager] Error processing model directory {model_dir_path}: {e_dir}")
+                else:
+                    print(f"[ModelManager] Unknown model_type '{model_type}' in scan_config: {config_entry}")
+            except Exception as e:
+                print(f"[ModelManager] Error processing scan_config {config_entry}: {e}")
+
+        print(f"[ModelManager] Found {len(available_models_list)} local models from scan configurations.")
+        return available_models_list
+
 
 if __name__ == '__main__':
     kv_cache_dir_for_demo = Path("data/kv_cache_manager_demo_main")

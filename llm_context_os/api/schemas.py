@@ -28,7 +28,8 @@ class StatusResponse(BaseModel):
 class ChatResponse(BaseModel):
     reply: str = Field(..., description="The LLM's reply.")
     request_details: Optional[ChatRequest] = Field(None, description="Original request details.")
-    tokens_generated: Optional[int] = Field(None, description="Number of tokens generated in the reply.", gt=-1)
+    generated_tokens: Optional[int] = Field(None, description="Number of tokens generated in the reply.", gt=-1) # Renamed
+    prompt_tokens: Optional[int] = Field(None, description="Number of tokens in the input prompt processed by the model.", gt=-1) # Added
     latency_ms: Optional[float] = Field(None, description="Time taken to generate the response in milliseconds.", ge=0.0)
 
 # New Schema for PDF Upload Response
@@ -76,6 +77,41 @@ class GlobalSettings(BaseModel):
 UpdateSettingsRequest = GlobalSettings
 
 
+# --- Model Listing Schemas ---
+class AvailableModel(BaseModel):
+    model_id: str = Field(..., description="A unique identifier for the model, could be filename or a derived ID.")
+    model_type: str = Field(..., description="Type of the model (e.g., 'gguf', 'awq', 'exl2', 'api_provided').")
+    path_or_identifier: str = Field(..., description="Filesystem path to the model or unique name for API models.")
+    name: Optional[str] = Field(None, description="A user-friendly name, could be derived from path.")
+    description: Optional[str] = Field(None, description="Brief description of the model.")
+    details: Optional[Dict[str, Any]] = Field(None, description="Extra information like file size, quantization, family, etc.")
+
+class ModelListResponse(BaseModel):
+    models: List[AvailableModel] = Field(..., description="List of available models.")
+
+# --- Tool Listing & Management Schemas ---
+class ToolInfo(BaseModel):
+    name: str = Field(..., description="Unique name of the tool.")
+    type: str = Field(..., description="Type of the tool (e.g., 'local', 'mcp').")
+    description: Optional[str] = Field(None, description="Description of what the tool does.")
+    is_enabled: bool = Field(True, description="Whether the tool is currently enabled for dispatch.")
+    parameters: Optional[Dict[str, Any]] = Field(None, description="JSON schema of parameters the tool accepts.")
+
+class ToolListResponse(BaseModel):
+    tools: List[ToolInfo] = Field(..., description="List of available tools and their status.")
+
+class ToggleToolRequest(BaseModel):
+    tool_name: str = Field(..., description="The name of the tool to enable or disable.")
+    enable: bool = Field(..., description="Set to true to enable the tool, false to disable.")
+
+# --- Model Download Schemas ---
+class DownloadModelRequest(BaseModel):
+    repo_id: str = Field(..., description="The Hugging Face repository ID (e.g., 'TheBloke/Mistral-7B-Instruct-v0.1-GGUF').")
+    model_type: Optional[str] = Field(None, description="Expected model type (e.g., 'gguf', 'awq', 'exl2'). Helps in organizing downloaded files or validation.")
+    filename: Optional[str] = Field(None, description="Specific filename to download from the repo (especially for GGUF). If None, attempts to download suitable files or the whole repo based on type.")
+    target_path: Optional[str] = Field(None, description="Optional local relative path within a configured models directory to save the model. If None, a default path will be constructed.")
+
+
 if __name__ == '__main__':
     print("\n--- ChatRequest with PDF RAG and Stream---")
     chat_req_pdf_rag = ChatRequest(
@@ -117,17 +153,20 @@ if __name__ == '__main__':
     params_default = GenerationParams()
     print(f"Default GenParams: {params_default.model_dump_json(indent=2)}")
 
-    print("\n--- ChatResponse with updated ChatRequest (existing) ---")
-    chat_resp = ChatResponse(
+    print("\n--- ChatResponse (Updated for token counts) ---")
+    chat_resp_updated = ChatResponse(
         reply="The PDF discusses several mitigation strategies.",
-        request_details=chat_req_pdf_rag,
-        tokens_generated=20,
+        request_details=chat_req_pdf_rag, # Using existing complex request
+        generated_tokens=20,
+        prompt_tokens=150, # Example prompt token count
         latency_ms=150.0
     )
-    print(f"Chat Resp with PDF RAG in details: {chat_resp.model_dump_json(indent=2)}")
-    assert chat_resp.request_details.pdf_doc_ids_for_rag == ["climate_change_overview", "another_report"]
+    print(f"Updated ChatResponse: {chat_resp_updated.model_dump_json(indent=2)}")
+    assert chat_resp_updated.generated_tokens == 20
+    assert chat_resp_updated.prompt_tokens == 150
 
-    print("\nSchema definitions and examples updated.")
+
+    print("\nSchema definitions and examples updated (GlobalSettings, etc.).")
 
     print("\n--- GlobalSettings Example (Partial) ---")
     partial_settings = GlobalSettings(
@@ -155,3 +194,44 @@ if __name__ == '__main__':
     empty_settings = GlobalSettings()
     print(empty_settings.model_dump_json(indent=2, exclude_unset=True)) # Should be {}
     assert empty_settings.model_dump(exclude_unset=True) == {}
+
+    print("\n--- Model Listing Schemas Examples ---")
+    available_model_ex = AvailableModel(
+        model_id="model_abc_123",
+        model_type="gguf",
+        path_or_identifier="/path/to/models/model_abc.gguf",
+        name="My Awesome GGUF Model",
+        description="A GGUF version of a popular LLM.",
+        details={"quantization": "Q5_K_M", "size_gb": 7.5, "family": "LlamaFam"}
+    )
+    print(f"AvailableModel: {available_model_ex.model_dump_json(indent=2)}")
+
+    model_list_resp_ex = ModelListResponse(models=[available_model_ex])
+    print(f"ModelListResponse: {model_list_resp_ex.model_dump_json(indent=2)}")
+    assert len(model_list_resp_ex.models) == 1
+
+    print("\n--- Tool Listing & Management Schemas Examples ---")
+    tool_info_ex = ToolInfo(
+        name="get_weather",
+        type="local",
+        description="Gets the current weather for a specified location.",
+        is_enabled=True,
+        parameters={"type": "object", "properties": {"location": {"type": "string"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}}, "required": ["location"]}
+    )
+    print(f"ToolInfo: {tool_info_ex.model_dump_json(indent=2)}")
+
+    tool_list_resp_ex = ToolListResponse(tools=[tool_info_ex])
+    print(f"ToolListResponse: {tool_list_resp_ex.model_dump_json(indent=2)}")
+
+    toggle_tool_req_ex = ToggleToolRequest(tool_name="get_weather", enable=False)
+    print(f"ToggleToolRequest: {toggle_tool_req_ex.model_dump_json(indent=2)}")
+
+    print("\n--- DownloadModelRequest Example ---")
+    download_req_ex = DownloadModelRequest(
+        repo_id="TheBloke/Mistral-7B-Instruct-v0.1-GGUF",
+        model_type="gguf",
+        filename="mistral-7b-instruct-v0.1.Q4_K_M.gguf",
+        target_path="downloaded_ggufs/"
+    )
+    print(f"DownloadModelRequest: {download_req_ex.model_dump_json(indent=2)}")
+    assert download_req_ex.filename == "mistral-7b-instruct-v0.1.Q4_K_M.gguf"

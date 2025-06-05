@@ -120,67 +120,120 @@ class EXL2Runner(BaseRunner):
 
         return settings
 
-    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> str:
-        if not EXL2_AVAILABLE or not self.model or not self.generator or not self.tokenizer:
-            return "Error: EXL2Runner is not available or not properly initialized."
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Tuple[str, t.Dict[str, int]]:
+        if not EXL2_AVAILABLE or not self.model or not self.generator or not self.tokenizer or not self.config:
+            error_msg = "Error: EXL2Runner is not available or not properly initialized."
+            print(f"[EXL2Runner] {error_msg}")
+            return error_msg, {"prompt_tokens": 0, "completion_tokens": 0}
 
+        # ... (logging as before) ...
         print(f"\n--- EXL2Runner ({os.path.basename(self.model_path)}) Generating ---")
         print(f"Prompt: {prompt[:100]}...")
-        if image_paths:
-            print(f"  Image Paths: {image_paths} (Note: EXL2Runner base class does not support multimodal image input with text.)")
+        if image_paths: print(f"  Image Paths: {image_paths} (Note: EXL2Runner base class does not support multimodal image input with text.)")
         if self._active_loras_objects: print(f"  Active LoRAs (applied): {list(self.loras.keys())}")
 
+
         settings = self._get_sampler_settings(**kwargs)
-        max_new_tokens = kwargs.get("max_new_tokens", self.config.max_seq_len - 10) # Ensure space for prompt
+        # Default max_new_tokens, ensuring space for the prompt itself.
+        # Tokenizer.encode() returns a tensor of shape (1, num_tokens).
+        prompt_ids = self.tokenizer.encode(prompt)
+        prompt_tokens = prompt_ids.shape[-1]
 
-        # generate_simple expects input_ids. Ensure prompt + generated does not exceed max_seq_len
-        # This is handled by max_new_tokens in generate_simple, but good to be mindful of input_ids length
+        # Calculate max_new_tokens intelligently
+        # Max new tokens should not exceed model's context length minus prompt tokens minus some buffer (e.g. 10 for safety)
+        model_max_seq_len = self.config.max_seq_len
+        max_possible_new_tokens = model_max_seq_len - prompt_tokens - 10
 
-        # Note: generate_simple re-encodes, re-caches. For optimal performance with KV, use stream or manual gen loop.
+        # User can specify max_new_tokens or max_tokens (alias)
+        user_max_new_tokens = kwargs.get('max_new_tokens', kwargs.get('max_tokens'))
+
+        if user_max_new_tokens is not None:
+            max_new_tokens = min(user_max_new_tokens, max_possible_new_tokens)
+        else: # No user value, use calculated max possible
+            max_new_tokens = max_possible_new_tokens
+
+        if max_new_tokens <= 0:
+            error_msg = f"Error: Prompt length ({prompt_tokens}) is too close to or exceeds model max sequence length ({model_max_seq_len}). Cannot generate new tokens."
+            print(f"[EXL2Runner] {error_msg}")
+            return error_msg, {"prompt_tokens": prompt_tokens, "completion_tokens": 0}
+
+        print(f"[EXL2Runner] Generating with settings: {settings}, max_new_tokens: {max_new_tokens}")
+
         full_text = self.generator.generate_simple(
-            prompt,
-            settings,
-            max_new_tokens,
+            prompt=prompt, # generate_simple can take string directly
+            gen_settings=settings,
+            num_tokens=max_new_tokens, # generate_simple uses num_tokens for max_new_tokens
             seed=kwargs.get("seed")
         )
-        # generate_simple returns the full text (prompt + generation)
-        # We need to return only the generated part.
+
+        generated_text_only = ""
         if full_text.startswith(prompt):
-            return full_text[len(prompt):]
-        return full_text # Fallback, though usually it should include prompt
+            generated_text_only = full_text[len(prompt):]
+        else: # Fallback if prompt somehow not prepended (should not happen with generate_simple)
+            generated_text_only = full_text
+            print("[EXL2Runner] Warning: Full generated text did not start with the prompt.")
+
+        completion_ids = self.tokenizer.encode(generated_text_only)
+        completion_tokens = completion_ids.shape[-1]
+
+        token_counts = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+        print(f"  Tokens: prompt={prompt_tokens}, completion={completion_tokens}")
+        return generated_text_only, token_counts
 
 
-    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[str, None, None]:
-        if not EXL2_AVAILABLE or not self.model or not self.generator or not self.tokenizer:
-            yield "Error: EXL2Runner is not available or not properly initialized."
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[t.Union[t.Dict[str, int], t.Tuple[str, int]], None, None]:
+        if not EXL2_AVAILABLE or not self.model or not self.generator or not self.tokenizer or not self.config:
+            error_msg = "Error: EXL2Runner is not available or not properly initialized."
+            print(f"[EXL2Runner] {error_msg}")
+            yield {"prompt_tokens": 0}
+            yield (error_msg, 0)
             return
 
+        # ... (logging as before) ...
         print(f"\n--- EXL2Runner ({os.path.basename(self.model_path)}) Streaming ---")
         print(f"Prompt: {prompt[:100]}...")
-        if image_paths:
-            print(f"  Image Paths: {image_paths} (Note: EXL2Runner base class does not support multimodal image input with text.)")
+        if image_paths: print(f"  Image Paths: {image_paths} (Note: EXL2Runner base class does not support multimodal image input with text.)")
         if self._active_loras_objects: print(f"  Active LoRAs (applied): {list(self.loras.keys())}")
 
         settings = self._get_sampler_settings(**kwargs)
-        max_new_tokens = kwargs.get("max_new_tokens", self.config.max_seq_len - 10)
 
         input_ids = self.tokenizer.encode(prompt)
-        # Ensure input_ids are not too long for the context
-        if input_ids.shape[-1] >= self.config.max_seq_len:
-            yield f"Error: Prompt is too long ({input_ids.shape[-1]} tokens) for max_seq_len ({self.config.max_seq_len})."
+        prompt_tokens = input_ids.shape[-1]
+        yield {"prompt_tokens": prompt_tokens}
+        print(f"  Yielded prompt_tokens: {prompt_tokens}")
+
+        # Calculate max_new_tokens for stream based on remaining context window
+        model_max_seq_len = self.config.max_seq_len
+        max_possible_new_tokens = model_max_seq_len - prompt_tokens - 10 # Buffer
+
+        user_max_new_tokens = kwargs.get('max_new_tokens', kwargs.get('max_tokens'))
+        if user_max_new_tokens is not None:
+            max_new_tokens_to_generate = min(user_max_new_tokens, max_possible_new_tokens)
+        else:
+            max_new_tokens_to_generate = max_possible_new_tokens
+
+        if max_new_tokens_to_generate <= 0:
+            yield (f"Error: Prompt length ({prompt_tokens}) near/exceeds model max sequence length ({model_max_seq_len}).", 0)
             return
 
+        print(f"[EXL2Runner] Streaming with settings: {settings}, max_new_tokens_to_generate: {max_new_tokens_to_generate}")
         self.generator.begin_stream(input_ids, settings)
 
-        generated_tokens = 0
-        while True:
-            chunk, eos, _ = self.generator.stream()
-            generated_tokens += 1
-            if chunk: # May yield empty if only BOS token is processed initially
-                 yield chunk
-            if eos or generated_tokens >= max_new_tokens:
-                break
-        print("\nStreaming complete.")
+        generated_token_count_in_stream = 0
+        try:
+            while True:
+                chunk, eos, _ = self.generator.stream() # _ is list of probabilities if enabled
+                if chunk: # Can be empty if only BOS token, or if sampling produces empty string for a token
+                    tokens_in_chunk = self.tokenizer.encode(chunk).shape[-1] if chunk else 0
+                    yield (chunk, tokens_in_chunk)
+                generated_token_count_in_stream += 1 # ExLlamaV2 streams token by token (text is decoded token)
+                if eos or generated_token_count_in_stream >= max_new_tokens_to_generate:
+                    break
+        except Exception as e_stream:
+            print(f"[EXL2Runner] Error during model streaming: {e_stream}")
+            yield (f"[EXL2Runner] Error streaming response: {e_stream}", 0)
+        finally:
+            print("\nStreaming complete.")
 
 
     def preload_kv(self, prompt: str, **kwargs: t.Any) -> None:
@@ -298,6 +351,19 @@ class EXL2Runner(BaseRunner):
         print(f"\n--- EXL2Runner ({os.path.basename(self.model_path)}) Unmerging LoRA Adapters ---")
         raise NotImplementedError("Runtime unmerging of LoRA adapters is not applicable as merging is offline.")
 
+    def count_tokens(self, text: str) -> Optional[int]:
+        """Counts tokens using the loaded ExLlamaV2Tokenizer."""
+        if not self.tokenizer or not EXL2_AVAILABLE:
+            print("[EXL2Runner] Tokenizer not available, cannot count tokens.")
+            return None
+        try:
+            # ExLlamaV2Tokenizer.encode() returns a tensor of shape (1, num_tokens)
+            input_ids = self.tokenizer.encode(text)
+            return input_ids.shape[-1] # Get the last dimension for the token count
+        except Exception as e:
+            print(f"[EXL2Runner] Error tokenizing text: {e}")
+            return None
+
 
 if __name__ == '__main__':
     print(f"EXL2 Available for __main__ test: {EXL2_AVAILABLE}")
@@ -355,20 +421,33 @@ if __name__ == '__main__':
                 print(f"\n--- Testing generate() for model: {os.path.basename(exl2_runner.model_path)} ---")
                 try:
                     # Override default sampler settings for this specific call if needed
-                    response_text = exl2_runner.generate(test_prompt, max_new_tokens=100, temperature=0.75)
+                    response_text, token_counts = exl2_runner.generate(test_prompt, max_new_tokens=100, temperature=0.75)
                     print(f"\nGenerate call response:\n'{response_text}'")
+                    print(f"Token counts from generate: {token_counts}")
                 except Exception as e:
                     print(f"Error during generate(): {e}")
 
                 print(f"\n--- Testing stream() for model: {os.path.basename(exl2_runner.model_path)} ---")
                 try:
-                    full_streamed_response = []
+                    full_streamed_response_text = []
+                    stream_completion_tokens = 0
                     print("Streamed response:")
-                    # Example of overriding a sampler setting for this stream call
-                    for chunk in exl2_runner.stream(test_prompt, max_new_tokens=120, top_p=0.5):
-                        print(chunk, end="", flush=True)
-                        full_streamed_response.append(chunk)
-                    print(f"\n\nFull streamed response collected: '{''.join(full_streamed_response)}'")
+
+                    stream_gen = exl2_runner.stream(test_prompt, max_new_tokens=120, top_p=0.5)
+                    prompt_token_info = next(stream_gen)
+                    print(f"\nPrompt token info from stream: {prompt_token_info}")
+
+                    for item in stream_gen:
+                        if isinstance(item, tuple):
+                            text_chunk, tokens_in_chunk = item
+                            print(text_chunk, end="", flush=True)
+                            full_streamed_response_text.append(text_chunk)
+                            stream_completion_tokens += tokens_in_chunk
+                        else: # Should not happen with current implementation
+                            print(f"\nUnexpected stream item: {item}")
+
+                    print(f"\n\nFull streamed response collected: '{''.join(full_streamed_response_text)}'")
+                    print(f"Total completion tokens from stream (calculated): {stream_completion_tokens}")
                 except Exception as e:
                     print(f"Error during stream(): {e}")
 
@@ -378,6 +457,17 @@ if __name__ == '__main__':
                     unload_success = exl2_runner.unload_lora_adapter("my_test_lora")
                     print(f"LoRA 'my_test_lora' unload attempt: {'Success' if unload_success else 'Failed'}")
                     print(f"Active LoRAs after unload: {exl2_runner.get_active_lora_adapters()}")
+
+                print("\n--- Token Counting Demo (EXL2Runner) ---")
+                if exl2_runner.model and exl2_runner.tokenizer: # Check if model and tokenizer loaded
+                    sample_text_exl2 = "Test sentence for EXL2 tokenizer."
+                    token_count_exl2 = exl2_runner.count_tokens(sample_text_exl2)
+                    if token_count_exl2 is not None:
+                        print(f"'{sample_text_exl2}' has {token_count_exl2} tokens (EXL2Runner).")
+                    else:
+                        print(f"Could not count tokens for '{sample_text_exl2}' with EXL2Runner.")
+                else:
+                    print("Skipping EXL2 token counting demo as model/tokenizer was not loaded.")
             else:
                 print("EXL2Runner model initialization failed. Cannot run generation tests.")
     else:

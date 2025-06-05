@@ -184,6 +184,82 @@ class TestToolDispatcherAndTools(unittest.TestCase):
         self.assertEqual(result_dict['status'], 'error')
         self.assertIn("Missing tool name", result_dict['error'])
 
+    # --- Tests for new ToolDispatcher features: list_tools, enable/disable ---
+    def test_list_tools_content_and_schema(self):
+        # dispatcher is self.dispatcher from setUp
+        tools_info = self.dispatcher.list_tools()
+        self.assertIsInstance(tools_info, list)
+
+        get_weather_info = next((t for t in tools_info if t.name == "get_weather"), None)
+        self.assertIsNotNone(get_weather_info, "get_weather tool not found in list_tools output.")
+
+        self.assertEqual(get_weather_info.name, "get_weather")
+        self.assertEqual(get_weather_info.type, "local")
+        self.assertTrue(get_weather_info.is_enabled, "get_weather should be enabled by default.")
+        self.assertIn("current weather in a given location", get_weather_info.description.lower()) # Check part of docstring
+
+        # Check parameters schema for get_weather
+        self.assertIsNotNone(get_weather_info.parameters)
+        self.assertEqual(get_weather_info.parameters.get("type"), "object")
+        self.assertIn("location", get_weather_info.parameters.get("properties", {}))
+        self.assertIn("unit", get_weather_info.parameters.get("properties", {}))
+        self.assertIn("location", get_weather_info.parameters.get("required", []))
+        self.assertEqual(get_weather_info.parameters["properties"]["unit"].get("default"), "celsius")
+
+    def test_enable_disable_tool_cycle(self):
+        tool_name = "get_weather"
+
+        # 1. Disable
+        self.dispatcher.disable_tool(tool_name)
+        self.assertFalse(self.dispatcher.tool_states.get(tool_name), f"{tool_name} should be disabled in tool_states.")
+
+        listed_tool_disabled = next((t for t in self.dispatcher.list_tools() if t.name == tool_name), None)
+        self.assertIsNotNone(listed_tool_disabled)
+        self.assertFalse(listed_tool_disabled.is_enabled, f"{tool_name} should be listed as disabled.")
+
+        # 2. Enable
+        self.dispatcher.enable_tool(tool_name)
+        self.assertTrue(self.dispatcher.tool_states.get(tool_name), f"{tool_name} should be enabled in tool_states.")
+
+        listed_tool_enabled = next((t for t in self.dispatcher.list_tools() if t.name == tool_name), None)
+        self.assertIsNotNone(listed_tool_enabled)
+        self.assertTrue(listed_tool_enabled.is_enabled, f"{tool_name} should be listed as enabled.")
+
+    def test_toggle_mcp_tool_state_and_listing(self):
+        mcp_tool_name = "mcp_hypothetical_tool"
+
+        # Initially not present in tool_states unless explicitly added by some other means
+        self.assertNotIn(mcp_tool_name, self.dispatcher.tool_states)
+
+        # Disable (adds/sets it to False)
+        self.dispatcher.disable_tool(mcp_tool_name)
+        self.assertFalse(self.dispatcher.tool_states.get(mcp_tool_name))
+
+        mcp_tool_info_disabled = next((t for t in self.dispatcher.list_tools() if t.name == mcp_tool_name), None)
+        self.assertIsNotNone(mcp_tool_info_disabled, "Disabled MCP tool should appear in list_tools.")
+        self.assertEqual(mcp_tool_info_disabled.type, "mcp")
+        self.assertFalse(mcp_tool_info_disabled.is_enabled)
+        self.assertIn("Description not available", mcp_tool_info_disabled.description) # Generic desc
+
+        # Enable
+        self.dispatcher.enable_tool(mcp_tool_name)
+        self.assertTrue(self.dispatcher.tool_states.get(mcp_tool_name))
+
+        mcp_tool_info_enabled = next((t for t in self.dispatcher.list_tools() if t.name == mcp_tool_name), None)
+        self.assertIsNotNone(mcp_tool_info_enabled)
+        self.assertTrue(mcp_tool_info_enabled.is_enabled)
+
+    def test_dispatch_disabled_tool(self):
+        tool_name = "get_weather"
+        self.dispatcher.disable_tool(tool_name) # Ensure it's disabled
+
+        call_json = json.dumps({"name": tool_name, "arguments": {"location": "London"}})
+        result_dict = self.dispatcher.dispatch(call_json)
+
+        self.assertEqual(result_dict['tool_name'], tool_name)
+        self.assertEqual(result_dict['status'], "error_disabled") # Check for specific disabled status
+        self.assertIn(f"Tool '{tool_name}' is currently disabled", result_dict['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

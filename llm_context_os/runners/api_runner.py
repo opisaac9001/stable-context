@@ -4,15 +4,31 @@ import httpx
 import json
 from .base import BaseRunner
 
+# Attempt to import tiktoken for fallback token counting
+TIKTOKEN_AVAILABLE = False
+tiktoken_encoding = None
+try:
+    import tiktoken
+    # Using cl100k_base as it's common for OpenAI models.
+    # Other models might need different encodings.
+    tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+    TIKTOKEN_AVAILABLE = True
+    print("tiktoken library found, will be used for fallback token counting if API doesn't provide usage stats.")
+except ImportError:
+    print("Warning: tiktoken library not found. Fallback token counting will not be available for APIRunner.")
+except Exception as e:
+    print(f"Warning: Error initializing tiktoken, fallback token counting may not work: {e}")
+
+
 class APIRunner(BaseRunner):
     def __init__(self, model_name: str, api_url: str, api_key: t.Optional[str] = None, **kwargs: t.Any):
         self.model_name = model_name
-        self.api_url = api_url # This should be the full URL to the completions/chat_completions endpoint
+        self.api_url = api_url
         self.api_key = api_key
-        # Default timeout is 5 seconds, which might be too short for model responses.
-        # Allow overriding via kwargs or set a higher default.
         timeout = kwargs.pop("timeout", 60.0)
         self.http_client = httpx.Client(timeout=timeout, **kwargs)
+
+        self.tokenizer = tiktoken_encoding if TIKTOKEN_AVAILABLE else None # Store for fallback
 
         print(f"APIRunner initialized for model '{self.model_name}' at URL: {self.api_url}")
         if self.api_key:
@@ -48,68 +64,83 @@ class APIRunner(BaseRunner):
         # e.g. presence_penalty, frequency_penalty
         return payload
 
-    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> str:
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Tuple[str, t.Dict[str, int]]:
         print(f"\n--- APIRunner ({self.model_name}) Generating ---")
-        print(f"Target URL: {self.api_url}")
-        print(f"Prompt: {prompt}")
-        if image_paths:
-            print(f"  Image Paths: {image_paths} (Note: Standard OpenAI-compatible API for text models may not support images directly in this field. This runner currently ignores them in the request.)")
+        # ... (logging prompt, image_paths as before) ...
 
         headers = self._prepare_headers()
         payload = self._prepare_payload(prompt, stream=False, **kwargs)
-
         print(f"Request Payload: {json.dumps(payload, indent=2)}")
+
+        generated_text = ""
+        prompt_tokens = 0
+        completion_tokens = 0
 
         try:
             response = self.http_client.post(self.api_url, headers=headers, json=payload)
-            response.raise_for_status()  # Raises an HTTPStatusError for 4xx/5xx responses
-
+            response.raise_for_status()
             response_data = response.json()
             print(f"Full API Response Data: {json.dumps(response_data, indent=2)}")
 
-            # Extract text based on common OpenAI structures
             if response_data.get("choices"):
                 choice = response_data["choices"][0]
                 if "message" in choice and "content" in choice["message"]:
-                    return choice["message"]["content"]
-                elif "text" in choice: # For older completion APIs
-                    return choice["text"]
+                    generated_text = choice["message"]["content"]
+                elif "text" in choice:
+                    generated_text = choice["text"]
 
-            # Fallback or error if structure is unexpected
-            raise ValueError(f"Unexpected API response structure: {response_data}")
+            if not generated_text: # If no text found via common paths
+                 raise ValueError(f"Unexpected API response structure, could not find generated text: {response_data}")
+
+            # Token counts from API response
+            if "usage" in response_data:
+                usage_data = response_data["usage"]
+                prompt_tokens = usage_data.get("prompt_tokens", 0)
+                completion_tokens = usage_data.get("completion_tokens", 0)
+                print(f"  Token counts from API: prompt={prompt_tokens}, completion={completion_tokens}")
+
+            # Fallback token counting if not in API response
+            if not prompt_tokens and not completion_tokens and self.tokenizer:
+                print("  Warning: Token usage data not found in API response. Using local tiktoken for estimation.")
+                prompt_tokens = len(self.tokenizer.encode(prompt))
+                completion_tokens = len(self.tokenizer.encode(generated_text))
+                print(f"  Token counts from tiktoken: prompt={prompt_tokens}, completion={completion_tokens}")
+
+            return generated_text, {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
 
         except httpx.HTTPStatusError as e:
             print(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
-            # You might want to re-raise a custom exception or return an error message
             raise Exception(f"API request failed with status {e.response.status_code}: {e.response.text}") from e
-        except httpx.RequestError as e:
-            print(f"Request error occurred: {e}")
-            raise Exception(f"API request failed due to a network or request error: {e}") from e
-        except json.JSONDecodeError as e:
-            print(f"Failed to decode JSON response: {e}")
-            raise Exception(f"Could not parse JSON response from API: {e}") from e
+        except Exception as e: # Catch other errors like RequestError, JSONDecodeError, ValueError
+            print(f"Error during API generate call: {e}")
+            # Return empty/error state for tokens as well
+            return str(e), {"prompt_tokens": 0, "completion_tokens": 0}
 
 
-    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[str, None, None]:
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[t.Union[t.Dict[str, int], t.Tuple[str, int]], None, None]:
         print(f"\n--- APIRunner ({self.model_name}) Streaming ---")
-        print(f"Target URL: {self.api_url}")
-        print(f"Prompt: {prompt}")
-        if image_paths:
-            print(f"  Image Paths: {image_paths} (Note: Standard OpenAI-compatible API for text models may not support images directly in this field. This runner currently ignores them in the request.)")
-        print(f"Streaming Config: {kwargs}")
+        # ... (logging as before) ...
 
         headers = self._prepare_headers()
         payload = self._prepare_payload(prompt, stream=True, **kwargs)
-
         print(f"Request Payload: {json.dumps(payload, indent=2)}")
+
+        # Yield prompt tokens first
+        prompt_tokens = 0
+        if self.tokenizer:
+            try:
+                prompt_tokens = len(self.tokenizer.encode(prompt))
+            except Exception as e_tok:
+                print(f"Warning: Error encoding prompt with tiktoken: {e_tok}. Prompt tokens will be 0.")
+        yield {"prompt_tokens": prompt_tokens}
+        print(f"  Yielded initial prompt_tokens: {prompt_tokens}")
 
         try:
             with self.http_client.stream("POST", self.api_url, headers=headers, json=payload) as response:
-                response.raise_for_status() # Check for HTTP errors before starting to iterate
+                response.raise_for_status()
 
                 for line in response.iter_lines():
-                    if not line: # Skip empty keep-alive lines
-                        continue
+                    if not line: continue
                     if line.startswith("data: "):
                         line_data = line[len("data: "):]
                         if line_data.strip() == "[DONE]":
@@ -119,24 +150,29 @@ class APIRunner(BaseRunner):
                             data_json = json.loads(line_data)
                             if data_json.get("choices"):
                                 delta = data_json["choices"][0].get("delta", {})
-                                content = delta.get("content")
-                                if content: # Ensure content is not None or empty string if you want to skip those
-                                    yield content
+                                content_chunk = delta.get("content")
+                                if content_chunk: # Can be None or empty string
+                                    tokens_in_chunk = 0
+                                    if self.tokenizer:
+                                        try: tokens_in_chunk = len(self.tokenizer.encode(content_chunk))
+                                        except Exception: pass # Ignore if chunk is not valid for tokenizer
+                                    yield (content_chunk, tokens_in_chunk)
                         except json.JSONDecodeError:
                             print(f"Warning: Could not decode JSON from stream line: {line_data}")
-                            continue # Or handle error more strictly
-                    else:
-                        print(f"Unrecognized stream line: {line}")
+                            # Yield problematic line as raw text chunk with 0 tokens? Or skip?
+                            # For now, skipping non-JSON data lines.
+                            continue
+                    # else: print(f"Unrecognized stream line: {line}") # Optional: log non-data lines
             print("Streaming complete.")
         except httpx.HTTPStatusError as e:
-            print(f"HTTP error occurred during stream: {e.response.status_code} - {e.response.text}")
-            # Depending on when this happens, part of the stream might have been yielded.
-            # Consider how to signal this error to the consumer.
-            # For now, just printing and re-raising.
-            raise Exception(f"API stream request failed with status {e.response.status_code}: {e.response.text}") from e
+            print(f"HTTP error during stream: {e.response.status_code} - {e.response.text}")
+            yield (f"Error: API stream request failed with status {e.response.status_code}", 0)
         except httpx.RequestError as e:
             print(f"Request error occurred during stream: {e}")
-            raise Exception(f"API stream request failed due to a network or request error: {e}") from e
+            yield (f"Error: API stream request failed due to a network or request error", 0)
+        except Exception as e_gen: # Catch any other general error during streaming
+            print(f"Generic error during stream processing: {e_gen}")
+            yield (f"Error: {str(e_gen)}", 0)
 
 
     def preload_kv(self, prompt: str, **kwargs: t.Any) -> None:
@@ -181,6 +217,23 @@ class APIRunner(BaseRunner):
         print("  Unmerging LoRAs is a server-side operation for API-based models. This call is a no-op for APIRunner.")
         return False
 
+    def count_tokens(self, text: str) -> Optional[int]:
+        """
+        Estimates the number of tokens in the given text.
+        Uses the loaded tiktoken tokenizer if available (typically for OpenAI models).
+        Falls back to word count if tiktoken is not available or fails.
+        Note: Actual tokenization is server-side and can vary.
+        """
+        if self.tokenizer:
+            try:
+                return len(self.tokenizer.encode(text))
+            except Exception as e:
+                print(f"Warning: Error using tiktoken for count_tokens: {e}. Falling back to word count.")
+                # Fall through to word count
+
+        print("[APIRunner] Warning: count_tokens is using basic word count as a rough estimate because tiktoken is unavailable or failed.")
+        return len(text.split())
+
 
 if __name__ == '__main__':
     # --- IMPORTANT ---
@@ -214,7 +267,6 @@ if __name__ == '__main__':
     if not api_key or "your_api_key_here" in api_key or not api_base_url.startswith("http"):
         print("WARNING: API Key or Base URL seems to be a placeholder or missing.")
         print("The API calls will likely fail. Please set them to valid values to test.")
-        # You could exit here, or let it try and fail. For now, let it try.
 
     api_model = APIRunner(
         model_name=model_name_on_api,
@@ -222,28 +274,50 @@ if __name__ == '__main__':
         api_key=api_key if api_key and api_key.lower() != "none" else None
     )
 
-    generation_params = {"temperature": 0.7, "max_tokens": 150}
-    # Image paths are not used by standard OpenAI text completion APIs via this runner
-    # example_image_paths = ["/path/to/image1.jpg", "/path/to/image2.png"]
-
-    test_prompt = "What is the capital of France?"
+    generation_params = {"temperature": 0.7, "max_tokens": 50}
+    test_prompt = "What is the capital of France? Explain in a short sentence."
 
     print(f"\n--- Testing generate() for model: {api_model.model_name} ---")
     try:
-        response_text = api_model.generate(test_prompt, **generation_params)
+        response_text, token_counts = api_model.generate(test_prompt, **generation_params)
         print(f"\nGenerate call response:\n'{response_text}'")
+        print(f"Token counts: {token_counts}")
     except Exception as e:
         print(f"Error during generate(): {e}")
 
     print(f"\n--- Testing stream() for model: {api_model.model_name} ---")
     try:
-        full_api_streamed_response = []
+        full_api_streamed_response_text = []
+        total_completion_tokens_in_stream = 0
         print("Streamed response:")
-        for chunk in api_model.stream(test_prompt, **generation_params):
-            print(chunk, end="", flush=True)
-            full_api_streamed_response.append(chunk)
-        print(f"\n\nFull API streamed response collected: '{''.join(full_api_streamed_response)}'")
+
+        stream_generator = api_model.stream(test_prompt, **generation_params)
+
+        # First item is prompt_tokens dict
+        prompt_token_info = next(stream_generator)
+        print(f"\nPrompt token info: {prompt_token_info}")
+
+        # Subsequent items are (text_chunk, tokens_in_chunk)
+        for item in stream_generator:
+            if isinstance(item, tuple): # Should be (text_chunk, tokens_in_chunk)
+                text_chunk, tokens_in_chunk = item
+                print(text_chunk, end="", flush=True)
+                full_api_streamed_response_text.append(text_chunk)
+                total_completion_tokens_in_stream += tokens_in_chunk if tokens_in_chunk else 0
+            else: # Should not happen with current APIRunner.stream logic
+                 print(f"\nUnexpected stream item: {item}")
+
+        print(f"\n\nFull API streamed response collected: '{''.join(full_api_streamed_response_text)}'")
+        print(f"Total completion tokens from stream (calculated locally): {total_completion_tokens_in_stream}")
     except Exception as e:
         print(f"Error during stream(): {e}")
+
+    print("\n--- Testing count_tokens() ---")
+    sample_text_for_counting = "This is a sample text for the new count_tokens method."
+    estimated_tokens = api_model.count_tokens(sample_text_for_counting)
+    if estimated_tokens is not None:
+        print(f"Estimated tokens for '{sample_text_for_counting}': {estimated_tokens}")
+    else:
+        print(f"Token counting not available/supported for APIRunner with text: '{sample_text_for_counting}'")
 
     print("\nAPIRunner functional demonstration complete.")

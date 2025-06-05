@@ -43,6 +43,9 @@ httpx>=0.25.0      # For making HTTP requests
 # peft # Hugging Face PEFT library (used with Transformers for LoRA, etc.)
 # bitsandbytes # Often used with PEFT for quantization during training/loading
 
+# --- Model Downloading ---
+huggingface-hub>=0.17.0       # For downloading models from Hugging Face Hub
+
 # --- Retriever (RAG - Phase 4) ---
 sentence-transformers>=2.2.0 # For embedding text
 chromadb>=0.4.15              # For vector storage and similarity search

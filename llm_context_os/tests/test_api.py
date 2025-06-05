@@ -65,6 +65,54 @@ class TestApi(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "No model is currently loaded. Please load a model first via /load_model.")
 
+    @patch('llm_context_os.api.main.model_mgr') # Patch the global model_mgr used by the endpoint
+    def test_chat_with_loaded_model_and_token_counts(self, mock_api_model_mgr):
+        mock_runner_instance = MagicMock()
+
+        # Simulate the new return type of generate: (text, {"prompt_tokens": X, "completion_tokens": Y})
+        # The prompt text built by _prepare_context_and_initial_prompt for "Test prompt..."
+        # will be something like: "You are a helpful AI assistant.\nuser: Test prompt for token count\n"
+        # Let's say this is 15 tokens. The reply "Mocked reply" is 2 tokens.
+        mock_runner_instance.generate.return_value = ("Mocked reply", {"prompt_tokens": 15, "completion_tokens": 2})
+
+        # This mock is for the runner's count_tokens method.
+        # The endpoint uses counts from runner.generate() primarily for ChatResponse.
+        # The direct calls to runner.count_tokens() in the endpoint are for specific cases or if generate() didn't return counts.
+        # Since BaseRunner.generate now MUST return counts, these direct calls are less critical for ChatResponse population
+        # but are used for the prompt_info event in streaming.
+        def mock_count_tokens_side_effect(text_to_count):
+            if "Test prompt for token count" in text_to_count: # Simulating prompt token count
+                return 15
+            if text_to_count == "Mocked reply": # Simulating generated text token count
+                return 2
+            return len(text_to_count.split()) # Fallback
+        mock_runner_instance.count_tokens = MagicMock(side_effect=mock_count_tokens_side_effect)
+
+        mock_api_model_mgr.get.return_value = mock_runner_instance
+
+        chat_text_for_prompt = "Test prompt for token count"
+        chat_req_data = ChatRequest(
+            message=chat_text_for_prompt,
+            generation_params=GenerationParams(temperature=0.5, max_new_tokens=50)
+        )
+
+        response = self.client.post("/chat", json=chat_req_data.model_dump())
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+
+        self.assertEqual(json_response["reply"], "Mocked reply")
+        self.assertEqual(json_response["prompt_tokens"], 15)     # From mock_runner_instance.generate
+        self.assertEqual(json_response["generated_tokens"], 2) # From mock_runner_instance.generate
+        self.assertIsNotNone(json_response["request_details"])
+        self.assertEqual(json_response["request_details"]["message"], chat_text_for_prompt)
+
+        mock_runner_instance.generate.assert_called_once()
+        # Check that count_tokens was called by _prepare_context_and_initial_prompt
+        # The first call to count_tokens happens inside _prepare_context_and_initial_prompt
+        # The second call happens on the final_reply_text.
+        self.assertGreaterEqual(mock_runner_instance.count_tokens.call_count, 1)
+
+
     def test_chat_with_loaded_model(self):
         load_req = LoadModelRequest(
             model_type="api",
@@ -203,41 +251,85 @@ class TestChatStreamingAPI(unittest.TestCase):
             await asyncio.sleep(0.001) # Simulate async behavior of a real stream
 
     @patch('llm_context_os.api.main.model_mgr')
-    def test_chat_stream_success_simple_text(self, mock_model_mgr_param):
-        # Configure the mock runner and its stream method
-        mock_runner = MagicMock()
-        chunks = ["Hello, ", "this is ", "a streamed ", "response."]
-        mock_runner.stream.return_value = self.mock_async_stream_generator(chunks)
-        mock_model_mgr_param.get.return_value = mock_runner
+    def test_chat_stream_sends_token_events(self, mock_api_model_mgr):
+        mock_runner_instance = MagicMock()
 
-        chat_data = ChatRequest(message="Tell me a story.", stream=True)
+        test_prompt_message = "Test streaming prompt for detailed token events"
+        # This is an approximation of the prompt text that _prepare_context_and_initial_prompt would build.
+        # The actual prompt sent to runner.count_tokens for "prompt_info" event.
+        expected_initial_prompt_full_text = f"{ctx_mgr.system_prompt}\nuser: {test_prompt_message}\n"
 
-        # When using TestClient with streaming, use a context manager for the request
-        full_response_text = ""
+        final_generated_text = "Stream chunk1 Stream chunk2"
+        mock_initial_prompt_tokens = 18
+        mock_generated_tokens_total = 7 # chunk1 (4) + chunk2 (3)
+
+        def mock_runner_count_tokens_side_effect(text_to_count):
+            if text_to_count == expected_initial_prompt_full_text:
+                return mock_initial_prompt_tokens
+            elif text_to_count == final_generated_text: # For total_generated_tokens in stream_end
+                return mock_generated_tokens_total
+            return len(text_to_count.split()) # Fallback
+        mock_runner_instance.count_tokens = MagicMock(side_effect=mock_runner_count_tokens_side_effect)
+
+        # This async generator mock now adheres to the BaseRunner.stream() interface:
+        # 1. Yield dict: {"prompt_tokens": count}
+        # 2. Yield tuples: (text_chunk, tokens_in_chunk)
+        async def mock_stream_generator_for_tokens_test(*args, **kwargs):
+            # The API's sse_generator calls runner.count_tokens on the full prompt first,
+            # then uses that for the first yield of its own.
+            # So, the runner.stream() itself first yields its own prompt_tokens.
+            # The prompt text is in kwargs['prompt'] or args[0]
+            prompt_text_arg = kwargs.get('prompt', args[0] if args else "")
+            # This call to count_tokens is from *within* the mocked runner.stream
+            p_tokens = mock_runner_instance.count_tokens(prompt_text_arg)
+            yield {"prompt_tokens": p_tokens}
+
+            yield ("Stream chunk1 ", 4) # Mocked tokens_in_chunk
+            await asyncio.sleep(0.001)
+            yield ("Stream chunk2", 3)  # Mocked tokens_in_chunk
+            await asyncio.sleep(0.001)
+
+        mock_runner_instance.stream.side_effect = mock_stream_generator_for_tokens_test
+        mock_api_model_mgr.get.return_value = mock_runner_instance
+
+        chat_data = ChatRequest(message=test_prompt_message, stream=True)
         received_events = []
+
         with self.client.stream("POST", "/chat", json=chat_data.model_dump()) as response:
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers['content-type'], 'text/event-stream; charset=utf-8') # FastAPI adds charset
+            self.assertEqual(response.headers['content-type'], 'text/event-stream; charset=utf-8')
+            for line_bytes in response.iter_lines():
+                received_events.extend(parse_sse_stream([line_bytes]))
 
-            for line_bytes in response.iter_lines(): # iter_lines gives bytes
-                received_events.extend(parse_sse_stream([line_bytes])) # Pass as list of one item
+        prompt_info_event = next((e for e in received_events if e['event'] == 'prompt_info'), None)
+        stream_end_event = next((e for e in received_events if e['event'] == 'stream_end'), None)
+        message_events_data = [e['data'] for e in received_events if e['event'] == 'message' and isinstance(e['data'], dict)]
 
-        # Process collected events
-        final_text_chunks = []
-        ended = False
-        for event in received_events:
-            if event['event'] == 'message' and 'text' in event['data']:
-                final_text_chunks.append(event['data']['text'])
-            elif event['event'] == 'stream_end':
-                ended = True
+        self.assertIsNotNone(prompt_info_event, "event: prompt_info not found.")
+        self.assertEqual(prompt_info_event['data'].get('prompt_tokens'), mock_initial_prompt_tokens)
 
-        self.assertTrue(ended, "Stream did not end with a 'stream_end' event.")
-        self.assertEqual("".join(final_text_chunks), "".join(chunks))
-        mock_runner.stream.assert_called_once()
+        self.assertIsNotNone(stream_end_event, "event: stream_end not found.")
+        self.assertEqual(stream_end_event['data'].get('total_generated_tokens'), mock_generated_tokens_total)
+        self.assertEqual(stream_end_event['data'].get('final_prompt_tokens'), mock_initial_prompt_tokens) # No tool call, so initial prompt tokens are final
+
+        # Check data messages for text and tokens_in_chunk
+        self.assertEqual(len(message_events_data), 2)
+        self.assertEqual(message_events_data[0].get('text'), "Stream chunk1 ")
+        self.assertEqual(message_events_data[0].get('tokens_in_chunk'), 4)
+        self.assertEqual(message_events_data[1].get('text'), "Stream chunk2")
+        self.assertEqual(message_events_data[1].get('tokens_in_chunk'), 3)
+
+        mock_runner_instance.stream.assert_called_once()
+        # Check calls to count_tokens:
+        # 1. By _prepare_context_and_initial_prompt (passed to sse_generator, then to runner.stream)
+        # 2. By sse_generator in its finally block for the full response.
+        mock_runner_instance.count_tokens.assert_any_call(expected_initial_prompt_full_text)
+        mock_runner_instance.count_tokens.assert_any_call(final_generated_text)
+
 
     @patch('llm_context_os.api.main.tool_dispatcher.dispatch')
     @patch('llm_context_os.api.main.model_mgr')
-    def test_chat_stream_with_tool_call(self, mock_model_mgr_param, mock_tool_dispatch):
+    def test_chat_stream_with_tool_call_and_token_counts(self, mock_api_model_mgr, mock_tool_dispatch):
         mock_runner = MagicMock()
 
         # Configure stream to be called twice with different return values
@@ -445,6 +537,176 @@ class TestSettingsAPI(unittest.TestCase):
 
         # Verify that live-updatable attributes on mocks were NOT changed
         self.assertEqual(self.mock_ctx_mgr.max_tokens, original_ctx_max_tokens)
+
+
+# --- Model Management API Tests ---
+from llm_context_os.api.schemas import AvailableModel, ModelListResponse, DownloadModelRequest, StatusResponse
+
+class TestModelManagementAPI(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        self.original_config = deepcopy(api_main.CONFIG) # Save original config
+
+    def tearDown(self):
+        api_main.CONFIG = self.original_config # Restore config
+
+    @patch('llm_context_os.api.main.model_scanner.scan_model_directories')
+    def test_list_available_models_success(self, mock_scan_model_directories):
+        mock_models_data = [
+            {"model_id": "model1.gguf", "model_type": "gguf", "path_or_identifier": "/path/model1.gguf", "source": "local_scan", "name": "Model 1"},
+            {"model_id": "org/model2-awq", "model_type": "awq", "path_or_identifier": "/path/model2-awq", "source": "local_scan", "name": "Model 2 AWQ"}
+        ]
+        # Convert dicts to AvailableModel instances for the mock's return value
+        mock_scan_model_directories.return_value = [AvailableModel(**data) for data in mock_models_data]
+
+        # Temporarily set scan_directories in CONFIG for this test
+        api_main.CONFIG['model_discovery'] = {'scan_directories': ['dummy_scan_dir/']}
+
+        response = self.client.get("/models/available")
+        self.assertEqual(response.status_code, 200)
+
+        response_data = ModelListResponse(**response.json())
+        self.assertEqual(len(response_data.models), 2)
+        self.assertEqual(response_data.models[0].model_id, "model1.gguf")
+        self.assertEqual(response_data.models[1].name, "Model 2 AWQ")
+        mock_scan_model_directories.assert_called_once()
+        # Can also assert that the call was made with resolved paths based on dummy_scan_dir
+
+    @patch('llm_context_os.api.main.model_scanner.scan_model_directories')
+    def test_list_available_models_no_scan_dirs_configured(self, mock_scan_model_directories):
+        # Ensure scan_directories is empty or not present in CONFIG for this test
+        original_model_discovery_config = api_main.CONFIG.pop('model_discovery', None)
+
+        response = self.client.get("/models/available")
+        self.assertEqual(response.status_code, 200)
+        response_data = ModelListResponse(**response.json())
+        self.assertEqual(len(response_data.models), 0)
+        mock_scan_model_directories.assert_not_called() # Should not be called if no valid dirs
+
+        # Restore config
+        if original_model_discovery_config is not None:
+            api_main.CONFIG['model_discovery'] = original_model_discovery_config
+
+
+    @patch('llm_context_os.api.main.model_scanner.scan_model_directories')
+    def test_list_available_models_scanner_error(self, mock_scan_model_directories):
+        mock_scan_model_directories.side_effect = Exception("Scanner crashed badly")
+        api_main.CONFIG['model_discovery'] = {'scan_directories': ['another_dummy_dir/']} # Ensure it tries to scan
+
+        response = self.client.get("/models/available")
+        self.assertEqual(response.status_code, 500)
+        json_response = response.json()
+        self.assertIn("Failed to scan model directories: Scanner crashed badly", json_response["detail"])
+
+    def test_download_model_placeholder_success(self):
+        payload = {
+            "repo_id": "TheBloke/Test-Model-GGUF",
+            "filename": "test-model.Q4_K_M.gguf",
+            "model_type": "gguf"
+        }
+        # Use @patch('llm_context_os.api.main.print') if you want to check specific log output
+        response = self.client.post("/models/download", json=payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["status"], "ok")
+        self.assertIn("Download request for 'TheBloke/Test-Model-GGUF'", json_response["message"])
+        self.assertIn("file: test-model.Q4_K_M.gguf", json_response["message"])
+        self.assertIn("Simulated download initiated", json_response["message"])
+
+    def test_download_model_missing_repo_id(self):
+        payload = {"filename": "test-model.Q4_K_M.gguf", "model_type": "gguf"} # Missing repo_id
+        response = self.client.post("/models/download", json=payload)
+        self.assertEqual(response.status_code, 422) # Unprocessable Entity for Pydantic validation error
+
+
+# --- Tool Management API Tests ---
+from llm_context_os.api.schemas import ToolInfo, ToolListResponse, ToggleToolRequest
+
+class TestToolManagementAPI(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        # Access the global tool_dispatcher from api_main to manage its state for tests
+        self.tool_dispatcher_instance = api_main.tool_dispatcher
+        # Store original state of tool_states to restore in tearDown
+        self.original_tool_states = deepcopy(self.tool_dispatcher_instance.tool_states)
+
+    def tearDown(self):
+        # Restore original tool states
+        self.tool_dispatcher_instance.tool_states = self.original_tool_states
+
+    def test_list_tools_success(self):
+        # Mock the list_tools method of the actual tool_dispatcher instance
+        with patch.object(self.tool_dispatcher_instance, 'list_tools') as mock_list_tools:
+            mock_tool_list_data = [
+                ToolInfo(name="get_weather", type="local", description="Gets weather", is_enabled=True, parameters={}).model_dump(),
+                ToolInfo(name="mcp_tool1", type="mcp", description="MCP tool", is_enabled=False, parameters={}).model_dump()
+            ]
+            # Ensure the mock returns Pydantic models if that's what list_tools now does
+            mock_list_tools.return_value = [ToolInfo(**data) for data in mock_tool_list_data]
+
+            response = self.client.get("/tools")
+            self.assertEqual(response.status_code, 200)
+
+            response_data = ToolListResponse(**response.json())
+            self.assertEqual(len(response_data.tools), 2)
+            self.assertEqual(response_data.tools[0].name, "get_weather")
+            self.assertTrue(response_data.tools[0].is_enabled)
+            self.assertEqual(response_data.tools[1].name, "mcp_tool1")
+            self.assertFalse(response_data.tools[1].is_enabled)
+            mock_list_tools.assert_called_once()
+
+    def test_toggle_tool_enable_disable(self):
+        tool_name_to_test = "get_weather" # Assuming this is a known local tool
+
+        # 1. Disable the tool
+        disable_payload = {"tool_name": tool_name_to_test, "enable": False}
+        response_disable = self.client.post("/tools/toggle", json=disable_payload)
+        self.assertEqual(response_disable.status_code, 200)
+        self.assertEqual(response_disable.json()["status"], "ok")
+        self.assertIn(f"Tool '{tool_name_to_test}' disabled", response_disable.json()["message"])
+        self.assertFalse(self.tool_dispatcher_instance.tool_states.get(tool_name_to_test))
+
+        # 2. List tools to confirm it's disabled
+        response_list_disabled = self.client.get("/tools")
+        self.assertEqual(response_list_disabled.status_code, 200)
+        listed_tools_disabled = ToolListResponse(**response_list_disabled.json()).tools
+        found_tool_disabled = next((t for t in listed_tools_disabled if t.name == tool_name_to_test), None)
+        self.assertIsNotNone(found_tool_disabled)
+        self.assertFalse(found_tool_disabled.is_enabled)
+
+        # 3. Enable the tool again
+        enable_payload = {"tool_name": tool_name_to_test, "enable": True}
+        response_enable = self.client.post("/tools/toggle", json=enable_payload)
+        self.assertEqual(response_enable.status_code, 200)
+        self.assertEqual(response_enable.json()["status"], "ok")
+        self.assertIn(f"Tool '{tool_name_to_test}' enabled", response_enable.json()["message"])
+        self.assertTrue(self.tool_dispatcher_instance.tool_states.get(tool_name_to_test))
+
+        # 4. List tools again to confirm it's enabled
+        response_list_enabled = self.client.get("/tools")
+        self.assertEqual(response_list_enabled.status_code, 200)
+        listed_tools_enabled = ToolListResponse(**response_list_enabled.json()).tools
+        found_tool_enabled = next((t for t in listed_tools_enabled if t.name == tool_name_to_test), None)
+        self.assertIsNotNone(found_tool_enabled)
+        self.assertTrue(found_tool_enabled.is_enabled)
+
+    def test_toggle_unknown_tool(self):
+        unknown_tool_name = "unknown_tool_xyz_123"
+        # Enabling an unknown tool (it gets added to tool_states)
+        enable_payload = {"tool_name": unknown_tool_name, "enable": True}
+        response_enable = self.client.post("/tools/toggle", json=enable_payload)
+        self.assertEqual(response_enable.status_code, 200)
+        self.assertEqual(response_enable.json()["status"], "ok")
+        self.assertTrue(self.tool_dispatcher_instance.tool_states.get(unknown_tool_name))
+
+        # List tools to confirm it shows up (as type "mcp" by current dispatcher logic if not local)
+        response_list = self.client.get("/tools")
+        self.assertEqual(response_list.status_code, 200)
+        listed_tools = ToolListResponse(**response_list.json()).tools
+        found_tool = next((t for t in listed_tools if t.name == unknown_tool_name), None)
+        self.assertIsNotNone(found_tool)
+        self.assertTrue(found_tool.is_enabled)
+        self.assertEqual(found_tool.type, "mcp") # Based on current ToolDispatcher.list_tools logic
 
 
 if __name__ == '__main__':
