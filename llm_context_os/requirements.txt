@@ -20,6 +20,8 @@ python-multipart # For FastAPI File Uploads (used in /upload_document)
 # --- Model Runners & Related Libraries ---
 # For LlamaCppRunner (GGUF models)
 llama-cpp-python>=0.2.20 # For running GGUF models locally
+# For LlavaCppRunner (multimodal - requires manual build of llama.cpp with LLaVA support, then pip install llava-cpp-python)
+llava-cpp-python>=0.1.0 # Add when LLaVA multimodal support is fully implemented
 
 # For AWQRunner (Transformers-based AWQ)
 transformers>=4.30.0       # For loading AWQ models via AutoModelForCausalLM
@@ -28,11 +30,11 @@ torch>=2.0.0               # Required by transformers and autoawq
 accelerate>=0.20.0         # For device mapping and optimized inference with Hugging Face
 
 # For EXL2Runner
-# exllamav2
-# torch      # Required by exllamav2
+exllamav2>=0.0.11          # High-performance inference for EXL2 models (GPU required, may need specific build steps)
+# torch is already listed above as a dependency for AWQRunner (torch>=2.0.0)
 
 # For APIRunner (example for OpenAI or other HTTP APIs)
-# httpx      # For making HTTP requests
+httpx>=0.25.0      # For making HTTP requests
 # openai     # If using the OpenAI Python client directly
 
 # For VLLMRunner
@@ -43,18 +45,23 @@ accelerate>=0.20.0         # For device mapping and optimized inference with Hug
 # peft # Hugging Face PEFT library (used with Transformers for LoRA, etc.)
 # bitsandbytes # Often used with PEFT for quantization during training/loading
 
+# --- Model Downloading ---
+huggingface-hub>=0.17.0       # For downloading models from Hugging Face Hub
+
 # --- Retriever (RAG - Phase 4) ---
-# sentence-transformers # For embedding text
-# chromadb              # For vector storage and similarity search
+sentence-transformers>=2.2.0 # For embedding text
+chromadb>=0.4.15              # For vector storage and similarity search
+tiktoken>=0.5.0               # For token counting, often used with embedding/retrieval
 # For PDF Processing (in PdfRetriever)
-# pypdf2                # For PDF text extraction
+pypdf2>=3.0.0                 # For PDF text extraction
 # pymupdf               # Alternative for PDF text extraction, often faster/more robust
+langchain-text-splitters>=0.0.1 # For RecursiveCharacterTextSplitter
 # langchain             # For text splitting and document loading (optional, can use custom)
 
 
 # --- Tool-Calling (Phase 4) ---
 # For MCP Adapters
-# langchain-mcp-adapters
+langchain-mcp-adapters>=0.1.0
 # Add other general tool-related dependencies here if any (e.g., for parsing specific tool inputs/outputs if not covered by basic types)
 
 # --- GUI (Phase 5) ---

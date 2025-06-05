@@ -65,11 +65,11 @@ class LlamaCppRunner(BaseRunner):
             print(f"[LlamaCppRunner] Error loading model {self.model_path}: {e}")
             self.model = None
 
-    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> str:
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Tuple[str, t.Dict[str, int]]:
         print(f"\n--- LlamaCppRunner ({self.model_path.split('/')[-1]}) Generating ---")
         if not self.model:
             print("[LlamaCppRunner] Error: Model not loaded. Cannot generate.")
-            return "[LlamaCppRunner] Error: Model not loaded."
+            return "[LlamaCppRunner] Error: Model not loaded.", {"prompt_tokens": 0, "completion_tokens": 0}
 
         if image_paths:
             print(f"[LlamaCppRunner] Warning: image_paths provided but LlamaCppRunner does not process them. Use LlavaCppRunner.")
@@ -98,18 +98,40 @@ class LlamaCppRunner(BaseRunner):
             print(f"  Applying LoRA '{lora_id}' (Path: {lora_path}, Scale: {lora_scale}) for this generation.")
 
         print(f"[LlamaCppRunner] Generating with params: { {k:v for k,v in llm_params.items() if k != 'prompt'} }")
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        generated_text = ""
+
         try:
+            # It's good to tokenize the prompt once for its count, if not provided by API directly
+            # llama-cpp-python's create_completion includes usage stats which are more accurate.
+            # prompt_tokens = len(self.model.tokenize(prompt.encode('utf-8', errors='ignore')))
+
             completion = self.model.create_completion(**llm_params)
-            return completion['choices'][0]['text']
+            generated_text = completion['choices'][0]['text']
+
+            if 'usage' in completion:
+                prompt_tokens = completion['usage'].get('prompt_tokens', 0)
+                completion_tokens = completion['usage'].get('completion_tokens', 0)
+            else: # Fallback if usage somehow not present
+                prompt_tokens = len(self.model.tokenize(prompt.encode('utf-8', errors='ignore')))
+                completion_tokens = len(self.model.tokenize(generated_text.encode('utf-8', errors='ignore')))
+
+            print(f"  Tokens: prompt={prompt_tokens}, completion={completion_tokens}")
+            return generated_text, {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+
         except Exception as e:
             print(f"[LlamaCppRunner] Error during model generation: {e}")
-            return f"[LlamaCppRunner] Error generating response: {e}"
+            return f"[LlamaCppRunner] Error generating response: {e}", {"prompt_tokens": prompt_tokens, "completion_tokens": 0}
 
-    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[str, None, None]:
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[t.Union[t.Dict[str, int], t.Tuple[str, int]], None, None]:
         print(f"\n--- LlamaCppRunner ({self.model_path.split('/')[-1]}) Streaming ---")
         if not self.model:
             print("[LlamaCppRunner] Error: Model not loaded. Cannot stream.")
-            yield "[LlamaCppRunner] Error: Model not loaded."; return
+            yield {"prompt_tokens": 0}
+            yield ("[LlamaCppRunner] Error: Model not loaded.", 0)
+            return
         if image_paths:
             print(f"[LlamaCppRunner] Warning: image_paths provided but LlamaCppRunner does not process them for streaming.")
 
@@ -136,13 +158,28 @@ class LlamaCppRunner(BaseRunner):
             print(f"  Applying LoRA '{lora_id}' (Path: {lora_path}, Scale: {lora_scale}) for this stream.")
 
         print(f"[LlamaCppRunner] Streaming with params: { {k:v for k,v in llm_params.items() if k not in ['prompt', 'stream']} }")
+
+        prompt_tokens = 0
+        try:
+            prompt_tokens = len(self.model.tokenize(prompt.encode('utf-8', errors='ignore')))
+        except Exception as e_tok:
+            print(f"[LlamaCppRunner] Error tokenizing prompt for stream: {e_tok}")
+        yield {"prompt_tokens": prompt_tokens}
+
         try:
             completion_stream = self.model.create_completion(**llm_params)
             for chunk in completion_stream:
-                yield chunk['choices'][0]['text']
+                text_chunk = chunk['choices'][0]['text']
+                if text_chunk: # Only yield if there's text
+                    tokens_in_chunk = 0
+                    try:
+                        tokens_in_chunk = len(self.model.tokenize(text_chunk.encode('utf-8', errors='ignore')))
+                    except Exception as e_chunk_tok:
+                         print(f"[LlamaCppRunner] Error tokenizing stream chunk: {e_chunk_tok}")
+                    yield (text_chunk, tokens_in_chunk)
         except Exception as e:
             print(f"[LlamaCppRunner] Error during model streaming: {e}")
-            yield f"[LlamaCppRunner] Error streaming response: {e}"
+            yield (f"[LlamaCppRunner] Error streaming response: {e}", 0)
         finally:
             print("[LlamaCppRunner] Streaming finished.")
 
@@ -232,6 +269,20 @@ class LlamaCppRunner(BaseRunner):
         print("[LlamaCppRunner] LoRA unmerging for GGUFs usually means reloading the base model without LoRA. This is not dynamically supported here.")
         return False
 
+    def count_tokens(self, text: str) -> Optional[int]:
+        """Counts tokens using the loaded Llama.cpp model's tokenizer."""
+        if not self.model:
+            print("[LlamaCppRunner] Model not loaded, cannot count tokens.")
+            return None
+        try:
+            # llama-cpp-python expects bytes for tokenize, so encode the string.
+            # errors='ignore' is a pragmatic choice for handling potential encoding issues.
+            tokens = self.model.tokenize(text.encode('utf-8', errors='ignore'))
+            return len(tokens)
+        except Exception as e:
+            print(f"[LlamaCppRunner] Error tokenizing text: {e}")
+            return None
+
 if __name__ == '__main__':
     dummy_model_path = "dummy_model_for_lora_test.gguf"
     is_real_model_available = False
@@ -271,8 +322,8 @@ if __name__ == '__main__':
 
         print("\nGenerating with (simulated) LoRA applied:")
         # generate will pick up the first LoRA from self.active_loras if model is loaded
-        response_with_lora = llama_model.generate("Prompt with LoRA.", max_new_tokens=10)
-        print(f"Response with LoRA: {response_with_lora}")
+        response_text_lora, tokens_lora = llama_model.generate("Prompt with LoRA.", max_new_tokens=10)
+        print(f"Response with LoRA: {response_text_lora}, Tokens: {tokens_lora}")
 
         print(f"\nUnloading LoRA: {lora1_id}")
         unload_status = llama_model.unload_lora_adapter(lora1_id)
@@ -286,6 +337,17 @@ if __name__ == '__main__':
         print(f"Merge status: {merge_status}")
         unmerge_status = llama_model.unmerge_lora_adapters()
         print(f"Unmerge status: {unmerge_status}")
+
+        print("\n--- Token Counting Demo (LlamaCppRunner) ---")
+        if llama_model.model: # Only if model loaded successfully
+            sample_text = "This is a test sentence for Llama.cpp tokenization."
+            token_count = llama_model.count_tokens(sample_text)
+            if token_count is not None:
+                print(f"'{sample_text}' has approximately {token_count} tokens (Llama.cpp).")
+            else:
+                print(f"Could not count tokens for '{sample_text}'.")
+        else:
+            print("Skipping token counting demo as model was not loaded.")
 
     except Exception as e:
         print(f"An unexpected error occurred during LlamaCppRunner demo: {e}")

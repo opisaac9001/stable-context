@@ -92,11 +92,11 @@ class AWQRunner(BaseRunner):
             print(f"[AWQRunner] Error loading AWQ model {self.model_path_or_repo_id}: {e}")
             self.model = None; self.tokenizer = None
 
-    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> str:
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Tuple[str, t.Dict[str, int]]:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Generating ---")
         if not self.model or not self.tokenizer or not AWQ_AVAILABLE or not torch:
             print("[AWQRunner] Error: Model, tokenizer, or torch not available.")
-            return "[AWQRunner] Error: Model, tokenizer, or torch not available."
+            return "[AWQRunner] Error: Model, tokenizer, or torch not available.", {"prompt_tokens": 0, "completion_tokens": 0}
         if image_paths: print(f"[AWQRunner] Warning: image_paths provided but AWQRunner does not process them.")
 
         active_adapters_msg = "No active LoRA adapters."
@@ -149,18 +149,26 @@ class AWQRunner(BaseRunner):
                 self.current_kv_cache = None
                 print("[AWQRunner] Did not find past_key_values in generate output. KV cache not updated.")
 
-            generated_ids = outputs[0][input_ids_length:]
+            generated_ids = outputs[0][input_ids_length:] # type: ignore
             generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+            prompt_tokens = input_ids_length
+            completion_tokens = len(generated_ids)
+            token_counts = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+
             print(f"[AWQRunner] Generated text: {generated_text[:100]}...")
-            return generated_text
+            print(f"  Tokens: prompt={prompt_tokens}, completion={completion_tokens}")
+            return generated_text, token_counts
         except Exception as e:
             print(f"[AWQRunner] Error during model generation: {e}")
-            return f"[AWQRunner] Error generating response: {e}"
+            return f"[AWQRunner] Error generating response: {e}", {"prompt_tokens": 0, "completion_tokens": 0}
 
-    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[str, None, None]:
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[t.Union[t.Dict[str, int], t.Tuple[str, int]], None, None]:
         print(f"\n--- AWQRunner ({self.model_path_or_repo_id}) Streaming ---")
         if not self.model or not self.tokenizer or not AWQ_AVAILABLE or not torch:
-            yield "[AWQRunner] Error: Model, tokenizer, or torch not available."; return
+            yield {"prompt_tokens": 0}
+            yield ("[AWQRunner] Error: Model, tokenizer, or torch not available.", 0)
+            return
         if image_paths: print(f"[AWQRunner] Warning: image_paths provided but AWQRunner does not process them.")
 
         active_adapters_msg = "No active LoRA adapters."
@@ -204,12 +212,20 @@ class AWQRunner(BaseRunner):
                   "but it's not updated with new past_key_values from the stream output by this placeholder. "
                   "Conversational context with KV cache in streaming requires more complex handling.")
 
-            for new_text in streamer: yield new_text
+            prompt_tokens = inputs.input_ids.shape[1] # type: ignore
+            yield {"prompt_tokens": prompt_tokens}
+            print(f"  Yielded prompt_tokens: {prompt_tokens}")
+
+            for new_text in streamer: # type: ignore
+                if new_text: # Ensure non-empty chunk
+                    tokens_in_chunk = len(self.tokenizer.encode(new_text))
+                    yield (new_text, tokens_in_chunk)
+                # else: yield ("", 0) # Optionally yield empty strings with 0 tokens
         except Exception as e:
             print(f"[AWQRunner] Error during model streaming: {e}")
-            yield f"[AWQRunner] Error streaming response: {e}"
+            yield (f"[AWQRunner] Error streaming response: {e}", 0)
         finally:
-            if 'thread' in locals() and thread.is_alive(): thread.join(timeout=1)
+            if 'thread' in locals() and thread.is_alive(): thread.join(timeout=1) # type: ignore
             print("[AWQRunner] Streaming finished.")
 
     def preload_kv(self, prompt: str, **kwargs: t.Any) -> None:
@@ -426,6 +442,19 @@ class AWQRunner(BaseRunner):
         print("[AWQRunner] Consider re-initializing the runner to get the base model without merged LoRAs.")
         return False
 
+    def count_tokens(self, text: str) -> Optional[int]:
+        """Counts tokens using the loaded Hugging Face tokenizer."""
+        if not self.tokenizer or not AWQ_AVAILABLE: # AWQ_AVAILABLE implies transformers is available
+            print("[AWQRunner] Tokenizer not available, cannot count tokens.")
+            return None
+        try:
+            # The tokenizer's encode method returns a list of token IDs.
+            input_ids = self.tokenizer.encode(text)
+            return len(input_ids)
+        except Exception as e:
+            print(f"[AWQRunner] Error tokenizing text: {e}")
+            return None
+
 
 if __name__ == '__main__':
     # ... (Updated __main__ block from previous step demonstrating generate) ...
@@ -518,8 +547,8 @@ if __name__ == '__main__':
 
                     print("\nAttempting to generate with LoRA (concept)...")
                     # Note: Real generation would use the LoRA-adapted model
-                    gen_output_lora = awq_runner.generate(base_prompt + " with LoRA?", max_new_tokens=5)
-                    print(f"Generate output (with LoRA concept): {gen_output_lora}")
+                    gen_output_lora, lora_tokens = awq_runner.generate(base_prompt + " with LoRA?", max_new_tokens=5)
+                    print(f"Generate output (with LoRA concept): {gen_output_lora}, Tokens: {lora_tokens}")
 
                     print(f"\nAttempting to unload LoRA adapter '{mock_adapter_id}'...")
                     unload_lora_success = awq_runner.unload_lora_adapter(mock_adapter_id)
@@ -538,8 +567,8 @@ if __name__ == '__main__':
                             print("Active adapters after merge (should be empty if PeftModel is gone):", awq_runner.get_active_lora_adapters())
 
                             print("\nAttempting to generate post-merge (concept)...")
-                            gen_output_merged = awq_runner.generate(base_prompt + " post-merge?", max_new_tokens=5)
-                            print(f"Generate output (post-merge concept): {gen_output_merged}")
+                            gen_output_merged, merged_tokens = awq_runner.generate(base_prompt + " post-merge?", max_new_tokens=5)
+                            print(f"Generate output (post-merge concept): {gen_output_merged}, Tokens: {merged_tokens}")
 
                             print("\nAttempting to unmerge LoRA adapters (may require model reload)...")
                             unmerge_success = awq_runner.unmerge_lora_adapters()
@@ -554,7 +583,18 @@ if __name__ == '__main__':
                 #     try: shutil.rmtree(mock_lora_path); print(f"Cleaned up mock LoRA directory: {mock_lora_path}")
                 #     except Exception as e: print(f"Error cleaning up mock dir: {e}")
 
+            print("\n--- Token Counting Demo (AWQRunner) ---")
+            if awq_runner.model and awq_runner.tokenizer: # Check if model and tokenizer loaded
+                sample_text_awq = "Test sentence for AWQ tokenizer."
+                token_count_awq = awq_runner.count_tokens(sample_text_awq)
+                if token_count_awq is not None:
+                    print(f"'{sample_text_awq}' has {token_count_awq} tokens (AWQRunner).")
+                else:
+                    print(f"Could not count tokens for '{sample_text_awq}' with AWQRunner.")
             else:
+                print("Skipping AWQ token counting demo as model/tokenizer was not loaded.")
+
+            else: # This PEFT_AVAILABLE else was mis-indented, should be outside the model&tokenizer check
                 print("\n--- PEFT_AVAILABLE is False. Skipping LoRA method tests. ---")
 
             # ... (rest of KV cache demo or other tests)

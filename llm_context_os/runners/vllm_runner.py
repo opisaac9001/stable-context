@@ -1,73 +1,144 @@
 # llm_context_os/runners/vllm_runner.py
 import typing as t
 import json
+import httpx # Added
 from .base import BaseRunner
 
 class VLLMRunner(BaseRunner):
     def __init__(self, model_name: str, api_url: str = "http://localhost:8000",
                  api_key: t.Optional[str] = None, **kwargs):
-        self.model_name = model_name
-        self.api_url = api_url
+        self.model_name = model_name # This is the 'model' field in the OpenAI-compatible API payload
+        self.api_url = api_url # This should be the base URL, e.g., http://localhost:8000
         self.api_key = api_key
+        self.completion_endpoint = "/v1/completions" # Standard for prompt-based completions
 
-        print(f"[VLLMRunner] Initialized for model '{self.model_name}' at API URL: {self.api_url}")
+        self.http_client = httpx.Client(
+            base_url=self.api_url,
+            timeout=kwargs.get("timeout", 60.0) # Allow timeout to be passed in kwargs
+        )
+        print(f"[VLLMRunner] Initialized for model '{self.model_name}'. HTTP client configured for API URL: {self.api_url}")
         if self.api_key:
             print(f"[VLLMRunner] API Key provided (ending with ...{self.api_key[-4:] if len(self.api_key) > 4 else '****'})")
-        print("[VLLMRunner] Placeholder: Actual HTTP client (e.g., httpx.AsyncClient) would be set up here.")
+
+    def _prepare_headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs) -> str:
-        max_tokens = kwargs.pop('max_new_tokens', kwargs.pop('max_tokens', 128))
-        payload = {
-            "prompt": prompt,
-            "model": self.model_name,
-            "max_tokens": max_tokens,
-            "temperature": kwargs.get('temperature', 0.7),
-            "top_p": kwargs.get('top_p', 1.0),
-            "stream": False,
-            **kwargs
-        }
-        if image_paths: # vLLM OpenAI API might take 'images' as a list of URLs or base64 strings
-            payload['images'] = image_paths # Assuming direct URL passing or future base64 handling
-            print(f"  Image Paths included in payload: {image_paths}")
-
-
-        payload = {k: v for k, v in payload.items() if v is not None}
-        print(f"[VLLMRunner] generate called for model '{self.model_name}'. Prompt: '{prompt[:50]}...'")
-        print(f"[VLLMRunner] Placeholder: Would send POST to an endpoint like {self.api_url}/v1/completions with payload:")
-        try: print(json.dumps(payload, indent=2, sort_keys=True))
-        except TypeError: print(str(payload))
-
-        response_text = f"[vLLM gen for {self.model_name}: {prompt[:30]}...]"
         if image_paths:
-            response_text += f" (images processed: {len(image_paths)})"
-        return response_text
+            print(f"[VLLMRunner] Warning: image_paths provided but standard vLLM OpenAI-compatible /v1/completions endpoint does not support them directly. Ignoring images: {image_paths}")
+
+        headers = self._prepare_headers()
+        # Common parameters for vLLM OpenAI-compatible /v1/completions
+        # Note: vLLM might have specific names for some parameters or additional ones.
+        # Refer to vLLM documentation for exact payload structure if different from standard OpenAI.
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "max_tokens": kwargs.get('max_new_tokens', kwargs.get('max_tokens', 128)),
+            "temperature": kwargs.get('temperature', 0.7),
+            "top_p": kwargs.get('top_p', 1.0), # Default 1.0 for vLLM if not specified
+            "n": kwargs.get('n', 1), # Number of completions to generate
+            "stop": kwargs.get('stop', None), # List of stop sequences
+            "stream": False,
+            # Other potential params: presence_penalty, frequency_penalty, best_of, logprobs, etc.
+            # Add them from kwargs if needed.
+        }
+        # Filter out None values to avoid sending them if they are not set
+        payload = {k: v for k, v in payload.items() if v is not None}
+        # Add any other kwargs passed, assuming they are valid for the API
+        payload.update(kwargs)
+
+
+        print(f"[VLLMRunner] Calling generate on {self.completion_endpoint} for model '{self.model_name}'")
+        # print(f"Payload: {json.dumps(payload, indent=2)}") # Can be verbose
+
+        try:
+            response = self.http_client.post(
+                self.completion_endpoint,
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            response_data = response.json()
+
+            generated_text = response_data.get("choices", [{}])[0].get("text", "").strip()
+            # TODO: Extract token counts if vLLM provides them in the 'usage' field like OpenAI
+            return generated_text
+        except httpx.HTTPStatusError as e:
+            error_detail = f"HTTP error {e.response.status_code} from vLLM server: {e.response.text}"
+            print(f"[VLLMRunner] {error_detail}")
+            return f"[VLLMRunner] Error: {error_detail}"
+        except httpx.RequestError as e:
+            error_detail = f"Request error connecting to vLLM server: {str(e)}"
+            print(f"[VLLMRunner] {error_detail}")
+            return f"[VLLMRunner] Error: {error_detail}"
+        except json.JSONDecodeError as e:
+            error_detail = f"Failed to decode JSON response from vLLM server: {str(e)}"
+            print(f"[VLLMRunner] {error_detail}")
+            return f"[VLLMRunner] Error: {error_detail}"
+        except Exception as e:
+            error_detail = f"Unexpected error processing vLLM response: {str(e)}"
+            print(f"[VLLMRunner] {error_detail}")
+            return f"[VLLMRunner] Error: {error_detail}"
 
     def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs) -> t.Generator[str, None, None]:
-        max_tokens = kwargs.pop('max_new_tokens', kwargs.pop('max_tokens', 128))
+        if image_paths:
+            print(f"[VLLMRunner] Warning: image_paths provided but standard vLLM OpenAI-compatible /v1/completions endpoint does not support them directly. Ignoring images: {image_paths}")
+
+        headers = self._prepare_headers()
         payload = {
-            "prompt": prompt,
             "model": self.model_name,
-            "max_tokens": max_tokens,
+            "prompt": prompt,
+            "max_tokens": kwargs.get('max_new_tokens', kwargs.get('max_tokens', 128)),
             "temperature": kwargs.get('temperature', 0.7),
             "top_p": kwargs.get('top_p', 1.0),
+            "n": kwargs.get('n', 1),
+            "stop": kwargs.get('stop', None),
             "stream": True,
-            **kwargs
         }
-        if image_paths:
-            payload['images'] = image_paths
-            print(f"  Image Paths included in stream payload: {image_paths}")
-
         payload = {k: v for k, v in payload.items() if v is not None}
+        payload.update(kwargs)
 
-        print(f"[VLLMRunner] stream called for model '{self.model_name}'. Prompt: '{prompt[:50]}...'")
-        print(f"[VLLMRunner] Placeholder: Would send POST to an endpoint like {self.api_url}/v1/completions with payload (stream=True):")
-        try: print(json.dumps(payload, indent=2, sort_keys=True))
-        except TypeError: print(str(payload))
+        print(f"[VLLMRunner] Calling stream on {self.completion_endpoint} for model '{self.model_name}'")
+        # print(f"Payload: {json.dumps(payload, indent=2)}")
 
-        yield "[vLLM_stream_chunk1_begin] "
-        image_info_chunk = f" (images_in_req: {len(image_paths)})" if image_paths else ""
-        yield f"data: {{\"id\": \"cmpl-xxx\", ..., \"text\": \"{prompt[:10]}...{image_info_chunk}\" ...}}\n\n"
-        yield "data: [DONE]\n\n"
+        try:
+            with self.http_client.stream("POST", self.completion_endpoint, json=payload, headers=headers) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line.strip():
+                        continue
+                    if line.startswith("data: [DONE]"):
+                        print("[VLLMRunner] Stream DONE marker received.")
+                        break
+                    if line.startswith("data: "):
+                        try:
+                            data_json_str = line.split("data: ", 1)[1]
+                            data_json = json.loads(data_json_str)
+                            chunk_text = data_json.get("choices", [{}])[0].get("text", "")
+                            if chunk_text:
+                                yield chunk_text
+                        except json.JSONDecodeError:
+                            print(f"[VLLMRunner] Warning: Could not decode JSON from stream line: {line}")
+                        except Exception as e_chunk:
+                            print(f"[VLLMRunner] Warning: Error processing stream chunk '{line}': {e_chunk}")
+        except httpx.HTTPStatusError as e:
+            error_detail = f"HTTP error {e.response.status_code} starting vLLM stream: {e.response.text}"
+            print(f"[VLLMRunner] {error_detail}")
+            yield f"[VLLMRunner] Error: {error_detail}"
+        except httpx.RequestError as e:
+            error_detail = f"Request error connecting to vLLM server for stream: {str(e)}"
+            print(f"[VLLMRunner] {error_detail}")
+            yield f"[VLLMRunner] Error: {error_detail}"
+        except Exception as e:
+            error_detail = f"Unexpected error during vLLM stream: {str(e)}"
+            print(f"[VLLMRunner] {error_detail}")
+            yield f"[VLLMRunner] Error: {error_detail}"
+        finally:
+            print("[VLLMRunner] Stream finished or aborted.")
 
     # --- KV Cache and LoRA methods remain the same (mostly no-ops for typical vLLM API client) ---
     def export_kv_cache(self) -> t.Any:
@@ -107,25 +178,57 @@ class VLLMRunner(BaseRunner):
         return False
 
 if __name__ == '__main__':
-    print("--- Testing VLLMRunner Placeholder ---")
-    default_vllm_api_url = "http://localhost:8000"
-    example_model_identifier = "mistralai/Mistral-7B-Instruct-v0.1"
-    vllm_runner = VLLMRunner(model_name=example_model_identifier, api_url=default_vllm_api_url)
-    example_image_paths = ["http://example.com/image.jpg"]
+    import os
+    print("--- Testing VLLMRunner ---")
+    # For this demo to work, ensure a vLLM server with an OpenAI-compatible endpoint is running.
+    # Example vLLM server startup:
+    # python -m vllm.entrypoints.openai.api_server --model mistralai/Mistral-7B-Instruct-v0.1 --host 0.0.0.0 --port 8000
 
+    vllm_api_url = os.environ.get("VLLM_API_URL", "http://localhost:8000") # Base URL, e.g., http://localhost:8000
+    # The runner will append "/v1/completions" or similar.
 
-    print("\n--- Generate Demo with Image ---")
-    gen_params = {"max_new_tokens": 60, "temperature": 0.65}
-    gen_output = vllm_runner.generate("What is in this image?", image_paths=example_image_paths, **gen_params)
-    print(f"Generate Output: {gen_output}")
+    # The model name here should match the model loaded by your vLLM server.
+    # For vLLM's OpenAI API, this is often the Hugging Face repo ID used to launch the server.
+    vllm_model_name = os.environ.get("VLLM_MODEL_NAME", "mistralai/Mistral-7B-Instruct-v0.1")
 
-    print("\n--- Stream Demo with Image ---")
-    stream_params = {"temperature": 0.5, "max_new_tokens": 70}
+    # Optional: API Key if your vLLM endpoint is protected
+    vllm_api_key = os.environ.get("VLLM_API_KEY", None)
+
+    print(f"Using VLLM API URL: {vllm_api_url}")
+    print(f"Using VLLM Model Name: {vllm_model_name}")
+    if vllm_api_key:
+        print("Using VLLM API Key.")
+    else:
+        print("No VLLM API Key provided (assuming endpoint is open or key is not needed).")
+
+    vllm_runner = VLLMRunner(
+        model_name=vllm_model_name,
+        api_url=vllm_api_url,
+        api_key=vllm_api_key
+    )
+
+    print("\n--- Generate Demo ---")
+    gen_prompt = "What is the capital of France?"
+    # Note: image_paths are currently ignored by this runner's generate/stream methods
+    # as standard /v1/completions doesn't take them.
+    # example_image_paths_vllm = ["http://images.cocodataset.org/val2017/000000039769.jpg"]
+
+    gen_params = {"max_tokens": 50, "temperature": 0.5} # Using max_tokens as per OpenAI /v1/completions
+    print(f"Sending to generate: '{gen_prompt}' with params: {gen_params}")
+    gen_output = vllm_runner.generate(gen_prompt, **gen_params)
+    print(f"Generate Output:\n{gen_output}")
+
+    print("\n--- Stream Demo ---")
+    stream_prompt = "Tell me a short joke."
+
+    stream_params = {"temperature": 0.7, "max_tokens": 60}
+    print(f"Sending to stream: '{stream_prompt}' with params: {stream_params}")
     full_streamed_response = []
-    for chunk in vllm_runner.stream("Describe the picture.", image_paths=example_image_paths, **stream_params):
-        print(chunk, end='')
+    print("Streamed Output:")
+    for chunk in vllm_runner.stream(stream_prompt, **stream_params):
+        print(chunk, end='', flush=True)
         full_streamed_response.append(chunk)
-    print("\nFull streamed output (raw chunks):", "".join(full_streamed_response))
+    print("\nFull streamed response collected:", "".join(full_streamed_response))
     print("\n")
 
-    print("\nVLLMRunner placeholder tests complete (including multimodal calls).")
+    print("\nVLLMRunner functional demonstration complete.")
