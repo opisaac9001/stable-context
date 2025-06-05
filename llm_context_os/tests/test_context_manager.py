@@ -2,91 +2,178 @@
 import unittest
 from llm_context_os.context.context_manager import ContextManager, MockTokenizer
 
+# --- Conditional imports for HFTokenizer ---
+HAVE_TRANSFORMERS = False
+HF_TOKENIZER_INSTANCE = None
+HF_MODEL_NAME = "gpt2" # Using a common model, fairly small
+
+try:
+    # Try to import AutoTokenizer to confirm transformers library is available
+    from transformers import AutoTokenizer
+    from llm_context_os.context.token_estimator import HFTokenEstimator
+    HAVE_TRANSFORMERS = True
+    try:
+        HF_TOKENIZER_INSTANCE = HFTokenEstimator(model_name=HF_MODEL_NAME)
+        print(f"Successfully loaded HFTokenizer with model '{HF_MODEL_NAME}'.")
+    except Exception as e:
+        # This can happen if the model is not found, network issues, etc.
+        print(f"Note: Could not load HFTokenizer model '{HF_MODEL_NAME}': {e}")
+        HF_TOKENIZER_INSTANCE = None # Ensure it's None if model loading fails
+except ImportError:
+    print("Note: 'transformers' library not found or HFTokenEstimator not found. Skipping HFTokenizer tests.")
+    # HAVE_TRANSFORMERS remains False, HF_TOKENIZER_INSTANCE remains None
+    pass
+# --- End conditional imports ---
+
 class TestContextManager(unittest.TestCase):
 
     def setUp(self):
         self.mock_tokenizer = MockTokenizer() # Using the char-counting mock
-        self.system_prompt = "SYSTEM:"
-        # max_tokens includes system_prompt length + 1 for newline + messages length
+        self.system_prompt_str = "SYSTEM:" # Renamed from self.system_prompt to avoid conflict if HF has own
+        # For MockTokenizer (char-based):
         # System prompt "SYSTEM:" is 7 chars. Newline is 1 char. So 8 chars for system part.
 
     def test_initialization(self):
-        cm = ContextManager(self.system_prompt, self.mock_tokenizer, max_tokens=100)
-        self.assertEqual(cm.system_prompt, self.system_prompt)
+        cm = ContextManager(self.system_prompt_str, self.mock_tokenizer, max_tokens=100)
+        self.assertEqual(cm.system_prompt, self.system_prompt_str)
         self.assertEqual(cm._messages, [])
         self.assertEqual(cm._start, 0)
         self.assertEqual(cm.max_tokens, 100)
         # Initial prompt should just be the system prompt + newline
         # Corrected based on ContextManager.build_prompt() logic which adds newline if messages follow
         # If no messages, it returns system_prompt as is.
-        self.assertEqual(cm.build_prompt(), self.system_prompt)
+        self.assertEqual(cm.build_prompt(), self.system_prompt_str)
 
 
     def test_add_message_simple(self):
-        cm = ContextManager(self.system_prompt, self.mock_tokenizer, max_tokens=100)
+        cm = ContextManager(self.system_prompt_str, self.mock_tokenizer, max_tokens=100)
         cm.add("user", "Hello") # image_path defaults to None
         self.assertEqual(len(cm._messages), 1)
         self.assertEqual(cm._messages[0], {"r": "user", "c": "Hello", "image_path": None})
         # _auto_scroll sets _start to len - 1, so 0.
         # _fit is called. Prompt: "SYSTEM:\nuser: Hello\n" (7+1+12 = 20 chars). Fits. _start remains 0.
         self.assertEqual(cm._start, 0)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\nuser: Hello\n")
+        self.assertEqual(cm.build_prompt(), self.system_prompt_str + "\nuser: Hello\n")
 
     def test_add_multiple_messages_and_auto_scroll(self):
-        cm = ContextManager(self.system_prompt, self.mock_tokenizer, max_tokens=100)
+        cm = ContextManager(self.system_prompt_str, self.mock_tokenizer, max_tokens=100)
         cm.add("user", "Msg1") # "user: Msg1\n" (11)
         cm.add("ai", "Msg2")   # "ai: Msg2\n" (9)
         self.assertEqual(len(cm._messages), 2)
         # _auto_scroll sets _start=1. Window is msg2 for _fit.
         # Prompt for _fit: "SYSTEM:\nai: Msg2\n" (7+1+9 = 17 chars). Fits. _start remains 1.
         self.assertEqual(cm._start, 1)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\nai: Msg2\n")
+        self.assertEqual(cm.build_prompt(), self.system_prompt_str + "\nai: Msg2\n")
+
+    def _run_fit_logic_truncation_test(self, tokenizer, system_prompt_str, max_tokens_val, msg_contents, expected_final_start_idx, test_label=""):
+        """
+        Helper function to test the fit logic of ContextManager.
+        Adds 3 messages, then jumps to the start and checks if _start is adjusted correctly
+        and the final prompt is within token limits.
+        """
+        cm = ContextManager(system_prompt_str, tokenizer, max_tokens=max_tokens_val)
+
+        # Add messages
+        roles = ["u", "a", "u"]
+        for i in range(3):
+            cm.add(roles[i], msg_contents[i])
+            # Basic check after each add (auto-scroll behavior)
+            self.assertEqual(cm._start, i, f"[{test_label}] After {i+1} add(s), _start should be {i}")
+            current_prompt = cm.build_prompt()
+            self.assertTrue(tokenizer.count_tokens(current_prompt) <= max_tokens_val,
+                            f"[{test_label}] Prompt after {i+1} add(s) should fit within max_tokens. "
+                            f"Got {tokenizer.count_tokens(current_prompt)}, max {max_tokens_val}. Prompt: {current_prompt}")
+
+        # Test _fit by jumping to cause potential overflow
+        cm.jump_to(0)
+
+        final_prompt = cm.build_prompt()
+        final_tokens = tokenizer.count_tokens(final_prompt)
+
+        self.assertEqual(cm._start, expected_final_start_idx,
+                         f"[{test_label}] After jump_to(0) and _fit, _start should be {expected_final_start_idx}, but got {cm._start}. "
+                         f"Final prompt: '{final_prompt}', tokens: {final_tokens}, max_tokens: {max_tokens_val}")
+
+        self.assertTrue(final_tokens <= max_tokens_val,
+                        f"[{test_label}] Final prompt tokens ({final_tokens}) should not exceed max_tokens ({max_tokens_val}). "
+                        f"Prompt: '{final_prompt}'")
+
+        # Verify that if truncation occurred (expected_final_start_idx > 0), the first message is not in the prompt
+        if expected_final_start_idx > 0 and len(cm._messages) > 0:
+            first_message_text = cm._messages[0]['c']
+            self.assertNotIn(first_message_text, final_prompt,
+                             f"[{test_label}] First message content '{first_message_text}' should not be in the final prompt if _start is {cm._start} (>0).")
+
 
     def test_fit_logic_truncation(self):
-        # System prompt "SYSTEM:" = 7 chars. Newline = 1 char. Total 8 for system part in prompt.
-        # max_tokens = 30.
-        cm = ContextManager(self.system_prompt, self.mock_tokenizer, max_tokens=30)
+        # Using MockTokenizer (char based)
+        system_prompt = self.system_prompt_str # "SYSTEM:" (7 chars) + NL (1 char) = 8 system part
+        # Message "u: content01\n": 1(role) + 2(: ) + 9(content) + 1(\n) = 13 chars
+        msg_contents = ["content01", "content02", "content03"]
 
-        # msg1 = "u: content01\n" (14 chars)
-        # Prompt with msg1: "SYSTEM:\nu: content01\n" (7+1+14 = 22 chars). Fits. _start=0.
-        cm.add("u", "content01")
-        self.assertEqual(cm._start, 0)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\nu: content01\n")
+        # Case 1: Original test case where truncation leads to _start = 2
+        # Sys (8) + M1(13) + M2(13) + M3(13) = 47. max_tokens = 30.
+        # After jump_to(0):
+        #   _start=0, prompt=47 > 30 -> _start=1
+        #   _start=1, prompt=Sys+M2+M3 = 8+13+13=34 > 30 -> _start=2
+        #   _start=2, prompt=Sys+M3 = 8+13=21 <= 30. Final _start=2.
+        self._run_fit_logic_truncation_test(self.mock_tokenizer, system_prompt,
+                                            max_tokens_val=30, msg_contents=msg_contents,
+                                            expected_final_start_idx=2, test_label="Mock-TruncateToLast")
 
-        # msg2 = "a: content02\n" (14 chars)
-        # _auto_scroll sets _start=1.
-        # _fit checks prompt with window=[msg2]: "SYSTEM:\na: content02\n" (7+1+14 = 22 chars). Fits. _start remains 1.
-        cm.add("a", "content02")
-        self.assertEqual(cm._start, 1)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\na: content02\n")
+        # Case 2: All messages fit
+        # Sys (8) + M1(13) + M2(13) + M3(13) = 47. max_tokens = 50.
+        # After jump_to(0): prompt=47 <= 50. Final _start=0.
+        self._run_fit_logic_truncation_test(self.mock_tokenizer, system_prompt,
+                                            max_tokens_val=50, msg_contents=msg_contents,
+                                            expected_final_start_idx=0, test_label="Mock-AllFit")
 
-        # msg3 = "u: content03\n" (14 chars)
-        # _auto_scroll sets _start=2.
-        # _fit checks prompt with window=[msg3]: "SYSTEM:\nu: content03\n" (7+1+14 = 22 chars). Fits. _start remains 2.
-        cm.add("u", "content03")
-        self.assertEqual(cm._start, 2)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\nu: content03\n")
+        # Case 3: Truncation leads to _start = 1
+        # Sys (8) + M1(13) + M2(13) + M3(13) = 47. max_tokens = 35.
+        # After jump_to(0):
+        #   _start=0, prompt=47 > 35 -> _start=1
+        #   _start=1, prompt=Sys+M2+M3 = 8+13+13=34 <= 35. Final _start=1.
+        self._run_fit_logic_truncation_test(self.mock_tokenizer, system_prompt,
+                                            max_tokens_val=35, msg_contents=msg_contents,
+                                            expected_final_start_idx=1, test_label="Mock-TruncateToOne")
 
-        # Now, let's test _fit explicitly by navigating.
-        # Messages: [msg1, msg2, msg3] (all 14 chars each)
-        # Jump to msg1 (idx 0).
-        cm.jump_to(0)
-        # _start is 0. _fit is called.
-        # Window for build_prompt: [msg1, msg2, msg3]
-        # Prompt: "SYSTEM:\nu: content01\na: content02\nu: content03\n"
-        # Tokens: 7(sys) + 1(nl) + 14(m1) + 14(m2) + 14(m3) = 50. (max_tokens = 30)
-        # _fit loop:
-        # 1. _start = 0. Prompt tokens = 50. > 30. _start < (3-1) is true. _start becomes 1.
-        # 2. _start = 1. Window: [msg2, msg3]. Prompt: "SYSTEM:\na: content02\nu: content03\n"
-        #    Tokens: 7(sys) + 1(nl) + 14(m2) + 14(m3) = 36. > 30. _start < (3-1) is true. _start becomes 2.
-        # 3. _start = 2. Window: [msg3]. Prompt: "SYSTEM:\nu: content03\n"
-        #    Tokens: 7(sys) + 1(nl) + 14(m3) = 22. < 30. Loop ends. _start stays 2.
-        self.assertEqual(cm._start, 2)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\nu: content03\n")
+
+    @unittest.skipIf(not HF_TOKENIZER_INSTANCE, "HFTokenizer not available or model could not be loaded")
+    def test_fit_logic_truncation_hf(self):
+        system_prompt = self.system_prompt_str # "SYSTEM:" (gpt2: 2 tokens) + NL (1 token) = 3 system part
+        # Message "u: content01\n" (gpt2: "u"(1) + ":"(1) + " content"(1) + "01"(1) + "\n"(1) = 5 tokens)
+        msg_contents = ["content01", "content02", "content03"] # Each gives 5 tokens for "role: contentXX\n"
+
+        # Total tokens if all included: Sys(3) + M1(5) + M2(5) + M3(5) = 18 tokens
+
+        # Case 1 HF: All messages fit
+        # max_tokens = 20. Full prompt is 18 tokens. Expected _start = 0.
+        self._run_fit_logic_truncation_test(HF_TOKENIZER_INSTANCE, system_prompt,
+                                            max_tokens_val=20, msg_contents=msg_contents,
+                                            expected_final_start_idx=0, test_label="HF-AllFit")
+
+        # Case 2 HF: One message truncated
+        # max_tokens = 15. Full prompt is 18 tokens.
+        # After jump_to(0):
+        #   _start=0, prompt=18 > 15 -> _start=1
+        #   _start=1, prompt=Sys+M2+M3 = 3+5+5=13 <= 15. Final _start=1.
+        self._run_fit_logic_truncation_test(HF_TOKENIZER_INSTANCE, system_prompt,
+                                            max_tokens_val=15, msg_contents=msg_contents,
+                                            expected_final_start_idx=1, test_label="HF-TruncateToOne")
+
+        # Case 3 HF: Two messages truncated
+        # max_tokens = 9. Full prompt is 18 tokens.
+        # After jump_to(0):
+        #   _start=0, prompt=18 > 9 -> _start=1
+        #   _start=1, prompt=Sys+M2+M3 = 3+5+5=13 > 9 -> _start=2
+        #   _start=2, prompt=Sys+M3 = 3+5=8 <= 9. Final _start=2.
+        self._run_fit_logic_truncation_test(HF_TOKENIZER_INSTANCE, system_prompt,
+                                            max_tokens_val=9, msg_contents=msg_contents,
+                                            expected_final_start_idx=2, test_label="HF-TruncateToLast")
 
     def test_system_prompt_never_dropped(self):
         # System prompt "SYSTEM:" = 7. Max tokens 10 (meaning 7+1 system part, 2 for messages).
-        cm = ContextManager(self.system_prompt, self.mock_tokenizer, max_tokens=10)
+        cm = ContextManager(self.system_prompt_str, self.mock_tokenizer, max_tokens=10)
         # "u: 12345\n" is 9 chars. Prompt: "SYSTEM:\nu: 12345\n" (7+1+9 = 17 tokens). Too long.
         cm.add("u", "12345")
         # _auto_scroll to _start=0. _fit runs.
@@ -94,7 +181,7 @@ class TestContextManager(unittest.TestCase):
         # _fit loop condition: `self._start < len(cm._messages) - 1` (0 < 0) is false. Loop doesn't run.
         # So the single message remains. _start is 0.
         self.assertEqual(cm._start, 0)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\nu: 12345\n")
+        self.assertEqual(cm.build_prompt(), self.system_prompt_str + "\nu: 12345\n")
         self.assertTrue(self.mock_tokenizer.count_tokens(cm.build_prompt()) > cm.max_tokens)
 
         # Add another message, short.
@@ -105,11 +192,11 @@ class TestContextManager(unittest.TestCase):
         # _fit loop condition: `self._start < len(cm._messages) - 1` (1 < 1) is false. Loop doesn't run. _start is 1.
         cm.add("a", "1")
         self.assertEqual(cm._start, 1)
-        self.assertEqual(cm.build_prompt(), self.system_prompt + "\na: 1\n")
+        self.assertEqual(cm.build_prompt(), self.system_prompt_str + "\na: 1\n")
 
 
     def test_shift_navigation(self):
-        cm = ContextManager(self.system_prompt, self.mock_tokenizer, max_tokens=55) # Increased max_tokens
+        cm = ContextManager(self.system_prompt_str, self.mock_tokenizer, max_tokens=55) # Increased max_tokens
         # Each message "role: content\n" will be:
         # msg1: "u: msg1\n" (9)
         # msg2: "a: msg2\n" (9)
