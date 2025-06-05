@@ -1,15 +1,24 @@
 # llm_context_os/tests/test_tools.py
+# llm_context_os/tests/test_tools.py
 import unittest
 import json
-from llm_context_os.tools.tool_dispatcher import ToolDispatcher
+from unittest.mock import patch, MagicMock # Added for MCP testing
+
+from llm_context_os.tools.tool_dispatcher import ToolDispatcher, MCP_ADAPTERS_AVAILABLE # Import flag
 from llm_context_os.tools import builtin_weather
+
+# If McpClient is imported in tool_dispatcher, we might need its path for patching
+# from langchain_mcp_adapters import McpClient # Only if needed for spec in MagicMock
 
 class TestToolDispatcherAndTools(unittest.TestCase):
 
     def setUp(self):
-        # It's good practice to create a new dispatcher for each test
-        # if its state could be modified (though current placeholder is stateless after init)
+        # Create a new dispatcher for each test to ensure a clean state,
+        # especially important if MCP_ADAPTERS_AVAILABLE changes or if McpClient is stateful.
+        # Patching MCP_ADAPTERS_AVAILABLE for specific tests will require re-instantiation
+        # of ToolDispatcher within those tests if its __init__ depends on the flag.
         self.dispatcher = ToolDispatcher()
+
 
     def test_builtin_weather_get_weather_known_location(self):
         result_ny_c = builtin_weather.get_weather("New York")
@@ -57,21 +66,101 @@ class TestToolDispatcherAndTools(unittest.TestCase):
         self.assertEqual(result_dict['status'], 'error')
         self.assertIn("got an unexpected keyword argument 'extra_param'", result_dict['error'].lower())
 
+    # --- MCP Tool Dispatching Tests ---
 
-    def test_dispatch_mcp_tool_placeholder(self):
-        mcp_call_json = json.dumps({"name": "mcp_example_tool", "arguments": {"data": "test"}})
-        result_dict = self.dispatcher.dispatch(mcp_call_json)
-        self.assertEqual(result_dict['tool_name'], 'mcp_example_tool')
-        self.assertEqual(result_dict['status'], 'success_placeholder') # As per ToolDispatcher code
-        self.assertIn("Placeholder result from MCP tool", result_dict['result'])
-        self.assertIn("'data': 'test'", result_dict['result']) # Check args are passed
+    @unittest.skipUnless(MCP_ADAPTERS_AVAILABLE, "langchain-mcp-adapters not installed, skipping MCP tests.")
+    @patch('llm_context_os.tools.tool_dispatcher.McpClient') # Patch the McpClient class where it's imported by ToolDispatcher
+    def test_dispatch_mcp_tool_success(self, MockMcpClient):
+        # This test runs if MCP_ADAPTERS_AVAILABLE is True.
+        # ToolDispatcher will attempt to initialize McpClient in its __init__.
+        # So, the MockMcpClient from the patch is the class, and dispatcher.mcp_client is an instance of this mock.
+
+        # Re-initialize dispatcher to ensure it uses the patched McpClient from this test's context
+        dispatcher = ToolDispatcher()
+        self.assertIsNotNone(dispatcher.mcp_client, "MCP Client should be initialized (mocked).")
+
+        # Configure the mock mcp_client instance
+        mock_mcp_instance = dispatcher.mcp_client
+        mock_mcp_instance.invoke.return_value = {"mcp_data": "successful result from mcp tool"}
+
+        mcp_tool_name = "mcp_actual_tool"
+        mcp_tool_args = {"arg1": "val1", "arg2": 123}
+        mcp_call_json = json.dumps({"name": mcp_tool_name, "arguments": mcp_tool_args})
+
+        result_dict = dispatcher.dispatch(mcp_call_json)
+
+        self.assertEqual(result_dict['tool_name'], mcp_tool_name)
+        self.assertEqual(result_dict['status'], 'success')
+        self.assertEqual(result_dict['result'], {"mcp_data": "successful result from mcp tool"})
+        mock_mcp_instance.invoke.assert_called_once_with(mcp_tool_name, mcp_tool_args)
+
+
+    @unittest.skipUnless(MCP_ADAPTERS_AVAILABLE, "langchain-mcp-adapters not installed, skipping MCP tests.")
+    @patch('llm_context_os.tools.tool_dispatcher.McpClient')
+    def test_dispatch_mcp_tool_error_from_client(self, MockMcpClient):
+        dispatcher = ToolDispatcher()
+        self.assertIsNotNone(dispatcher.mcp_client)
+
+        mock_mcp_instance = dispatcher.mcp_client
+        mock_mcp_instance.invoke.side_effect = Exception("MCP client experienced a critical failure")
+
+        mcp_tool_name = "mcp_failing_tool"
+        mcp_tool_args = {"param": "boom"}
+        mcp_call_json = json.dumps({"name": mcp_tool_name, "arguments": mcp_tool_args})
+
+        result_dict = dispatcher.dispatch(mcp_call_json)
+
+        self.assertEqual(result_dict['tool_name'], mcp_tool_name)
+        self.assertEqual(result_dict['status'], 'error')
+        self.assertIn("MCP Error for tool mcp_failing_tool: MCP client experienced a critical failure", result_dict['error'])
+        mock_mcp_instance.invoke.assert_called_once_with(mcp_tool_name, mcp_tool_args)
+
+    # This test specifically checks behavior when MCP_ADAPTERS_AVAILABLE is False *during* ToolDispatcher init
+    @patch('llm_context_os.tools.tool_dispatcher.MCP_ADAPTERS_AVAILABLE', False)
+    def test_dispatch_mcp_tool_unavailable_client_falls_to_unknown(self):
+        # With MCP_ADAPTERS_AVAILABLE patched to False, ToolDispatcher should set self.mcp_client to None
+        dispatcher_no_mcp = ToolDispatcher()
+        self.assertIsNone(dispatcher_no_mcp.mcp_client, "MCP client should be None when MCP_ADAPTERS_AVAILABLE is False.")
+
+        mcp_tool_name = "mcp_tool_when_client_is_none"
+        mcp_call_json = json.dumps({"name": mcp_tool_name, "arguments": {}})
+        result_dict = dispatcher_no_mcp.dispatch(mcp_call_json)
+
+        self.assertEqual(result_dict['tool_name'], mcp_tool_name)
+        self.assertEqual(result_dict['status'], 'error')
+        # The error message includes "client unavailable/tool not found"
+        self.assertIn(f"Unknown tool: {mcp_tool_name}. Not found in local tools or MCP (client unavailable/tool not found).", result_dict['error'])
 
     def test_dispatch_unknown_tool(self):
-        unknown_call_json = json.dumps({"name": "fake_tool", "arguments": {}}) # Added arguments
-        result_dict = self.dispatcher.dispatch(unknown_call_json)
+        # This test now implicitly also covers the case where MCP_ADAPTERS_AVAILABLE is True,
+        # McpClient initializes, but the tool is not local and not found by MCP (if MCP client itself
+        # raises an error that the dispatcher catches and then moves to 'unknown tool').
+        # The current dispatcher logic: local -> mcp (if client) -> unknown.
+        # If mcp_client.invoke raises an error, it's reported as an MCP error, not "Unknown tool".
+        # So this test primarily covers "not local AND (MCP client is None OR MCP_ADAPTERS_AVAILABLE is False)"
+        # or if MCP was available but the tool name was not even attempted via MCP (e.g. due to naming convention not met, though current code doesn't have such a convention check before trying MCP)
+
+        # To specifically test "unknown to local AND unknown to a functioning MCP client":
+        # This would require the mocked mcp_client.invoke to raise a specific "ToolNotFoundOnMCPError"
+        # which the dispatcher then specifically catches to return the "Unknown tool" message.
+        # The current implementation returns "MCP Error: ToolNotFoundOnMCPError" instead.
+        # So, this test remains for "not local, and no MCP client to ask".
+
+        # If MCP_ADAPTERS_AVAILABLE is true and McpClient is mocked by other tests,
+        # self.dispatcher might have a mocked mcp_client.
+        # To ensure this test checks "unknown when MCP not available or not relevant":
+        if self.dispatcher.mcp_client: # If a mock client got attached from a previous MCP test context
+            with patch.object(self.dispatcher, 'mcp_client', None): # Temporarily remove mcp_client
+                 unknown_call_json = json.dumps({"name": "fake_tool", "arguments": {}})
+                 result_dict = self.dispatcher.dispatch(unknown_call_json)
+        else: # mcp_client is already None (e.g. MCP_ADAPTERS_AVAILABLE was false)
+            unknown_call_json = json.dumps({"name": "fake_tool", "arguments": {}})
+            result_dict = self.dispatcher.dispatch(unknown_call_json)
+
         self.assertEqual(result_dict['tool_name'], 'fake_tool')
         self.assertEqual(result_dict['status'], 'error')
         self.assertIn("Unknown tool: fake_tool", result_dict['error'])
+
 
     def test_dispatch_invalid_json(self):
         invalid_json_str = '{"name": "get_weather", "arguments": {"location": "New York"}' # Missing closing brace

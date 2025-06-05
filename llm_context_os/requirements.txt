@@ -44,8 +44,9 @@ httpx>=0.25.0      # For making HTTP requests
 # bitsandbytes # Often used with PEFT for quantization during training/loading
 
 # --- Retriever (RAG - Phase 4) ---
-# sentence-transformers # For embedding text
-# chromadb              # For vector storage and similarity search
+sentence-transformers>=2.2.0 # For embedding text
+chromadb>=0.4.15              # For vector storage and similarity search
+tiktoken>=0.5.0               # For token counting, often used with embedding/retrieval
 # For PDF Processing (in PdfRetriever)
 # pypdf2                # For PDF text extraction
 # pymupdf               # Alternative for PDF text extraction, often faster/more robust
@@ -54,7 +55,7 @@ httpx>=0.25.0      # For making HTTP requests
 
 # --- Tool-Calling (Phase 4) ---
 # For MCP Adapters
-# langchain-mcp-adapters
+langchain-mcp-adapters>=0.1.0
 # Add other general tool-related dependencies here if any (e.g., for parsing specific tool inputs/outputs if not covered by basic types)
 
 # --- GUI (Phase 5) ---

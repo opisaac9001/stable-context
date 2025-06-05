@@ -11,6 +11,7 @@ import tempfile
 import shutil
 
 # App-specific imports
+import yaml # For config loading
 from llm_context_os.api.schemas import (
     LoadModelRequest,
     ChatRequest,
@@ -19,31 +20,125 @@ from llm_context_os.api.schemas import (
     UploadPdfResponse,
     GenerationParams
 )
-from llm_context_os.context.context_manager import ContextManager, MockTokenizer # Ensure correct import path
+from llm_context_os.context.context_manager import ContextManager, MockTokenizer
+from llm_context_os.context.token_estimator import TikTokenEstimator, HFTokenEstimator # For RAG tokenizer
 from llm_context_os.runners.manager import ModelManager
 from llm_context_os.runners.base import BaseRunner
 from llm_context_os.retriever.chat_history import ChatHistoryRetriever
-from llm_context_os.retriever.pdf_retriever import PdfRetriever # Added
+from llm_context_os.retriever.pdf_retriever import PdfRetriever
 from llm_context_os.tools.tool_dispatcher import ToolDispatcher
 
 # --- Application Setup ---
 app = FastAPI(
     title="LLM Context OS API",
     description="API for managing local LLM models, context, RAG, and generation.",
-    version="0.1.1" # Incremented version
+    version="0.1.2" # Incremented version for config changes
 )
 
-# --- Global Instances ---
-model_mgr = ModelManager()
-mock_tokenizer_for_ctx = MockTokenizer()
+# --- Configuration Loading ---
+DEFAULT_CONFIG = {
+    "context_manager": {"system_prompt": "You are a helpful AI assistant.", "max_tokens": 4096},
+    "chat_history_retriever": {
+        "recall_budget_tokens": 512,
+        "embedding_model_name": "all-MiniLM-L6-v2",
+        "vector_db_path": "data/vector_dbs/api_default_chat_history"
+    },
+    "pdf_retriever": {
+        "vector_db_path": "data/vector_dbs/api_default_pdf_rag",
+        "embedding_model_name": "all-MiniLM-L6-v2",
+        "chunk_size": 500,
+        "chunk_overlap": 50
+    },
+    "model_manager": {"default_idle_unload_sec": 900},
+    "token_estimator_for_rag_budgeting": {"type": "tiktoken", "model_name": "cl100k_base"}
+}
+CONFIG = DEFAULT_CONFIG.copy() # Start with defaults
+try:
+    # Assuming config.yaml is in llm_context_os/config/config.yaml relative to project root
+    # For robustness, resolve path from this file's location.
+    # __file__ is llm_context_os/api/main.py
+    # So, parent is api/, parent.parent is llm_context_os/
+    config_file_path = Path(__file__).parent.parent / "config" / "config.yaml"
+    if config_file_path.exists():
+        print(f"Loading configuration from: {config_file_path}")
+        with open(config_file_path, 'r') as f:
+            loaded_config_yaml = yaml.safe_load(f)
+        if loaded_config_yaml: # Merge loaded config into defaults
+            for key, value in loaded_config_yaml.items():
+                if key in CONFIG and isinstance(CONFIG[key], dict) and isinstance(value, dict):
+                    # Deep merge for one level of nesting
+                    CONFIG[key].update(value)
+                else:
+                    CONFIG[key] = value
+            print("Configuration loaded and merged successfully.")
+    else:
+        print(f"Warning: config.yaml not found at {config_file_path}. Using default API configurations.")
+except Exception as e:
+    print(f"Error loading or parsing config.yaml: {e}. Using default API configurations.")
+
+# --- Global Instances Initialized from CONFIG ---
+
+# Tokenizer for RAG and ContextManager budgeting
+rag_tokenizer_config = CONFIG.get('token_estimator_for_rag_budgeting', DEFAULT_CONFIG['token_estimator_for_rag_budgeting'])
+rag_tokenizer = None
+print(f"Attempting to load RAG tokenizer based on config: {rag_tokenizer_config}")
+if rag_tokenizer_config['type'] == 'tiktoken':
+    try:
+        rag_tokenizer = TikTokenEstimator(model_name=rag_tokenizer_config.get('model_name', 'cl100k_base'))
+        print(f"Using TikTokenEstimator ('{rag_tokenizer_config.get('model_name', 'cl100k_base')}') for RAG budgeting.")
+    except Exception as e:
+        print(f"Warning: Could not load TikTokenEstimator for RAG: {e}")
+elif rag_tokenizer_config['type'] == 'hf':
+    try:
+        rag_tokenizer = HFTokenEstimator(model_name=rag_tokenizer_config.get('model_name', 'gpt2'))
+        print(f"Using HFTokenEstimator ('{rag_tokenizer_config.get('model_name', 'gpt2')}') for RAG budgeting.")
+    except Exception as e:
+        print(f"Warning: Could not load HFTokenEstimator for RAG: {e}")
+
+if not rag_tokenizer:
+    print("Warning: Using fallback MockTokenizer for RAG/Context budgeting due to previous errors.")
+    rag_tokenizer = MockTokenizer()
+
+# Context Manager
+ctx_mgr_config = CONFIG.get('context_manager', DEFAULT_CONFIG['context_manager'])
 ctx_mgr = ContextManager(
-    system_prompt="You are a helpful AI assistant.",
-    tokenizer=mock_tokenizer_for_ctx,
-    max_tokens=1024
+    system_prompt=ctx_mgr_config['system_prompt'],
+    tokenizer=rag_tokenizer, # Use the RAG tokenizer for context manager too
+    max_tokens=ctx_mgr_config['max_tokens']
 )
-chat_history_retriever = ChatHistoryRetriever() # Renamed for clarity
-pdf_retriever = PdfRetriever() # Added
+print(f"ContextManager initialized with: system_prompt='{ctx_mgr_config['system_prompt'][:50]}...', max_tokens={ctx_mgr_config['max_tokens']}, tokenizer={type(rag_tokenizer).__name__}")
+
+
+# Chat History Retriever
+chr_config = CONFIG.get('chat_history_retriever', DEFAULT_CONFIG['chat_history_retriever'])
+chat_history_retriever = ChatHistoryRetriever(
+    recall_budget_tokens=chr_config['recall_budget_tokens'],
+    tokenizer=rag_tokenizer,
+    vector_db_path=chr_config['vector_db_path'],
+    embedding_model_name=chr_config['embedding_model_name']
+)
+print(f"ChatHistoryRetriever initialized with: budget={chr_config['recall_budget_tokens']}, db_path='{chr_config['vector_db_path']}', model='{chr_config['embedding_model_name']}'")
+
+# PDF Retriever
+pdf_retriever_config = CONFIG.get('pdf_retriever', DEFAULT_CONFIG['pdf_retriever'])
+pdf_retriever = PdfRetriever(
+    vector_db_path=pdf_retriever_config['vector_db_path'],
+    embedding_model_name=pdf_retriever_config['embedding_model_name'],
+    tokenizer=rag_tokenizer, # Pass tokenizer for potential future use (e.g. chunk size by tokens)
+    chunk_size=pdf_retriever_config['chunk_size'],
+    chunk_overlap=pdf_retriever_config['chunk_overlap']
+)
+print(f"PdfRetriever initialized with: db_path='{pdf_retriever_config['vector_db_path']}', model='{pdf_retriever_config['embedding_model_name']}'")
+
+
+# Model Manager
+model_mgr_config = CONFIG.get('model_manager', DEFAULT_CONFIG['model_manager'])
+model_mgr = ModelManager(default_idle_unload_sec=model_mgr_config['default_idle_unload_sec'])
+print(f"ModelManager initialized with default_idle_unload_sec={model_mgr_config['default_idle_unload_sec']}")
+
+# Tool Dispatcher (currently no config needed from file for its __init__)
 tool_dispatcher = ToolDispatcher()
+print("ToolDispatcher initialized.")
 
 # --- API Endpoints ---
 
@@ -125,15 +220,21 @@ async def chat_endpoint(req: ChatRequest):
     def _prepare_context_and_initial_prompt(
         current_req: ChatRequest,
         current_ctx_mgr: ContextManager,
-        current_chat_history_retriever: ChatHistoryRetriever,
-        current_pdf_retriever: PdfRetriever
+        current_chat_history_retriever: ChatHistoryRetriever, # Now global, but passed for explicitness
+        current_pdf_retriever: PdfRetriever         # Now global, but passed for explicitness
     ) -> str:
         first_image_path: Optional[str] = None
         if current_req.image_paths and len(current_req.image_paths) > 0:
             first_image_path = current_req.image_paths[0]
-            # Log image path if needed
 
+        # Add user message to context manager first
         current_ctx_mgr.add(role="user", content=current_req.message, image_path=first_image_path)
+        # Then add to chat history retriever
+        # (Let CHR generate its own ID, or pass one if available/needed)
+        try:
+            chat_history_retriever.add_message(message_text=current_req.message, role="user")
+        except Exception as e_chr_add:
+            print(f"Warning: Failed to add user message to ChatHistoryRetriever: {e_chr_add}")
 
         retrieved_snippets = []
         if current_req.use_rag and not current_req.pdf_doc_ids_for_rag:
@@ -163,29 +264,29 @@ async def chat_endpoint(req: ChatRequest):
     # --- Shared logic for handling tool calls ---
     def _handle_tool_call(
         tool_call_str: str, # The raw "[FUNCALL]..." string
-        current_ctx_mgr: ContextManager,
-        current_tool_dispatcher: ToolDispatcher
-    ) -> str: # Returns the second prompt
+        current_ctx_mgr: ContextManager,         # Now global, but passed for explicitness
+        current_tool_dispatcher: ToolDispatcher  # Now global, but passed for explicitness
+    ) -> tuple[str, str, str]: # Returns (second_prompt_text, tool_name, tool_params_json_str)
         print(f'[API /chat] Detected function call: {tool_call_str}')
         function_call_json_str = tool_call_str.replace('[FUNCALL]', '').strip()
 
-        # Attempt to parse the JSON string early to catch errors
+        tool_name_for_event = "unknown_tool"
         try:
-            tool_params = json.loads(function_call_json_str) # To extract tool name for event
+            tool_params = json.loads(function_call_json_str)
             tool_name_for_event = tool_params.get("tool_name", "unknown_tool")
         except json.JSONDecodeError:
             tool_name_for_event = "unknown_tool_json_decode_error"
-            # Let tool_dispatcher handle the potentially malformed string if it can/wants to
-
-        # Yield tool call event (for streaming) - this helper is sync, so can't yield directly.
-        # The streaming generator will yield this.
 
         tool_result_dict = current_tool_dispatcher.dispatch(function_call_json_str)
         print(f'[API /chat] Tool dispatch result: {tool_result_dict}')
-        tool_message_content = json.dumps(tool_result_dict) # Convert result back to JSON string for context
+        tool_message_content = json.dumps(tool_result_dict)
         current_ctx_mgr.add(role='tool_result', content=tool_message_content)
-        print('[API /chat] Added tool result to context. Building second prompt...')
+        # Also add tool result to chat history retriever? This could be noisy.
+        # For now, only user/assistant turns are added to CHR. This can be reviewed.
+        # e.g., if tool_result_dict.get("status") == "success":
+        #    chat_history_retriever.add_message(message_text=f"Tool {tool_name_for_event} result: {tool_result_dict.get('result')}", role="tool_result_summary")
 
+        print('[API /chat] Added tool result to context. Building second prompt...')
         second_prompt_text = current_ctx_mgr.build_prompt()
         print(f"Built second prompt for model (len {len(second_prompt_text)} chars):\n{second_prompt_text[:500]}...")
         return second_prompt_text, tool_name_for_event, function_call_json_str
@@ -194,10 +295,12 @@ async def chat_endpoint(req: ChatRequest):
     # --- Streaming Response Logic ---
     if req.stream:
         async def sse_generator() -> AsyncGenerator[str, None]:
+            full_assistant_reply_for_history = [] # Accumulate chunks for CHR
             prompt_for_model = ""
             try:
+                # Use global instances directly in the generator context
                 prompt_for_model = _prepare_context_and_initial_prompt(req, ctx_mgr, chat_history_retriever, pdf_retriever)
-            except HTTPException as e: # Catch HTTPException from prompt building
+            except HTTPException as e:
                 error_content = json.dumps({"error": e.detail, "status_code": e.status_code})
                 yield f"event: error\ndata: {error_content}\n\n"
                 return
@@ -251,23 +354,34 @@ async def chat_endpoint(req: ChatRequest):
                     # Reconstruct the "[FUNCALL]..." string for the handler
                     full_func_call_command = f"[FUNCALL]{actual_func_call_payload}"
 
-                    second_prompt, tool_name, tool_params_str = _handle_tool_call(full_func_call_command, ctx_mgr, tool_dispatcher)
-                    yield f"event: tool_call\ndata: {json.dumps({'tool_name': tool_name, 'tool_params': json.loads(tool_params_str) if tool_params_str else None})}\n\n"
+                    # Use global instances here too
+                    second_prompt, tool_name, tool_params_json_str = _handle_tool_call(full_func_call_command, ctx_mgr, tool_dispatcher)
+                    parsed_tool_params = {}
+                    try: parsed_tool_params = json.loads(tool_params_json_str)
+                    except: pass # Keep it empty if not valid JSON for some reason
+
+                    yield f"event: tool_call\ndata: {json.dumps({'tool_name': tool_name, 'tool_params': parsed_tool_params})}\n\n"
 
                     # Stream the final response after tool call
                     for final_chunk in runner.stream(prompt=second_prompt, **req.generation_params.model_dump()):
+                        full_assistant_reply_for_history.append(final_chunk)
                         yield f"data: {json.dumps({'text': final_chunk})}\n\n"
                         await asyncio.sleep(0.01)
-
-                # If loop finished and no func_call_str_detected, it means all initial chunks were yielded.
-                # (Handled by the initial loop's yield)
+                else: # No tool call, initial stream is the final response
+                    full_assistant_reply_for_history = initial_response_buffer # Already contains all chunks
 
             except Exception as e_stream:
                 print(f"Error during streaming: {e_stream}")
-                # import traceback; traceback.print_exc() # For debugging
                 error_content = json.dumps({"error": str(e_stream)})
                 yield f"event: error\ndata: {error_content}\n\n"
             finally:
+                # Add accumulated assistant reply to history AFTER stream is fully processed
+                if full_assistant_reply_for_history:
+                    try:
+                        chat_history_retriever.add_message(message_text="".join(full_assistant_reply_for_history), role="assistant")
+                    except Exception as e_chr_add_assist:
+                        print(f"Warning: Failed to add assistant's streamed reply to ChatHistoryRetriever: {e_chr_add_assist}")
+
                 yield f"event: stream_end\ndata: {json.dumps({'message': 'Stream ended.'})}\n\n"
 
         return StreamingResponse(sse_generator(), media_type="text/event-stream")
@@ -275,9 +389,10 @@ async def chat_endpoint(req: ChatRequest):
     # --- Synchronous (Non-Streaming) Response Logic ---
     else:
         start_time = time.time()
-        final_reply_text = ""
+        final_reply_text = "" # Ensure it's always defined
 
         try:
+            # Use global instances
             prompt_for_model = _prepare_context_and_initial_prompt(req, ctx_mgr, chat_history_retriever, pdf_retriever)
 
             reply_text = runner.generate(
@@ -291,6 +406,13 @@ async def chat_endpoint(req: ChatRequest):
                 second_prompt, _, _ = _handle_tool_call(reply_text, ctx_mgr, tool_dispatcher)
                 final_reply_text = runner.generate(second_prompt, **req.generation_params.model_dump())
                 print(f"[API /chat] Final reply after tool call: {final_reply_text[:100]}...")
+
+            # Add final assistant reply to chat history retriever
+            if final_reply_text: # Ensure there is a reply to add
+                try:
+                    chat_history_retriever.add_message(message_text=final_reply_text, role="assistant")
+                except Exception as e_chr_add_assist_sync:
+                    print(f"Warning: Failed to add assistant's sync reply to ChatHistoryRetriever: {e_chr_add_assist_sync}")
 
         except HTTPException: # Re-raise HTTPExceptions from helpers
             raise

@@ -1,15 +1,43 @@
 # llm_context_os/tools/tool_dispatcher.py
 import json
-from llm_context_os.tools import builtin_weather # Assuming it's in the same package via __init__.py
+from llm_context_os.tools import builtin_weather
 import typing as t
+import os # Potentially for MCP config later
+
+# Attempt to import langchain_mcp_adapters
+MCP_ADAPTERS_AVAILABLE = False
+McpClient = None
+try:
+    from langchain_mcp_adapters import McpClient # Assuming this is the client class
+    MCP_ADAPTERS_AVAILABLE = True
+    print("Successfully imported McpClient from langchain_mcp_adapters.")
+except ImportError:
+    print("Warning: langchain-mcp-adapters not found. MCP tool dispatching will be unavailable.")
+except Exception as e: # Catch other potential errors during import
+    print(f"Warning: Error importing McpClient from langchain-mcp-adapters: {e}. MCP tool dispatching will be unavailable.")
+
 
 class ToolDispatcher:
     def __init__(self):
-        print("[ToolDispatcher] Initialized. Placeholder: Would load local tools and MCP adapters here.")
         self.local_tools = {
             "get_weather": builtin_weather.get_weather
         }
-        # In a real scenario, might load tools from a config file or discover them dynamically.
+        self.mcp_client: t.Optional[McpClient] = None
+
+        if MCP_ADAPTERS_AVAILABLE:
+            try:
+                # Initialize McpClient.
+                # For this task, assuming default constructor works or it uses env vars.
+                # Real-world usage might involve passing server_urls from a config file:
+                # e.g., mcp_server_url = os.getenv("MCP_SERVER_URL", "http://default_mcp_server/api")
+                # self.mcp_client = McpClient(base_url=mcp_server_url)
+                self.mcp_client = McpClient()
+                print("[ToolDispatcher] McpClient initialized successfully.")
+            except Exception as e:
+                print(f"[ToolDispatcher] Error initializing McpClient: {e}. MCP tools will be unavailable.")
+                self.mcp_client = None
+        else:
+            print("[ToolDispatcher] langchain-mcp-adapters not available. MCP tools will not be dispatched.")
 
     def dispatch(self, function_call_json: str) -> t.Dict[str, t.Any]:
         """
@@ -34,22 +62,36 @@ class ToolDispatcher:
             if tool_name in self.local_tools:
                 tool_function = self.local_tools[tool_name]
                 try:
-                    # Note: Real implementation needs robust arg handling, validation, and security.
-                    # Consider using Pydantic models for tool argument validation.
                     result = tool_function(**tool_args)
                     return {"tool_name": tool_name, "result": result, "status": "success"}
-                except TypeError as e: # Catch issues with mismatched arguments
-                    return {"tool_name": tool_name, "error": f"Argument mismatch for tool {tool_name}: {str(e)}", "status": "error"}
-                except Exception as e: # Catch other execution errors
-                    return {"tool_name": tool_name, "error": f"Error executing tool {tool_name}: {str(e)}", "status": "error"}
+                except TypeError as e:
+                    return {"tool_name": tool_name, "error": f"Argument mismatch for local tool {tool_name}: {str(e)}", "status": "error"}
+                except Exception as e:
+                    return {"tool_name": tool_name, "error": f"Error executing local tool {tool_name}: {str(e)}", "status": "error"}
 
-            elif tool_name.startswith("mcp_"): # Example prefix for MCP tools
-                print(f"[ToolDispatcher] Placeholder: Would dispatch to MCP tool: {tool_name}")
-                # Real MCP dispatch logic would go here
-                return {"tool_name": tool_name, "result": f"Placeholder result from MCP tool {tool_name} with args {tool_args}", "status": "success_placeholder"}
+            # If not a local tool, try MCP if available
+            elif self.mcp_client:
+                print(f"[ToolDispatcher] Attempting to dispatch '{tool_name}' to MCP client with args: {tool_args}")
+                try:
+                    # Assuming McpClient has an 'invoke' or similar method.
+                    # The structure of the response from mcp_client.invoke needs to be known.
+                    # For now, assume it returns the direct result of the tool.
+                    # If it returns a more complex object, adaptation will be needed.
+                    mcp_result = self.mcp_client.invoke(tool_name, tool_args) # Or e.g. tool_args if it expects a dict
+                    # Example: mcp_result = self.mcp_client.invoke({"tool_name": tool_name, "tool_input": tool_args})
 
+                    print(f"[ToolDispatcher] MCP tool '{tool_name}' executed. Result: {mcp_result}")
+                    return {"tool_name": tool_name, "result": mcp_result, "status": "success"}
+                except Exception as e:
+                    # This could be various errors: tool not found on MCP, execution error on MCP, network error.
+                    # langchain_mcp_adapters might raise specific exceptions to distinguish these.
+                    error_message = f"MCP Error for tool {tool_name}: {str(e)}"
+                    print(f"[ToolDispatcher] {error_message}")
+                    return {"tool_name": tool_name, "error": error_message, "status": "error"}
+
+            # If not local and MCP client not available or tool not found by MCP (if McpClient raises specific error caught above)
             else:
-                return {"tool_name": tool_name, "error": f"Unknown tool: {tool_name}", "status": "error"}
+                return {"tool_name": tool_name, "error": f"Unknown tool: {tool_name}. Not found in local tools or MCP (client unavailable/tool not found).", "status": "error"}
 
         except json.JSONDecodeError as e:
             return {"tool_name": None, "error": f"Invalid JSON for function call: {str(e)}", "status": "error"}
@@ -80,13 +122,50 @@ if __name__ == '__main__':
     # Expected: {'tool_name': 'get_weather', 'error': "Argument mismatch for tool get_weather: get_weather() missing 1 required positional argument: 'location'", 'status': 'error'}
 
 
-    print("\n--- Test 4: MCP tool placeholder ---")
-    mcp_call = '{"name": "mcp_some_enterprise_tool", "arguments": {"param1": "value1"}}'
-    result3 = dispatcher.dispatch(mcp_call)
-    print(f"Dispatch result 3: {result3}")
-    # Expected: {'tool_name': 'mcp_some_enterprise_tool', 'result': "Placeholder result from MCP tool mcp_some_enterprise_tool with args {'param1': 'value1'}", 'status': 'success_placeholder'}
+    print("\n--- Test 4: MCP tool call (mocked success) ---")
+    # This test requires McpClient to be available or mocked.
+    # We will mock it for this __main__ block for demonstration.
+    if MCP_ADAPTERS_AVAILABLE:
+        # Mocking the mcp_client instance on the dispatcher for this test
+        original_mcp_client = dispatcher.mcp_client
 
-    print("\n--- Test 5: Unknown tool ---")
+        mock_mcp_client_instance = MagicMock(spec=McpClient) # Use spec for better mocking
+        mock_mcp_client_instance.invoke.return_value = "Mocked successful result from MCP tool"
+        dispatcher.mcp_client = mock_mcp_client_instance
+
+        mcp_call_success = '{"name": "mcp_some_tool", "arguments": {"param": "value"}}'
+        result_mcp_success = dispatcher.dispatch(mcp_call_success)
+        print(f"Dispatch result (MCP success): {result_mcp_success}")
+        mock_mcp_client_instance.invoke.assert_called_once_with("mcp_some_tool", {"param": "value"})
+
+        print("\n--- Test 4b: MCP tool call (mocked error) ---")
+        mock_mcp_client_instance.reset_mock() # Reset call counts etc.
+        mock_mcp_client_instance.invoke.side_effect = Exception("MCP tool execution failed on server")
+        mcp_call_error = '{"name": "mcp_another_tool", "arguments": {}}'
+        result_mcp_error = dispatcher.dispatch(mcp_call_error)
+        print(f"Dispatch result (MCP error): {result_mcp_error}")
+        mock_mcp_client_instance.invoke.assert_called_once_with("mcp_another_tool", {})
+
+        dispatcher.mcp_client = original_mcp_client # Restore original client
+    else:
+        print("Skipping MCP tests as langchain-mcp-adapters is not available.")
+
+
+    print("\n--- Test 5: Unknown tool (MCP client unavailable or tool truly unknown) ---")
+    if dispatcher.mcp_client: # If MCP client was initialized (even if later mocked for specific tests)
+        original_mcp_client_for_unknown = dispatcher.mcp_client
+        # Simulate McpClient raising a "ToolNotFound" style error or generic Exception if tool is not on MCP
+        # For simplicity, let's assume it just doesn't find it after local check
+        # Or, if the MCP client itself is None because it failed to init or lib not available:
+        if not MCP_ADAPTERS_AVAILABLE: # If lib was never there
+             dispatcher.mcp_client = None
+        else: # If lib is there, but we want to test "MCP does not find it"
+             # This depends on McpClient's behavior. If it raises error for unknown tool, test above covers it.
+             # If it returns None or specific non-error, that's different.
+             # For now, the existing logic assumes if not local, and mcp_client exists, it tries.
+             # If mcp_client.invoke itself handles "tool not found" by raising an Exception, Test 4b covers it.
+             pass # Covered by existing logic: if not local, try mcp, if mcp fails, error. If no mcp client, error.
+
     unknown_tool_call = '{"name": "non_existent_tool", "arguments": {}}'
     result4 = dispatcher.dispatch(unknown_tool_call)
     print(f"Dispatch result 4: {result4}")

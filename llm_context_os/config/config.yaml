@@ -1,38 +1,28 @@
-llm_context_os_config:
-  # Settings for ModelManager
-  idle_unload_sec: 900 # Seconds before an idle model is unloaded. Set to null or 0 to disable.
+# llm_context_os/config/config.yaml
 
-  # Default generation parameters (can be overridden in ChatRequest)
-  generation_defaults:
-    temperature: 0.7
-    top_p: 1.0
-    max_new_tokens: 256 # Renamed from max_tokens for clarity, matching schema
-    use_kv_cache: true
+# --- Configuration for API server components ---
 
-  # Settings for ContextManager (max_tokens here refers to context window capacity)
-  context_manager:
-    max_tokens: 4096 # Default from blueprint, context window size
-    # system_prompt: "You are a helpful AI assistant." # Example, could be loaded from here
+context_manager:
+  system_prompt: "You are a super helpful AI assistant configured via YAML."
+  max_tokens: 3500 # Example override of default
 
-  # Settings for Retriever (RAG - Phase 4)
-  rag:
-    embed_model: "all-MiniLM-L6-v2" # Default from blueprint
-    db_path: "data/chroma_db"       # Example path, can be relative to project root
-    retrieval_budget_tokens: 512    # Max tokens for retrieved snippets (blueprint default)
-    # top_k_results: 3              # Example: Number of snippets to retrieve initially
+chat_history_retriever:
+  recall_budget_tokens: 600
+  embedding_model_name: "sentence-transformers/all-MiniLM-L6-v2" # Full name for clarity
+  vector_db_path: "data/vector_dbs/yaml_configured_chat_history" # Unique path
 
-  # Settings for Tool Dispatcher (Phase 4)
-  # tools_config:
-  #   # Example: Configuration for specific local tools if needed
-  #   # builtin_weather:
-  #   #   api_key: "YOUR_WEATHER_API_KEY_IF_NEEDED" # If get_weather used an API key
+pdf_retriever:
+  vector_db_path: "data/vector_dbs/yaml_configured_pdf_rag"
+  embedding_model_name: "sentence-transformers/all-MiniLM-L12-v2" # Example different model
+  chunk_size: 750
+  chunk_overlap: 75
 
-  # MCP Servers for Tool Calling (Phase 4)
-  mcp_servers:
-    - "https://mcp.mycorp.example.com/api/v1" # Example MCP server endpoint
-    # - "https://another.mcp.server/api"
+model_manager:
+  default_idle_unload_sec: 1200 # e.g., 20 minutes
 
-  # Settings for API Runner (example structure - preserved)
-  # api_runner_defaults:
-  #   openai_api_key: "YOUR_OPENAI_API_KEY_HERE_OR_USE_ENV_VAR"
-  #   openai_base_url: "https://api.openai.com/v1"
+# Configuration for the tokenizer used by RAG components for budgeting snippets
+token_estimator_for_rag_budgeting:
+  type: "tiktoken" # Options: "tiktoken", "hf" (Hugging Face)
+  # model_name for tiktoken: e.g., "cl100k_base", "p50k_base"
+  # model_name for hf: e.g., "gpt2", "facebook/opt-125m"
+  model_name: "cl100k_base"
