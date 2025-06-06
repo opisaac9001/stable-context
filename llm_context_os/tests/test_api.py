@@ -588,6 +588,8 @@ class TestSettingsAPI(unittest.TestCase):
 
 # --- Model Management API Tests ---
 from llm_context_os.api.schemas import AvailableModel, ModelListResponse, DownloadModelRequest, StatusResponse
+from pathlib import Path # Added for download test result path
+from unittest.mock import patch, MagicMock, ANY # ANY for some mock call assertions
 
 class TestModelManagementAPI(unittest.TestCase):
     def setUp(self):
@@ -664,6 +666,92 @@ class TestModelManagementAPI(unittest.TestCase):
         payload = {"filename": "test-model.Q4_K_M.gguf", "model_type": "gguf"} # Missing repo_id
         response = self.client.post("/models/download", json=payload)
         self.assertEqual(response.status_code, 422) # Unprocessable Entity for Pydantic validation error
+
+    @patch('llm_context_os.api.main.download_model_from_hf')
+    def test_download_model_success_single_file(self, mock_download_func):
+        mock_download_func.return_value = (True, Path("/fake/downloaded/model_repo_name/file.gguf"))
+
+        payload = DownloadModelRequest(
+            repo_id="test-org/model-repo-name",
+            filename="file.gguf",
+            revision="test-rev"
+        ).model_dump()
+
+        response = self.client.post("/models/download", json=payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["status"], "ok")
+        self.assertIn("Download for 'test-org/model-repo-name'", json_response["message"])
+        self.assertIn("File: file.gguf", json_response["message"])
+        self.assertIn("Revision: test-rev", json_response["message"])
+        self.assertIn("Saved to: /fake/downloaded/model_repo_name/file.gguf", json_response["message"])
+
+        mock_download_func.assert_called_once_with(
+            repo_id="test-org/model-repo-name",
+            target_dir=ANY, # Path object, difficult to match exactly without more setup
+            filename="file.gguf",
+            hf_token=api_main.CONFIG.get('hf_token'),
+            ignore_patterns=api_main.CONFIG.get('hf_snapshot_ignore_patterns'),
+            allow_patterns=api_main.CONFIG.get('hf_snapshot_allow_patterns'),
+            repo_type=api_main.CONFIG.get('hf_repo_type'),
+            revision="test-rev"
+        )
+        # Check that target_dir argument to the mock was a Path object
+        args, _ = mock_download_func.call_args
+        self.assertIsInstance(args[1], Path) # target_dir is the second positional argument
+
+    @patch('llm_context_os.api.main.download_model_from_hf')
+    def test_download_model_success_snapshot(self, mock_download_func):
+        mock_download_func.return_value = (True, Path("/fake/downloaded/snapshot_repo_name/"))
+
+        payload = DownloadModelRequest(
+            repo_id="test-org/snapshot-repo-name",
+            # No filename for snapshot
+            revision="main"
+        ).model_dump()
+
+        response = self.client.post("/models/download", json=payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["status"], "ok")
+        self.assertIn("Download for 'test-org/snapshot-repo-name'", json_response["message"])
+        self.assertIn("File: snapshot", json_response["message"]) # Filename defaults to 'snapshot' in message
+        self.assertIn("Revision: main", json_response["message"])
+        self.assertIn("Saved to: /fake/downloaded/snapshot_repo_name", json_response["message"])
+
+        mock_download_func.assert_called_once_with(
+            repo_id="test-org/snapshot-repo-name",
+            target_dir=ANY,
+            filename=None, # Explicitly None for snapshot
+            hf_token=api_main.CONFIG.get('hf_token'),
+            ignore_patterns=api_main.CONFIG.get('hf_snapshot_ignore_patterns'),
+            allow_patterns=api_main.CONFIG.get('hf_snapshot_allow_patterns'),
+            repo_type=api_main.CONFIG.get('hf_repo_type'),
+            revision="main"
+        )
+
+    @patch('llm_context_os.api.main.download_model_from_hf')
+    def test_download_model_failure_downloader_returns_error(self, mock_download_func):
+        mock_download_func.return_value = (False, "Simulated downloader network error")
+
+        payload = DownloadModelRequest(
+            repo_id="test-org/failing-repo",
+            filename="some.file"
+        ).model_dump()
+
+        response = self.client.post("/models/download", json=payload)
+        # The endpoint currently returns 200 OK with status="error" in body
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["status"], "error")
+        self.assertEqual(json_response["message"], "Simulated downloader network error")
+
+        mock_download_func.assert_called_once()
+
+    # test_download_model_invalid_request_payload is effectively covered by
+    # test_download_model_missing_repo_id, which checks for 422 on Pydantic validation error.
+    # If more specific invalid payload tests are needed (e.g. wrong data type for a field),
+    # they can be added, but missing required field is a good proxy for general payload validation.
 
 
 # --- Tool Management API Tests ---

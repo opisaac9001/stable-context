@@ -33,6 +33,7 @@ from llm_context_os.api.schemas import (
     ToolInfo, ToolListResponse, ToggleToolRequest, # Added for tool management
     DownloadModelRequest # Added for model download
 )
+from llm_context_os.utils.hf_downloader import download_model_from_hf # Added for model download
 from llm_context_os.context.context_manager import ContextManager, MockTokenizer
 from llm_context_os.context.token_estimator import TikTokenEstimator, HFTokenEstimator # For RAG tokenizer
 from llm_context_os.runners.manager import ModelManager
@@ -295,26 +296,121 @@ async def update_settings_endpoint(updated_values: UpdateSettingsRequest):
 @app.post("/models/download", response_model=StatusResponse)
 async def download_model_endpoint(req: DownloadModelRequest):
     """
-    (Placeholder) Initiates a model download from a Hugging Face repository.
-    Actual download logic to be implemented later.
+    Initiates a model download from a Hugging Face repository.
+
+    The endpoint uses the `hf_downloader` utility to fetch models or specific files.
+    Models are saved into a subdirectory (named after the repository) within the
+    globally configured `model_download_dir` (see `config.yaml`).
+
+    The download process is synchronous in the current implementation.
+
+    Request Body (`DownloadModelRequest`):
+    - **repo_id** (str, required): The Hugging Face repository ID.
+      Example: `"TheBloke/Mistral-7B-Instruct-v0.1-GGUF"`.
+    - **filename** (str, optional): The specific file to download from the repository.
+      If provided, only this file will be downloaded. This is typically used for
+      GGUF models or specific configuration files. If `None`, the entire repository
+      (a "snapshot") will be downloaded, respecting ignore/allow patterns from `config.yaml`.
+      Example: `"mistral-7b-instruct-v0.1.Q4_K_M.gguf"`.
+    - **model_type** (str, optional): Expected model type (e.g., "gguf", "safetensors", "awq").
+      This field is primarily for organizational purposes or future validation. It can
+      also inform the `repo_type` parameter for `huggingface_hub` functions if needed,
+      though `hf_repo_type` in `config.yaml` or auto-detection often handles this.
+    - **revision** (str, optional): The specific model revision to download.
+      This can be a branch name (e.g., `"main"`), a tag (e.g., `"v1.0.0"`),
+      or a commit hash. If `None`, the default revision (usually "main") is used.
+      Example: `"gguf-Q4_K_M"`.
+    - **target_path** (str, optional): Not currently used by this endpoint as downloads
+      are always placed within the configured `model_download_dir`. Reserved for future use.
+
+
+    Successful Response (HTTP 200):
+    - `StatusResponse` with `status: "ok"` and a message indicating successful
+      download, including the path to the downloaded model file or repository snapshot.
+      Example:
+      ```json
+      {
+        "status": "ok",
+        "message": "Download for 'TheBloke/Mistral-7B-Instruct-v0.1-GGUF' (File: mistral-7b-instruct-v0.1.Q4_K_M.gguf, Revision: main) completed. Saved to: /path/to/models/downloaded/Mistral-7B-Instruct-v0.1-GGUF/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+      }
+      ```
+
+    Error Responses (HTTP 200 with `status: "error"` in body, or HTTP 500 for server errors):
+    - If the download fails due to issues like file not found, repository not found,
+      network errors, or permissions, a `StatusResponse` with `status: "error"`
+      and a descriptive message from the downloader is returned.
+      Example:
+      ```json
+      {
+        "status": "error",
+        "message": "File 'nonexistent.gguf' not found in repo 'TheBloke/Mistral-7B-Instruct-v0.1-GGUF' (revision: main)."
+      }
+      ```
+    - If there's an internal server error during the process (e.g., cannot create
+      base download directory), an HTTP 500 error might be raised directly by FastAPI.
     """
-    print(f"Received download request for model repo: {req.repo_id}, filename: {req.filename or 'all files (repo)'}")
-    print(f"  Requested model type: {req.model_type or 'any'}")
-    print(f"  Requested target path: {req.target_path or 'default location'}")
+    print(f"Received download request: repo_id='{req.repo_id}', filename='{req.filename}', revision='{req.revision}', model_type='{req.model_type}'")
 
-    # Placeholder: In a real implementation, this would trigger an async download task
-    # from huggingface_hub import hf_hub_download
-    # For now, just acknowledge the request.
+    # Retrieve configurations
+    configured_download_dir_str = CONFIG.get('model_download_dir', 'models/downloaded/') # Relative to project root or absolute
+    hf_auth_token = CONFIG.get('hf_token') # Optional, for private repos
+    ignore_patterns = CONFIG.get('hf_snapshot_ignore_patterns') # For snapshot downloads
+    allow_patterns = CONFIG.get('hf_snapshot_allow_patterns') # For snapshot downloads
+    default_hf_repo_type = CONFIG.get('hf_repo_type') # General repo type from config (e.g., "model")
 
-    # Determine a default target path if not provided, e.g., based on model_type and repo_id
-    # For example: models/<model_type>/<repo_id_user>/<repo_id_name>
-    # Ensure this path is within allowed configurable base model directories.
+    # Determine target directory for the downloader
+    # The hf_downloader will create a model-specific subdirectory inside this.
+    base_download_dir = Path(configured_download_dir_str)
+    if not base_download_dir.is_absolute():
+        base_download_dir = PROJECT_ROOT / base_download_dir
 
-    return StatusResponse(
-        status="ok",
-        message=f"Download request for '{req.repo_id}' (file: {req.filename or 'all files'}) received. "
-                f"Simulated download initiated. Model would appear at a predefined location based on target_path or defaults."
+    # Ensure the base directory exists; hf_downloader handles its own subdirectories.
+    try:
+        base_download_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Base download directory ensured at: {base_download_dir.resolve()}")
+    except Exception as e:
+        print(f"Error creating base download directory {base_download_dir}: {e}")
+        raise HTTPException(status_code=500, detail=f"Server error creating base download directory: {str(e)}")
+
+    # Determine repo_type for hf_hub_download.
+    # If req.model_type is provided and is a valid HF repo_type (e.g., "model", "dataset", "space"), it could be used.
+    # For now, we'll prefer a specific hf_repo_type from config if available, else None (downloader default).
+    # A more sophisticated mapping from req.model_type to hf repo_type might be needed if they differ.
+    hf_repo_type_to_use = default_hf_repo_type # Could also be informed by req.model_type if desired
+
+    print(f"Calling download_model_from_hf with target_dir: {base_download_dir}")
+    success, result_path_or_msg = download_model_from_hf(
+        repo_id=req.repo_id,
+        target_dir=base_download_dir, # hf_downloader creates repo_id subdir here
+        filename=req.filename,
+        hf_token=hf_auth_token,
+        ignore_patterns=ignore_patterns,
+        allow_patterns=allow_patterns,
+        repo_type=hf_repo_type_to_use, # Pass the determined repo_type
+        revision=req.revision # Pass revision from request
     )
+
+    if success:
+        return StatusResponse(
+            status="ok",
+            message=f"Download for '{req.repo_id}' (File: {req.filename or 'snapshot'}, Revision: {req.revision or 'main'}) completed. Saved to: {result_path_or_msg}"
+        )
+    else:
+        # Log the error server-side as hf_downloader already prints.
+        # Determine if it's a client error (4xx) or server error (5xx) based on message
+        error_msg_str = str(result_path_or_msg)
+        status_code = 400 # Default to client error
+        if "not found" in error_msg_str.lower() or "invalid" in error_msg_str.lower():
+            status_code = 404 # Or 400 for bad request
+        elif "http error" in error_msg_str.lower() or "network" in error_msg_str.lower():
+            status_code = 502 # Bad Gateway / upstream error
+        elif "unexpected error" in error_msg_str.lower() or "permission" in error_msg_str.lower():
+            status_code = 500 # Internal server error
+
+        # For this implementation, we'll return a StatusResponse with error message.
+        # Raising HTTPException is also a good option for more RESTful error handling.
+        # Example: raise HTTPException(status_code=status_code, detail=error_msg_str)
+        return StatusResponse(status="error", message=error_msg_str)
 
 @app.get("/models/available", response_model=ModelListResponse)
 async def get_available_models_endpoint():

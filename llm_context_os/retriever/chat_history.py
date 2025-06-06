@@ -233,16 +233,17 @@ class ChatHistoryRetriever:
             print("Error: Retriever not properly initialized. Cannot retrieve.")
             return []
 
-        # Check if there's anything to search in the first place
         has_vector_content = self.collection.count() > 0
-        has_bm25_content = self.bm25_index and self.bm25_corpus_texts
-        if not has_vector_content and not (self.enable_hybrid_search and has_bm25_content):
+        # BM25 index is only relevant if hybrid search is enabled
+        has_bm25_to_search = self.enable_hybrid_search and self.bm25_index and self.bm25_corpus_texts
+
+        if not has_vector_content and not has_bm25_to_search:
             print("No messages in history (vector DB or BM25 corpus if hybrid) to retrieve from.")
             return []
 
-        doc_details_cache = {} # To store full details for RRF reconstruction & final snippet generation
-        candidate_items_for_cross_encoder = [] # This will hold items for cross-encoder input
-        dense_results_list = [] # Specifically for dense results before fusion/selection
+        doc_details_cache = {}
+        candidate_items_for_cross_encoder = []
+        dense_results_list = []
 
         # --- Dense Retrieval (ChromaDB) ---
         if has_vector_content:
@@ -253,10 +254,9 @@ class ChatHistoryRetriever:
                 num_dense_to_fetch = self.rerank_top_n_candidates
 
                 query_n_dense = min(num_dense_to_fetch, self.collection.count())
-                # Ensure query_n_dense is at least 1 if collection is not empty, to avoid ChromaDB error with n_results=0
                 if query_n_dense == 0 and self.collection.count() > 0: query_n_dense = 1
 
-                if query_n_dense > 0: # Proceed only if there's something to query for
+                if query_n_dense > 0:
                     chroma_results = self.collection.query(
                         query_embeddings=[query_embedding],
                         n_results=query_n_dense,
@@ -273,17 +273,18 @@ class ChatHistoryRetriever:
                             if current_chat_history and any(h.get('c') == text for h in current_chat_history): continue
 
                             item_details = {"id": msg_id, "text": text, "metadata": meta, "dense_score": -dist}
-                            dense_results_list.append(item_details) # Keep a separate list for dense ranked by score
-                            doc_details_cache[msg_id] = item_details # Cache for RRF and final object construction
+                            dense_results_list.append(item_details)
+                            doc_details_cache[msg_id] = item_details
 
-                        dense_results_list.sort(key=lambda x: x['dense_score'], reverse=True) # Higher is better
+                        dense_results_list.sort(key=lambda x: x['dense_score'], reverse=True)
                         print(f"[ChatHistoryRetriever] Dense retrieval found {len(dense_results_list)} candidates.")
             except Exception as e:
                 print(f"Error during dense retrieval in ChatHistoryRetriever: {e}")
 
-        if self.enable_hybrid_search and self.bm25_index and self.bm25_message_ids:
+        # --- Hybrid Search Logic ---
+        if self.enable_hybrid_search and has_bm25_content: # Check has_bm25_content again
             sparse_results_ranked_list = []
-            print(f"[ChatHistoryRetriever] Performing BM25 sparse retrieval for query: '{query_text[:100]}...'")
+            print(f"[ChatHistoryRetriever] Performing BM25 sparse retrieval (Hybrid Mode) for query: '{query_text[:100]}...'")
             try:
                 tokenized_query = self._tokenize_for_bm25(query_text)
                 bm25_scores = self.bm25_index.get_scores(tokenized_query)

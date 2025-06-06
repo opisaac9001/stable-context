@@ -46,6 +46,8 @@ token_estimator_for_rag_budgeting:
 # Define a list of directories to scan for local models.
 # Paths can be absolute or relative to the project root (where llm_context_os is located).
 # For dockerized environments, these paths should correspond to paths within the container.
+# For downloaded models to be automatically discovered, ensure the 'model_download_dir' (see below)
+# or specific subdirectories within it are included in this list.
 model_scan_directories:
   - "models/" # Default local models directory, relative to project root
   # - "/path/to/another/model_collection" # Absolute path example
@@ -53,18 +55,41 @@ model_scan_directories:
   # - "models/awq_models"
 
 # --- Model Downloading Settings ---
-model_download_dir: "models/downloaded/"  # Default local directory for downloaded models
-hf_token: null                            # Optional: Your Hugging Face API token (string or null)
-                                          # Can also be set via HUGGING_FACE_HUB_TOKEN env var
-# For snapshot_download:
-# These are examples; a very broad ignore list is often used initially,
-# or allow_patterns for specific file types like *.safetensors, *.json, tokenizer.model
-hf_snapshot_ignore_patterns:              # Optional: List of patterns to ignore when downloading a whole repo
+# Specifies the base directory where models downloaded from Hugging Face will be saved.
+# A subdirectory named after the model repository (e.g., 'TheBloke_Mistral-7B-Instruct-v0.1-GGUF')
+# will be created inside this directory for each download.
+# For downloaded models to be discoverable by the `/models/available` endpoint, this path
+# (or one of its parent directories, if this is a subdirectory like 'models/downloaded/')
+# must be included in the 'model_scan_directories' list above.
+model_download_dir: "models/downloaded/"
+
+# Optional: Your Hugging Face API token (string).
+# Required for downloading private or gated models from Hugging Face Hub.
+# If set to null or not provided, only public models can be downloaded.
+# This can also be set via the HUGGING_FACE_HUB_TOKEN environment variable,
+# which takes precedence if both are set.
+hf_token: null
+
+# For repository snapshot downloads (when no specific filename is provided in the download request):
+# Optional: List of glob patterns to ignore when downloading an entire repository snapshot.
+# Useful for excluding unnecessary files like documentation, examples, or non-model files.
+# Examples: ["*.md", "LICENSE", ".gitattributes", "*.txt", "*.pyc", "docs/*", "*.git*"]
+hf_snapshot_ignore_patterns:
   - "*.md"
   - "LICENSE"
   - ".gitattributes"
-  - "docs/*"
-  - "examples/*"
-  # Add more patterns like "*.pt", "*.bin" if you usually only want specific formats (e.g. safetensors or gguf)
-hf_snapshot_allow_patterns: null          # Optional: List of patterns to exclusively download (takes precedence over ignore). E.g., ["*.gguf", "*.json", "*.safetensors", "tokenizer.model"]
-hf_repo_type: null                        # Optional: Type of the repo, e.g., "model", "dataset", "space". Auto-detected if null.
+  # - "*.pt" # Example: if you only want .safetensors or .gguf
+  # - "*.bin" # Example: if you only want .safetensors or .gguf
+
+# Optional: List of glob patterns to exclusively include when downloading a repository snapshot.
+# If specified, only files matching these patterns will be downloaded. This takes precedence over hf_snapshot_ignore_patterns.
+# Useful for targeting specific file types (e.g., only GGUF files, or only safetensors and tokenizer files).
+# Example for GGUF: ["*.gguf", "*.json"] (to get model and any metadata like generation_config.json)
+# Example for safetensors: ["*.safetensors", "*.json", "tokenizer.model", "tokenizer_config.json"]
+hf_snapshot_allow_patterns: null
+
+# Optional: Type of the Hugging Face repository (e.g., "model", "dataset", "space").
+# This is passed to huggingface_hub functions. If set to null or omitted,
+# huggingface_hub will usually auto-detect the repository type.
+# It's generally recommended to leave this as null unless specific behavior is required.
+hf_repo_type: null

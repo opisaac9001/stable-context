@@ -107,8 +107,9 @@ class ToggleToolRequest(BaseModel):
 # --- Model Download Schemas ---
 class DownloadModelRequest(BaseModel):
     repo_id: str = Field(..., description="The Hugging Face repository ID (e.g., 'TheBloke/Mistral-7B-Instruct-v0.1-GGUF').")
-    model_type: Optional[str] = Field(None, description="Expected model type (e.g., 'gguf', 'awq', 'exl2'). Helps in organizing downloaded files or validation.")
+    model_type: Optional[str] = Field(None, description="Expected model type (e.g., 'gguf', 'awq', 'exl2'). Helps in organizing downloaded files or validation. Also can inform `repo_type` for `hf_hub_download` if not specified otherwise.")
     filename: Optional[str] = Field(None, description="Specific filename to download from the repo (especially for GGUF). If None, attempts to download suitable files or the whole repo based on type.")
+    revision: Optional[str] = Field(None, description="Optional model revision (branch name, tag name, or commit hash) to download.")
     target_path: Optional[str] = Field(None, description="Optional local relative path within a configured models directory to save the model. If None, a default path will be constructed.")
 
 
@@ -231,7 +232,9 @@ if __name__ == '__main__':
         repo_id="TheBloke/Mistral-7B-Instruct-v0.1-GGUF",
         model_type="gguf",
         filename="mistral-7b-instruct-v0.1.Q4_K_M.gguf",
+        revision="main", # Example revision
         target_path="downloaded_ggufs/"
     )
     print(f"DownloadModelRequest: {download_req_ex.model_dump_json(indent=2)}")
     assert download_req_ex.filename == "mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+    assert download_req_ex.revision == "main"
