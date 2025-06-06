@@ -1,0 +1,43 @@
+The LLM Context OS provides GPU support primarily through its model runners (`vLLMRunner` and `LlamaCppRunner`), with configurations managed in `config.yaml`.
+
+**1. General GPU Configuration (`config.yaml`):**
+*   The `config.yaml` file is expected to contain global and runner-specific settings for GPU utilization.
+*   **Runner-Specific Sections:** Dedicated blocks for `vLLMRunner` and `LlamaCppRunner` would define their GPU parameters.
+*   **Potential Options:**
+    *   `device`: A general setting to specify CPU or a particular CUDA device (e.g., `cpu`, `cuda`, `cuda:0`).
+    *   For `vLLMRunner`:
+        *   `tensor_parallel_size`: Crucial for multi-GPU, indicating how many GPUs to use for tensor parallelism.
+        *   `gpu_memory_utilization`: To control how much VRAM vLLM attempts to use.
+    *   For `LlamaCppRunner`:
+        *   `n_gpu_layers`: The number of model layers to offload to the GPU(s).
+        *   `main_gpu`: Specifies the primary GPU for certain operations in a multi-GPU offload scenario for Llama.cpp.
+        *   `tensor_split`: An array to define how layers are distributed across multiple GPUs for Llama.cpp.
+*   These configurations allow users to tailor GPU usage for each runner without altering the core code.
+
+**2. `vLLMRunner` GPU Capabilities:**
+*   **Single GPU:** `vLLMRunner` can run a model on a single designated GPU. This is typically the default if a GPU is available and `tensor_parallel_size` is 1 or not specified.
+*   **Multi-GPU (including Dual GPU):**
+    *   **Native Tensor Parallelism:** vLLM excels at multi-GPU support by implementing tensor parallelism. A single `vLLMRunner` instance can distribute a model across multiple GPUs (e.g., 2 for dual GPU) by setting `tensor_parallel_size` in `config.yaml` (e.g., `tensor_parallel_size: 2`).
+    *   This allows loading models larger than a single GPU's VRAM and can improve inference speed by parallelizing the computation. The runner passes this configuration directly to vLLM's engine.
+
+**3. `LlamaCppRunner` GPU Capabilities:**
+*   **Single GPU Offload:** `LlamaCppRunner` supports offloading a specified number of model layers to a single GPU using the `n_gpu_layers` parameter (e.g., `n_gpu_layers: 35`). The remaining layers run on the CPU. A non-zero `n_gpu_layers` in `config.yaml` enables this.
+*   **Multi-GPU Offload (including Dual GPU):**
+    *   **Native Layer Offloading:** Llama.cpp itself can offload layers to multiple GPUs. The `n_gpu_layers` parameter determines the total number of layers to offload. Llama.cpp then distributes these layers across the available and configured GPUs.
+    *   The `LlamaCppRunner` passes `n_gpu_layers` to the `llama-cpp-python` library. Advanced distribution can be influenced by parameters like `main_gpu` and `tensor_split` (if exposed in `config.yaml` and supported by the runner's integration), which tell `llama-cpp-python` how to divide layers among the GPUs. For instance, with two GPUs, a portion of the `n_gpu_layers` would go to GPU0 and the rest to GPU1.
+
+**4. Distinguishing Native Multi-GPU Support vs. Multiple Runner Instances:**
+
+*   **Native Multi-GPU Support (within a Single Runner Instance):**
+    *   **Definition:** A single instance of `vLLMRunner` or `LlamaCppRunner` uses multiple GPUs to accelerate or enable the loading of *one model*.
+    *   **`vLLMRunner`:** Uses tensor parallelism; the model itself is split across GPUs.
+    *   **`LlamaCppRunner`:** Offloads different sets of layers of the *same model* to different GPUs.
+    *   **Benefit:** Enables running very large models that don't fit on a single GPU and can improve inference latency for that single model.
+
+*   **Running Multiple Instances on Different GPUs:**
+    *   **Definition:** This involves launching multiple, separate processes of `vLLMRunner` or `LlamaCppRunner`. Each process is explicitly assigned to a *distinct GPU*.
+    *   **Example:** `RunnerA` on `GPU0`, `RunnerB` on `GPU1`. Each runner instance loads its own model (or a copy of the same model).
+    *   **Configuration:** This would typically be managed by setting `CUDA_VISIBLE_DEVICES` differently for each launched runner process or through specific `device` configurations in `config.yaml` if the system supports defining multiple distinct runner profiles.
+    *   **Benefit:** Primarily for increasing system throughput by handling multiple independent inference requests in parallel, or for serving different models on different GPUs simultaneously. This is about scaling out the number of concurrent requests/models rather than accelerating a single model with multiple GPUs.
+
+The LLM Context OS aims to provide flexibility in GPU utilization by supporting both intensive single-model acceleration via native multi-GPU features of the underlying engines (vLLM, Llama.cpp) and scalable multi-model serving by potentially running multiple runner instances on separate GPUs.

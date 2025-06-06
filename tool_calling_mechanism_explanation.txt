@@ -1,0 +1,30 @@
+The LLM Context OS employs a sophisticated tool calling mechanism, orchestrated primarily by the `ToolDispatcher`, with interactions defined in the API and validated by tests. Here's an explanation of its components and flow:
+
+**1. Role of `ToolDispatcher` (likely defined in `llm_context_os/tools/tool_dispatcher.py`):**
+*   **Central Hub:** The `ToolDispatcher` acts as the central registry and execution engine for all tools within the system.
+*   **Registration:** It is responsible for discovering and registering available tools. This includes local "builtin" tools and is designed to be extensible for external tools or "Model Capability Packs" (MCPs). Registration might occur at startup by scanning designated directories or through explicit configuration.
+*   **Invocation:** When a tool call is requested (typically triggered by an LLM output), the `ToolDispatcher` identifies the specified tool and invokes the appropriate method or function within that tool, passing along any parameters provided in the call.
+*   **Standardization:** It likely provides a standardized way to handle tool execution and the return of results to the main application flow, ensuring consistency regardless of the tool type.
+
+**2. Local Tool Registration and Call (e.g., `builtin_weather`):**
+*   **Definition:** Local tools, such as a hypothetical `builtin_weather` tool, are typically Python classes or modules that adhere to a specific interface or structure recognized by the `ToolDispatcher`.
+*   **Registration:** These tools are made known to the `ToolDispatcher` during its initialization phase. For instance, the dispatcher might load all tools from a `llm_context_os/tools/builtin/` directory.
+*   **Call Process:** When the LLM generates a directive like `[FUNCALL] builtin_weather(location="New York")`, the system parses this. The `ToolDispatcher` then looks up the `builtin_weather` tool in its registry and executes it with the provided arguments (e.g., `location="New York"`). `llm_context_os/tests/test_tools.py` would contain tests demonstrating this registration and direct invocation.
+
+**3. External Tool Integration (MCP - Model Capability Pack):**
+*   **Extensibility:** The system is designed with the potential to integrate external tools or services, referred to as Model Capability Packs (MCPs).
+*   **Adapter/Proxy Model:** While a specific MCP adapter might not be fully implemented in the current file set, the `ToolDispatcher`'s architecture would likely support this via an adapter pattern. An "MCP adapter" would be registered with the dispatcher like any other tool. When called, this adapter would then be responsible for communicating with the actual external MCP (e.g., making an API request to the MCP's service).
+*   **Uniformity:** The goal is to make the calling of an external tool appear seamless and similar to calling a local tool from the perspective of the main chat/generation logic.
+
+**4. API Endpoints for Tool Management (in `llm_context_os/api/main.py`):**
+*   The API (`api/main.py`) would expose endpoints related to tool functionality:
+    *   **List Tools:** An endpoint (e.g., `/api/tools` or `/tools`) that returns a list of all currently registered and available tools, along with their descriptions, parameters, and capabilities. This allows clients (like the GUI) or the LLM itself (via system prompts) to be aware of available functions.
+    *   **Tool Management (Potential):** There might be further administrative endpoints for enabling/disabling specific tools or managing their configurations, though these are less certain without inspecting the detailed API spec.
+
+**5. Chat/Generation Flow and `[FUNCALL]` Detection:**
+*   **LLM Directive:** The system relies on the LLM to signal its intent to call a tool. This is typically done by the LLM generating a specially formatted string, such as `[FUNCALL] tool_name(param1=value1, ...)`, within its response.
+*   **Detection and Parsing:** The main chat or generation processing loop (likely managed by logic within or called by `api/main.py`) monitors the LLM's output for this `[FUNCALL]` pattern. Upon detection, it parses the string to extract the tool's name and its arguments.
+*   **Dispatch and Execution:** The parsed tool name and arguments are then passed to the `ToolDispatcher`, which executes the relevant tool.
+*   **Result Integration:** The output/result from the tool is returned to the chat/generation flow. This result is then typically used to inform the LLM's next generation step: the tool's output is provided back to the LLM as context, and the LLM is prompted to use this information to formulate a final response to the user. The `llm_context_os/tests/test_tools.py` would likely include tests that simulate this entire sequence: LLM outputting `[FUNCALL]`, tool execution, and the result being fed back.
+
+This mechanism allows the LLM Context OS to augment LLM capabilities by enabling them to interact with and leverage external information or perform specific actions through a structured and extensible tool framework.

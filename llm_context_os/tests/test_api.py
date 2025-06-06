@@ -755,6 +755,315 @@ class TestToolManagementAPI(unittest.TestCase):
         self.assertTrue(found_tool.is_enabled)
         self.assertEqual(found_tool.type, "mcp") # Based on current ToolDispatcher.list_tools logic
 
+    def test_get_openai_tool_schemas_endpoint(self):
+        # Ensure get_weather is enabled for this test
+        self.tool_dispatcher_instance.enable_tool("get_weather")
+
+        response = self.client.get("/tools/openai_schemas")
+        self.assertEqual(response.status_code, 200)
+
+        schemas = response.json()
+        self.assertIsInstance(schemas, list)
+
+        get_weather_schema = next((s for s in schemas if s.get("function", {}).get("name") == "get_weather"), None)
+        self.assertIsNotNone(get_weather_schema, "get_weather schema not found in endpoint response.")
+
+        self.assertEqual(get_weather_schema["type"], "function")
+        function_def = get_weather_schema["function"]
+        self.assertEqual(function_def["name"], "get_weather")
+        self.assertIn("current weather", function_def["description"].lower())
+
+        parameters = function_def["parameters"]
+        self.assertEqual(parameters["type"], "object")
+        self.assertIn("properties", parameters)
+        self.assertIn("location", parameters["properties"])
+        self.assertEqual(parameters["properties"]["location"]["type"], "str")
+        self.assertIn("unit", parameters["properties"])
+        self.assertEqual(parameters["properties"]["unit"]["type"], "str")
+        self.assertEqual(parameters["properties"]["unit"]["default"], "celsius")
+        self.assertIn("location", parameters["required"])
+
+        # Test that a disabled tool is not included
+        self.tool_dispatcher_instance.disable_tool("get_weather")
+        response_disabled = self.client.get("/tools/openai_schemas")
+        self.assertEqual(response_disabled.status_code, 200)
+        schemas_disabled = response_disabled.json()
+        get_weather_schema_disabled = next((s for s in schemas_disabled if s.get("function", {}).get("name") == "get_weather"), None)
+        self.assertIsNone(get_weather_schema_disabled, "Disabled get_weather tool should not be in OpenAI schemas from endpoint.")
+
+        # Re-enable for other tests if any depend on it being enabled by default in other test classes
+        self.tool_dispatcher_instance.enable_tool("get_weather")
+
+
+# --- Test class for Chat Endpoint with OpenAI Tool Calls ---
+# We might need to move some general mocks (like model_mgr) to a common setup
+# if these tests grow and TestApi also needs them.
+
+class TestChatWithOpenAITools(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        # Ensure a clean state for model_mgr and ctx_mgr for each test
+        if model_mgr.current_runner:
+            model_mgr.unload()
+        ctx_mgr._messages = [] # Clear context manager messages
+        ctx_mgr._start = 0
+
+        # Mock the global tool_dispatcher instance used by the API
+        # self.patch_tool_dispatcher = patch('llm_context_os.api.main.tool_dispatcher', MagicMock(spec=ToolDispatcher))
+        # self.mock_tool_dispatcher = self.patch_tool_dispatcher.start()
+        # No, better to use the real tool_dispatcher and mock its methods if needed,
+        # or ensure its state is clean / tools are simple like get_weather.
+        # For these tests, we'll use the real tool_dispatcher.
+        # Ensure 'get_weather' tool is enabled for these tests
+        api_main.tool_dispatcher.enable_tool("get_weather")
+
+
+    def tearDown(self):
+        # if hasattr(self, 'patch_tool_dispatcher'): # Stop patch if it was started
+        #     self.patch_tool_dispatcher.stop()
+        if model_mgr.current_runner: # Clean up any loaded models
+            model_mgr.unload()
+        ctx_mgr._messages = []
+        ctx_mgr._start = 0
+
+
+    @patch('llm_context_os.api.main.model_mgr.get') # Patch where model_mgr.get() is called
+    def test_chat_sync_openai_tool_call_success(self, mock_get_runner):
+        mock_runner = MagicMock(spec=APIRunner) # Use a spec if possible, or BaseRunner
+        mock_get_runner.return_value = mock_runner
+
+        # --- Configure mock_runner.generate() ---
+        # First call: LLM requests a tool call
+        tool_call_request = {
+            "tool_calls": [{
+                "id": "call_abc123",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": json.dumps({"location": "Paris", "unit": "celsius"})
+                }
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10} # Tokens for the request itself
+        }
+        # Second call: LLM provides final text response after tool result
+        final_text_response = {
+            "text": "The weather in Paris is 20 degrees Celsius.",
+            "usage": {"prompt_tokens": 50, "completion_tokens": 15} # Tokens for the full context + final answer
+        }
+        mock_runner.generate.side_effect = [tool_call_request, final_text_response]
+
+        # Mock runner's count_tokens for _prepare_context_and_initial_prompt
+        # This count is for the initial user message + system prompt.
+        mock_runner.count_tokens.return_value = 15 # Example token count for initial prompt
+
+        chat_payload = ChatRequest(
+            message="What's the weather in Paris like?",
+            stream=False
+        )
+        response = self.client.post("/chat", json=chat_payload.model_dump())
+
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+
+        self.assertEqual(json_response["reply"], "The weather in Paris is 20 degrees Celsius.")
+        # Token counts should reflect the full interaction if OpenAI-style
+        # The second call's prompt_tokens (50) + first call's completion_tokens (10 for tool req) + second call's completion_tokens (15 for text)
+        # The API currently reports:
+        # prompt_tokens_count = second_prompt_tokens (from second call's usage)
+        # generated_tokens_count = initial_completion_tokens + second_completion_tokens
+        self.assertEqual(json_response["prompt_tokens"], 50)
+        self.assertEqual(json_response["generated_tokens"], 10 + 15)
+
+        self.assertEqual(mock_runner.generate.call_count, 2)
+
+        # Assertions on ContextManager state after the interaction
+        # 1. User message
+        # 2. Assistant message (with tool_calls) - This is implicitly added by adding tool results now.
+        #    The ContextManager change adds role="assistant" with tool_calls=[...]
+        # 3. Tool result message
+        # ContextManager now stores messages with internal keys 'r', 'c', 'tcid', 'nm', 'tool_calls'
+        # build_prompt converts these to OpenAI format {'role': ..., 'content': ...}
+
+        # Check that user message was added
+        user_message_in_ctx = next((m for m in ctx_mgr._messages if m['r'] == 'user'), None)
+        self.assertIsNotNone(user_message_in_ctx)
+        self.assertEqual(user_message_in_ctx['c'], "What's the weather in Paris like?")
+
+        # Check that assistant's tool request was added
+        # This is now added by the API endpoint logic when tool_calls are detected from LLM
+        # In ContextManager, it's added as: role="assistant", content=None, tool_calls=openai_tool_calls
+        assistant_tool_request_msg = next((m for m in ctx_mgr._messages if m['r'] == 'assistant' and m.get('tool_calls')), None)
+        self.assertIsNotNone(assistant_tool_request_msg, "Assistant message with tool_calls not found in context.")
+        self.assertEqual(assistant_tool_request_msg['tool_calls'][0]['id'], "call_abc123")
+        self.assertEqual(assistant_tool_request_msg['tool_calls'][0]['function']['name'], "get_weather")
+
+        # Check that tool result was added
+        tool_result_msg = next((m for m in ctx_mgr._messages if m['r'] == 'tool'), None)
+        self.assertIsNotNone(tool_result_msg, "Tool result message not found in context.")
+        self.assertEqual(tool_result_msg['tcid'], "call_abc123")
+        self.assertEqual(tool_result_msg['nm'], "get_weather")
+        # The content of the tool result for get_weather("Paris") is "The weather in Paris is 20 degrees celsius."
+        # The dispatcher returns {"status": "success", "result": "The weather in Paris is 20 degrees celsius."}
+        # The API then puts str(dispatch_result.get("result","")) or str(dispatch_result.get("error","")) into content
+        self.assertIn("Paris is 20 degrees celsius", tool_result_msg['c'])
+
+
+    @patch('llm_context_os.api.main.model_mgr.get')
+    def test_chat_sync_openai_tool_call_tool_disabled(self, mock_get_runner):
+        mock_runner = MagicMock(spec=APIRunner)
+        mock_get_runner.return_value = mock_runner
+
+        tool_call_request_for_disabled_tool = {
+            "tool_calls": [{
+                "id": "call_disabled_tool", "type": "function",
+                "function": {"name": "get_weather", "arguments": json.dumps({"location": "Moon"})}
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        }
+        # LLM will then respond based on the error message from the disabled tool
+        final_text_response_after_disabled_tool = {
+            "text": "Sorry, I couldn't use the get_weather tool because it's disabled.",
+            "usage": {"prompt_tokens": 30, "completion_tokens": 8}
+        }
+        mock_runner.generate.side_effect = [tool_call_request_for_disabled_tool, final_text_response_after_disabled_tool]
+        mock_runner.count_tokens.return_value = 10
+
+        # Disable the tool
+        api_main.tool_dispatcher.disable_tool("get_weather")
+
+        chat_payload = ChatRequest(message="Weather on Moon?", stream=False)
+        response = self.client.post("/chat", json=chat_payload.model_dump())
+
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response["reply"], "Sorry, I couldn't use the get_weather tool because it's disabled.")
+
+        # Check context manager: should have the tool message with the error
+        tool_msg = next((m for m in ctx_mgr._messages if m['r'] == 'tool' and m['tcid'] == 'call_disabled_tool'), None)
+        self.assertIsNotNone(tool_msg)
+        self.assertIn("Tool 'get_weather' is currently disabled", tool_msg['c'])
+
+        # Re-enable the tool for other tests
+        api_main.tool_dispatcher.enable_tool("get_weather")
+
+
+    @patch('llm_context_os.api.main.model_mgr.get')
+    def test_chat_stream_openai_tool_call_success(self, mock_get_runner):
+        mock_runner = MagicMock(spec=APIRunner) # or BaseRunner
+        mock_get_runner.return_value = mock_runner
+
+        # --- Configure mock_runner.stream() ---
+        # 1. First stream call (LLM requests tool call)
+        tool_call_request_stream_item = {
+            "tool_calls": [{
+                "id": "stream_call_xyz789", "type": "function",
+                "function": {"name": "get_weather", "arguments": json.dumps({"location": "Mars", "unit": "celsius"})}
+            }]
+            # "usage" is typically not part of the tool_calls dict itself from OpenAI,
+            # but prompt_tokens for the first call might be yielded separately by the runner.
+        }
+        # Let's assume runner yields prompt_tokens first, then the tool_calls dict.
+        initial_stream_yield = [
+            {"prompt_tokens": 25}, # Tokens for the initial prompt
+            tool_call_request_stream_item
+        ]
+
+        # 2. Second stream call (LLM provides final text response)
+        final_text_chunks_yield = [
+            {"prompt_tokens": 60}, # Tokens for the prompt that included tool results
+            ("Weather on Mars is very cold. ", 7), # (text_chunk, tokens_in_chunk)
+            ("Bring a warm jacket!", 5)
+        ]
+
+        # Use a side_effect that can be called multiple times returning different generators
+        mock_runner.stream.side_effect = [
+            self.mock_async_stream_generator(initial_stream_yield),
+            self.mock_async_stream_generator(final_text_chunks_yield)
+        ]
+
+        # Mock count_tokens for _prepare_context_and_initial_prompt (called before first stream)
+        # This is for the very first prompt calculation by the API endpoint.
+        mock_runner.count_tokens.return_value = 25
+
+        chat_payload = ChatRequest(
+            message="What is the weather on Mars and what should I wear?",
+            stream=True
+        )
+
+        received_events = []
+        with self.client.stream("POST", "/chat", json=chat_payload.model_dump()) as response:
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers['content-type'], 'text/event-stream; charset=utf-8')
+            for line_bytes in response.iter_lines():
+                received_events.extend(parse_sse_stream([line_bytes])) # parse_sse_stream is from TestChatStreamingAPI
+
+        # --- Assertions on received SSE events ---
+        # print("\nReceived SSE events for streaming tool call test:")
+        # for event in received_events:
+        #     print(event)
+
+        # 1. Initial prompt_info
+        prompt_info_initial = next((e for e in received_events if e['event'] == 'prompt_info' and e['data'].get('context') == 'initial_prompt'), None)
+        self.assertIsNotNone(prompt_info_initial)
+        self.assertEqual(prompt_info_initial['data']['prompt_tokens'], 25)
+
+        # 2. Runner-provided initial prompt_info (optional, if different from calculation)
+        # In this mock, the first item from runner.stream is {"prompt_tokens": 25}, which matches, so no second initial_prompt.
+        # If it were different, another prompt_info with context 'runner_provided_initial' would appear.
+
+        # 3. Tool calls processing event (optional, but good for UX)
+        tool_calls_processing_event = next((e for e in received_events if e['event'] == 'tool_calls_processing'), None)
+        self.assertIsNotNone(tool_calls_processing_event)
+        self.assertEqual(tool_calls_processing_event['data'][0]['id'], "stream_call_xyz789")
+        self.assertEqual(tool_calls_processing_event['data'][0]['function']['name'], "get_weather")
+
+        # 4. Tool result event
+        tool_result_event = next((e for e in received_events if e['event'] == 'tool_result'), None)
+        self.assertIsNotNone(tool_result_event)
+        self.assertEqual(tool_result_event['data']['tool_call_id'], "stream_call_xyz789")
+        self.assertEqual(tool_result_event['data']['name'], "get_weather")
+        self.assertIn("Mars is -65 degrees celsius", tool_result_event['data']['result']) # From get_weather("Mars")
+
+        # 5. Prompt_info for the second LLM call (after tools)
+        prompt_info_after_tools = next((e for e in received_events if e['event'] == 'prompt_info' and e['data'].get('context') == 'runner_provided_after_tools'), None)
+        self.assertIsNotNone(prompt_info_after_tools)
+        self.assertEqual(prompt_info_after_tools['data']['prompt_tokens'], 60) # From mock
+
+        # 6. Text chunks for the final response
+        text_chunk_events = [e['data'] for e in received_events if e['event'] == 'message' and 'text' in e['data']]
+        self.assertTrue(len(text_chunk_events) >= 2)
+        reconstructed_reply = "".join(chunk['text'] for chunk in text_chunk_events)
+        self.assertEqual(reconstructed_reply, "Weather on Mars is very cold. Bring a warm jacket!")
+        self.assertEqual(text_chunk_events[0]['tokens_in_chunk'], 7)
+        self.assertEqual(text_chunk_events[1]['tokens_in_chunk'], 5)
+
+        # 7. Stream end event
+        stream_end_event = next((e for e in received_events if e['event'] == 'stream_end'), None)
+        self.assertIsNotNone(stream_end_event)
+        # Expected total generated tokens for the second LLM call
+        self.assertEqual(stream_end_event['data']['total_generated_tokens'], 7 + 5)
+        # final_prompt_tokens should be from the second call's prompt
+        self.assertEqual(stream_end_event['data']['final_prompt_tokens'], 60)
+
+        self.assertEqual(mock_runner.stream.call_count, 2)
+        # Check that context manager was updated correctly
+        user_msg = next((m for m in ctx_mgr._messages if m['r'] == 'user'), None)
+        self.assertEqual(user_msg['c'], "What is the weather on Mars and what should I wear?")
+
+        assistant_tool_request = next((m for m in ctx_mgr._messages if m['r'] == 'assistant' and m.get('tool_calls')), None)
+        self.assertIsNotNone(assistant_tool_request)
+        self.assertEqual(assistant_tool_request['tool_calls'][0]['id'], 'stream_call_xyz789')
+
+        tool_response_msg = next((m for m in ctx_mgr._messages if m['r'] == 'tool' and m.get('tcid') == 'stream_call_xyz789'), None)
+        self.assertIsNotNone(tool_response_msg)
+        self.assertIn("Mars is -65 degrees celsius", tool_response_msg['c'])
+
+    # Helper for mocking async generator for stream tests
+    async def mock_async_stream_generator(self, items_to_yield: list):
+        for item in items_to_yield:
+            yield item
+            await asyncio.sleep(0.001)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,0 +1,19 @@
+The LLM Context OS is a comprehensive system designed to streamline and enhance interactions with Large Language Models (LLMs). Its primary purpose is to provide a structured environment for managing LLM context, integrating diverse data sources, and leveraging various LLM runners and tools.
+
+Key features include:
+
+*   **Context Management:** The system emphasizes robust context management, allowing users to control and manipulate the information provided to LLMs for more relevant and accurate responses.
+*   **RAG Capabilities:** It incorporates Retrieval Augmented Generation (RAG) functionalities, enabling LLMs to access and utilize information from external sources like PDFs and chat history. This enhances the LLMs' knowledge base and allows them to provide more informed answers.
+*   **Model Runner Diversity:** The architecture supports multiple LLM runners, suggesting flexibility in choosing and switching between different LLM providers or models based on specific needs or preferences.
+*   **Tool Usage:** The system facilitates the integration and use of tools with LLMs, allowing them to perform actions and interact with external systems, thereby extending their capabilities beyond text generation.
+*   **GUI and API Access:** The presence of both a Graphical User Interface (GUI) and an Application Programming Interface (API) indicates that the system caters to different user needs and interaction styles. The GUI likely offers a user-friendly way to interact with the system, while the API allows for programmatic access and integration with other applications or workflows.
+
+In essence, the LLM Context OS aims to be a versatile platform for developers and users to effectively harness the power of LLMs by providing tools for context control, knowledge integration, model flexibility, and diverse interaction methods.
+
+**Compatibility with OpenAI Tool Calls:**
+
+The system implements a tool-calling mechanism that is conceptually aligned with OpenAI's function calling, where the LLM signals its intent to use a tool and provides arguments in a structured JSON format. However, it uses a custom `[FUNCALL]` syntax embedded in the LLM's text output rather than OpenAI's specific `tool_calls` object in the API response.
+
+For closer integration with projects accustomed to OpenAI's native tool call format:
+*   An adaptation layer might be needed to convert LLM outputs from OpenAI's `tool_calls` format to the system's `[FUNCALL]` string.
+*   Similarly, the method of defining available tools to the LLM would need to align with how this system's `ToolDispatcher` discovers and lists them, rather than directly using OpenAI's tool schema format in API requests.

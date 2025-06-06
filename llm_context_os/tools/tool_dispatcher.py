@@ -133,7 +133,7 @@ class ToolDispatcher:
 
     def dispatch(self, function_call_json: str) -> t.Dict[str, t.Any]:
         """
-        Parses a function call JSON (string) and executes the appropriate tool.
+        Parses a function call JSON (string) from [FUNCALL] syntax and executes the appropriate tool.
         Returns a dictionary with the result or an error.
         """
         print(f"[ToolDispatcher] Received function call JSON string: {function_call_json}")
@@ -169,7 +169,7 @@ class ToolDispatcher:
             elif self.mcp_client:
                 print(f"[ToolDispatcher] Attempting to dispatch '{tool_name}' to MCP client with args: {tool_args}")
                 try:
-                    mcp_result = self.mcp_client.invoke(tool_name, tool_args)
+                    mcp_result = self.mcp_client.invoke(tool_name, tool_args) # type: ignore
                     print(f"[ToolDispatcher] MCP tool '{tool_name}' executed. Result: {mcp_result}")
                     # Update tool_states to mark this MCP tool as known and enabled by default if it was successful
                     if tool_name not in self.tool_states: self.tool_states[tool_name] = True
@@ -187,7 +187,103 @@ class ToolDispatcher:
         except Exception as e: # Catch-all for other unexpected errors during dispatch logic
             return {"tool_name": None, "error": f"Unexpected error in dispatch: {str(e)}", "status": "error"}
 
+    def dispatch_openai_tool_call(self, tool_name: str, arguments_json_str: str) -> t.Dict[str, t.Any]:
+        """
+        Executes the appropriate tool based on OpenAI-style tool name and JSON string arguments.
+        Returns a dictionary with the result or an error.
+        """
+        print(f"[ToolDispatcher] Received OpenAI tool call: Name='{tool_name}', ArgsJSON='{arguments_json_str}'")
+        parsed_args: t.Dict[str, t.Any] = {}
+        try:
+            parsed_args = json.loads(arguments_json_str)
+            if not isinstance(parsed_args, dict):
+                raise json.JSONDecodeError("Arguments JSON did not parse to a dictionary.", arguments_json_str, 0)
+        except json.JSONDecodeError as e:
+            return {"status": "error", "error": f"Invalid JSON arguments string for tool {tool_name}: {str(e)}"}
+
+        # Check if tool is enabled
+        if not self.tool_states.get(tool_name, True): # Defaults to True if not in states (e.g. new MCP tool)
+            print(f"[ToolDispatcher] OpenAI Tool '{tool_name}' is disabled. Not dispatching.")
+            return {"status": "error", "error": f"Tool '{tool_name}' is currently disabled."}
+
+        if tool_name in self.local_tools:
+            tool_function = self.local_tools[tool_name]
+            try:
+                result = tool_function(**parsed_args)
+                return {"status": "success", "result": result}
+            except TypeError as e:
+                return {"status": "error", "error": f"Argument mismatch for local tool {tool_name}: {str(e)}"}
+            except Exception as e:
+                return {"status": "error", "error": f"Error executing local tool {tool_name}: {str(e)}"}
+
+        elif self.mcp_client:
+            print(f"[ToolDispatcher] Attempting to dispatch OpenAI tool '{tool_name}' to MCP client with args: {parsed_args}")
+            try:
+                mcp_result = self.mcp_client.invoke(tool_name, parsed_args) # type: ignore
+                print(f"[ToolDispatcher] MCP tool '{tool_name}' (via OpenAI call) executed. Result: {mcp_result}")
+                if tool_name not in self.tool_states: self.tool_states[tool_name] = True
+                return {"status": "success", "result": mcp_result}
+            except Exception as e:
+                error_message = f"MCP Error for tool {tool_name} (via OpenAI call): {str(e)}"
+                print(f"[ToolDispatcher] {error_message}")
+                return {"status": "error", "error": error_message}
+        else:
+            return {"status": "error", "error": f"Unknown tool: {tool_name}. Not found in local tools or MCP (client unavailable/tool not found)."}
+
+    def get_openai_tool_schemas(self) -> t.List[t.Dict[str, t.Any]]:
+        openai_schemas = []
+        all_tools_info = self.list_tools() # This gets all tools, including MCP if states were set
+
+        for tool_info in all_tools_info:
+            # For now, only generate OpenAI schemas for local tools where we reliably have parameter info
+            # and for tools that are currently enabled.
+            if tool_info.type == "local" and tool_info.is_enabled:
+                # Ensure description is not None
+                description = tool_info.description if tool_info.description is not None else ""
+
+                # Ensure parameters schema is valid, defaulting if necessary
+                parameters_schema = tool_info.parameters
+                if not isinstance(parameters_schema, dict) or \
+                   not isinstance(parameters_schema.get("type"), str) or \
+                   not isinstance(parameters_schema.get("properties"), dict):
+                    # If schema is malformed or missing, use a default empty schema
+                    parameters_schema = {"type": "object", "properties": {}, "required": []}
+
+                # Ensure 'required' field is a list of strings, if present
+                if "required" in parameters_schema and not all(isinstance(item, str) for item in parameters_schema["required"]):
+                    print(f"Warning: 'required' field for tool '{tool_info.name}' is not a list of strings. Setting to empty list for OpenAI schema.")
+                    parameters_schema["required"] = []
+
+
+                tool_schema = {
+                    "type": "function",
+                    "function": {
+                        "name": tool_info.name,
+                        "description": description,
+                        "parameters": parameters_schema
+                    }
+                }
+                openai_schemas.append(tool_schema)
+            # TODO: Future: Consider how to represent MCP tools if their parameter schemas become available
+            # via McpClient.list_available_tools() and are compatible.
+
+        return openai_schemas
+
+
 if __name__ == '__main__':
+    # Mock McpClient for standalone testing if library is not available or for controlled tests
+    # This basic mock helps avoid crashing if McpClient cannot be imported/initialized.
+    if not MCP_ADAPTERS_AVAILABLE:
+        class MockMcpClient:
+            def invoke(self, tool_name: str, arguments: t.Dict[str, t.Any]):
+                print(f"[MockMcpClient] Invoked tool: {tool_name} with args: {arguments}")
+                if tool_name == "mcp_some_tool":
+                    return "Mocked successful result from MCP tool"
+                elif tool_name == "mcp_another_tool":
+                    raise Exception("MCP tool execution failed on server")
+                raise Exception(f"Mock MCP tool '{tool_name}' not found.")
+        McpClient = MockMcpClient # type: ignore
+
     dispatcher = ToolDispatcher()
 
     print("\n--- Test 1: Valid local tool call (get_weather) ---")
@@ -282,18 +378,18 @@ if __name__ == '__main__':
 
     print("\n--- Testing Tool Listing and Management ---")
     print("Initial tool list:")
-    for tool_info in dispatcher.list_tools():
+    initial_tools = dispatcher.list_tools()
+    for tool_info in initial_tools:
         print(f"  - {tool_info.name} (Enabled: {tool_info.is_enabled}, Type: {tool_info.type}, Params: {tool_info.parameters})")
 
     print("\nDisabling 'get_weather' tool...")
     dispatcher.disable_tool("get_weather")
-    print("Tool list after disabling 'get_weather':")
-    for tool_info in dispatcher.list_tools():
-        if tool_info.name == "get_weather":
-            print(f"  - {tool_info.name} (Enabled: {tool_info.is_enabled})") # Should be False
-            assert not tool_info.is_enabled
+    get_weather_info_disabled = next((t for t in dispatcher.list_tools() if t.name == "get_weather"), None)
+    if get_weather_info_disabled:
+        print(f"  - get_weather (Enabled: {get_weather_info_disabled.is_enabled})") # Should be False
+        assert not get_weather_info_disabled.is_enabled
 
-    print("\nAttempting to dispatch disabled 'get_weather':")
+    print("\nAttempting to dispatch disabled 'get_weather' using [FUNCALL]:")
     weather_call_disabled = '{"name": "get_weather", "arguments": {"location": "New York"}}'
     result_disabled = dispatcher.dispatch(weather_call_disabled)
     print(f"Dispatch result (disabled): {result_disabled}")
@@ -302,27 +398,103 @@ if __name__ == '__main__':
 
     print("\nEnabling 'get_weather' tool...")
     dispatcher.enable_tool("get_weather")
-    print("Tool list after re-enabling 'get_weather':")
-    for tool_info in dispatcher.list_tools():
-        if tool_info.name == "get_weather":
-            print(f"  - {tool_info.name} (Enabled: {tool_info.is_enabled})") # Should be True
-            assert tool_info.is_enabled
+    get_weather_info_enabled = next((t for t in dispatcher.list_tools() if t.name == "get_weather"), None)
+    if get_weather_info_enabled:
+        print(f"  - get_weather (Enabled: {get_weather_info_enabled.is_enabled})") # Should be True
+        assert get_weather_info_enabled.is_enabled
 
-    print("\nAttempting to dispatch enabled 'get_weather':")
+    print("\nAttempting to dispatch enabled 'get_weather' using [FUNCALL]:")
     result_enabled_again = dispatcher.dispatch(weather_call_valid) # Use valid call from earlier
     print(f"Dispatch result (enabled again): {result_enabled_again}")
     assert result_enabled_again['status'] == 'success'
 
-    print("\nTesting enabling/disabling a non-local (presumed MCP) tool:")
-    dispatcher.disable_tool("mcp_hypothetical_tool")
-    self.assertFalse(dispatcher.tool_states.get("mcp_hypothetical_tool"))
-    mcp_tool_info = next((t for t in dispatcher.list_tools() if t.name == "mcp_hypothetical_tool"), None)
-    self.assertIsNotNone(mcp_tool_info)
-    self.assertFalse(mcp_tool_info.is_enabled)
+    print("\n--- Test OpenAI Dispatch Method ---")
+    print("\n--- Test OpenAI 1: Valid local tool call (get_weather) ---")
+    openai_result1 = dispatcher.dispatch_openai_tool_call("get_weather", '{"location": "New York", "unit": "fahrenheit"}')
+    print(f"OpenAI Dispatch result 1: {openai_result1}")
+    assert openai_result1['status'] == 'success'
+    assert "New York" in openai_result1.get("result", "")
 
-    dispatcher.enable_tool("mcp_hypothetical_tool")
-    self.assertTrue(dispatcher.tool_states.get("mcp_hypothetical_tool"))
-    mcp_tool_info_enabled = next((t for t in dispatcher.list_tools() if t.name == "mcp_hypothetical_tool"), None)
-    self.assertTrue(mcp_tool_info_enabled.is_enabled)
+    print("\n--- Test OpenAI 2: Local tool with argument error ---")
+    openai_result2 = dispatcher.dispatch_openai_tool_call("get_weather", '{"unit": "celsius"}') # Missing 'location'
+    print(f"OpenAI Dispatch result 2: {openai_result2}")
+    assert openai_result2['status'] == 'error'
+    assert "Argument mismatch" in openai_result2.get("error", "")
 
-    print("\nTool Management Demo complete.")
+    print("\n--- Test OpenAI 3: Tool disabled ---")
+    dispatcher.disable_tool("get_weather")
+    openai_result3 = dispatcher.dispatch_openai_tool_call("get_weather", '{"location": "London", "unit": "celsius"}')
+    print(f"OpenAI Dispatch result 3 (disabled): {openai_result3}")
+    assert openai_result3['status'] == 'error'
+    assert "disabled" in openai_result3.get("error", "")
+    dispatcher.enable_tool("get_weather") # Re-enable for subsequent tests if any
+
+    print("\n--- Test OpenAI 4: Unknown tool ---")
+    openai_result4 = dispatcher.dispatch_openai_tool_call("no_such_tool_openai", '{}')
+    print(f"OpenAI Dispatch result 4 (unknown): {openai_result4}")
+    assert openai_result4['status'] == 'error'
+    assert "Unknown tool" in openai_result4.get("error", "")
+
+    print("\n--- Test OpenAI 5: Invalid JSON arguments ---")
+    openai_result5 = dispatcher.dispatch_openai_tool_call("get_weather", '{"location": "Berlin", "unit": "celsius"') # Malformed JSON
+    print(f"OpenAI Dispatch result 5 (invalid JSON): {openai_result5}")
+    assert openai_result5['status'] == 'error'
+    assert "Invalid JSON arguments" in openai_result5.get("error", "")
+
+    # Test MCP via OpenAI dispatch if MCP client is available/mocked
+    if dispatcher.mcp_client: # Check if a real or mock client is there
+        print("\n--- Test OpenAI 6: MCP tool call (mocked success) ---")
+        openai_mcp_success = dispatcher.dispatch_openai_tool_call("mcp_some_tool", '{"param": "value"}')
+        print(f"OpenAI Dispatch result (MCP success): {openai_mcp_success}")
+        assert openai_mcp_success['status'] == 'success'
+        assert openai_mcp_success.get("result") == "Mocked successful result from MCP tool"
+
+        print("\n--- Test OpenAI 7: MCP tool call (mocked error) ---")
+        openai_mcp_error = dispatcher.dispatch_openai_tool_call("mcp_another_tool", '{}')
+        print(f"OpenAI Dispatch result (MCP error): {openai_mcp_error}")
+        assert openai_mcp_error['status'] == 'error'
+        assert "MCP tool execution failed on server" in openai_mcp_error.get("error", "")
+
+    print("\nTesting enabling/disabling a non-local (presumed MCP) tool for OpenAI dispatch:")
+    dispatcher.disable_tool("mcp_hypothetical_openai_tool")
+    mcp_tool_info_disabled_openai = next((t for t in dispatcher.list_tools() if t.name == "mcp_hypothetical_openai_tool"), None)
+    # Note: list_tools might create a minimal entry if a tool state is set for an unknown tool
+    if mcp_tool_info_disabled_openai:
+         assert not mcp_tool_info_disabled_openai.is_enabled
+    else: # If it wasn't added to list_tools just by setting state
+         assert not dispatcher.tool_states.get("mcp_hypothetical_openai_tool")
+
+    openai_mcp_disabled_call = dispatcher.dispatch_openai_tool_call("mcp_hypothetical_openai_tool", '{}')
+    print(f"OpenAI Dispatch result (MCP disabled): {openai_mcp_disabled_call}")
+    assert openai_mcp_disabled_call['status'] == 'error'
+    assert "disabled" in openai_mcp_disabled_call.get("error", "")
+
+    dispatcher.enable_tool("mcp_hypothetical_openai_tool")
+    mcp_tool_info_enabled_openai = next((t for t in dispatcher.list_tools() if t.name == "mcp_hypothetical_openai_tool"), None)
+    if mcp_tool_info_enabled_openai:
+        assert mcp_tool_info_enabled_openai.is_enabled
+    else:
+        assert dispatcher.tool_states.get("mcp_hypothetical_openai_tool")
+
+    print("\n--- Test get_openai_tool_schemas ---")
+    openai_schemas = dispatcher.get_openai_tool_schemas()
+    print("OpenAI Tool Schemas:")
+    for schema in openai_schemas:
+        print(json.dumps(schema, indent=2))
+
+    # Check if get_weather is in the schemas (assuming it's enabled by default)
+    get_weather_schema = next((s for s in openai_schemas if s["function"]["name"] == "get_weather"), None)
+    assert get_weather_schema is not None
+    assert get_weather_schema["function"]["parameters"]["type"] == "object"
+    assert "location" in get_weather_schema["function"]["parameters"]["properties"]
+
+    # Disable get_weather and check again
+    print("\nDisabling get_weather and checking OpenAI schemas again...")
+    dispatcher.disable_tool("get_weather")
+    openai_schemas_after_disable = dispatcher.get_openai_tool_schemas()
+    get_weather_schema_after_disable = next((s for s in openai_schemas_after_disable if s["function"]["name"] == "get_weather"), None)
+    assert get_weather_schema_after_disable is None, "Disabled tool 'get_weather' should not be in OpenAI schemas."
+    dispatcher.enable_tool("get_weather") # Re-enable for other tests
+
+
+    print("\nTool Management and OpenAI Dispatch Demo complete.")

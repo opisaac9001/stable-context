@@ -337,6 +337,19 @@ async def list_tools_endpoint():
     tools = tool_dispatcher.list_tools()
     return ToolListResponse(tools=tools)
 
+@app.get("/tools/openai_schemas", response_model=t.List[t.Dict[str, t.Any]])
+async def get_openai_tool_schemas_endpoint():
+    """
+    Returns a list of OpenAI-compatible tool schemas for enabled local tools.
+    """
+    try:
+        schemas = tool_dispatcher.get_openai_tool_schemas()
+        return schemas
+    except Exception as e:
+        print(f"Error generating OpenAI tool schemas: {e}")
+        # import traceback; traceback.print_exc() # For debugging
+        raise HTTPException(status_code=500, detail=f"Failed to generate OpenAI tool schemas: {str(e)}")
+
 @app.post("/tools/toggle", response_model=StatusResponse)
 async def toggle_tool_endpoint(req: ToggleToolRequest):
     """
@@ -535,124 +548,196 @@ async def chat_endpoint(req: ChatRequest):
     # --- Streaming Response Logic ---
     if req.stream:
         async def sse_generator() -> AsyncGenerator[str, None]:
-            full_assistant_reply_for_history = []
-            accumulated_completion_tokens = 0
             final_prompt_tokens_for_response = 0
+            accumulated_completion_tokens = 0
+            full_assistant_reply_for_history: List[str] = [] # Stores text parts of assistant's reply
+            active_tool_calls_info: List[Dict[str, Any]] = [] # Stores OpenAI tool_call objects
 
-            initial_prompt_text = ""
+            initial_prompt_data_for_runner: Any # Could be str or List[Dict] depending on runner
+            initial_prompt_token_count_calc = 0
+
             try:
-                initial_prompt_text, initial_prompt_tokens_calc = _prepare_context_and_initial_prompt(
+                # _prepare_context_and_initial_prompt now returns a list of messages if ctx_mgr.build_prompt does.
+                # For now, we assume runner.stream expects a string for the first call,
+                # so _prepare_context_and_initial_prompt needs to return that or be adapted.
+                # Let's assume _prepare_context_and_initial_prompt still returns (str, int) for now.
+                # This is a temporary inconsistency that runner adaptation will resolve.
+                # For this subtask, we focus on sse_generator logic given this assumption.
+
+                # TODO: Resolve if initial_prompt_text should be str or List[Dict] based on runner capabilities
+                # For now, assuming _prepare_context_and_initial_prompt provides a string for the first call.
+                # If it provides List[Dict], runner.stream() needs to handle `messages=` for first call too.
+                initial_prompt_text_str, initial_prompt_token_count_calc = _prepare_context_and_initial_prompt(
                     req, ctx_mgr, chat_history_retriever, pdf_retriever, runner
                 )
-                final_prompt_tokens_for_response = initial_prompt_tokens_calc
-                yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': initial_prompt_tokens_calc, 'context': 'initial_prompt'})}\n\n"
+                initial_prompt_data_for_runner = initial_prompt_text_str # Assuming string for now
+
+                final_prompt_tokens_for_response = initial_prompt_token_count_calc
+                yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': initial_prompt_token_count_calc, 'context': 'initial_prompt'})}\n\n"
+
             except HTTPException as e:
                 error_content = json.dumps({"error": e.detail, "status_code": e.status_code})
                 yield f"event: error\ndata: {error_content}\n\n"
                 return
-
-            initial_response_buffer = []
-            func_call_str_detected = None
-
-            try:
-                # First LLM call (streaming)
-                stream_iterator_initial = runner.stream(prompt=initial_prompt_text, image_paths=req.image_paths, **req.generation_params.model_dump())
-
-                # Process prompt_tokens info from the runner's stream
-                first_item_initial_stream = next(stream_iterator_initial, None)
-                if isinstance(first_item_initial_stream, dict) and "prompt_tokens" in first_item_initial_stream:
-                    if final_prompt_tokens_for_response != first_item_initial_stream["prompt_tokens"]:
-                        print(f"Info: Runner's initial stream prompt token count ({first_item_initial_stream['prompt_tokens']}) differs from pre-calculated ({final_prompt_tokens_for_response}). Using runner's value.")
-                        final_prompt_tokens_for_response = first_item_initial_stream["prompt_tokens"]
-                        # Optionally re-yield if it changed significantly
-                        yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': final_prompt_tokens_for_response, 'context': 'runner_provided_initial'})}\n\n"
-                elif first_item_initial_stream: # First item was not dict, assume it's a (chunk, count) tuple
-                    text_chunk, tokens_in_chunk = first_item_initial_stream
-                    initial_response_buffer.append(text_chunk) # Buffer for FUNCALL detection
-                    # Check for FUNCALL immediately, even in the first chunk
-                    current_buffered_text_check = "".join(initial_response_buffer)
-                    if "[FUNCALL]" in current_buffered_text_check and (current_buffered_text_check.endswith("}") or len(current_buffered_text_check) > 2048): # Heuristic for completion
-                        func_call_str_detected = current_buffered_text_check
-                    else: # Not a FUNCALL or potentially incomplete
-                        full_assistant_reply_for_history.append(text_chunk)
-                        accumulated_completion_tokens += tokens_in_chunk if tokens_in_chunk is not None else 0
-                        yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
-                        initial_response_buffer.clear() # Clear since this part is yielded
-                        await asyncio.sleep(0.01)
-
-                if not func_call_str_detected: # Continue with the rest of the stream if no FUNCALL yet
-                    for item in stream_iterator_initial:
-                        text_chunk, tokens_in_chunk = item
-                        initial_response_buffer.append(text_chunk)
-                        current_buffered_text_check = "".join(initial_response_buffer)
-                        if "[FUNCALL]" in current_buffered_text_check:
-                            if not current_buffered_text_check.endswith("}") and len(current_buffered_text_check) <= 2048 : continue
-                            func_call_str_detected = current_buffered_text_check; break
-
-                        full_assistant_reply_for_history.append(text_chunk)
-                        accumulated_completion_tokens += tokens_in_chunk if tokens_in_chunk is not None else 0
-                        yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
-                        initial_response_buffer.clear()
-                        await asyncio.sleep(0.01)
-
-                if func_call_str_detected:
-                    # Extract FUNCALL and any preceding text from the buffer
-                    # The buffer might contain parts already yielded if FUNCALL was detected late.
-                    # This part needs careful management to avoid duplicate text yields.
-                    # For simplicity, assume func_call_str_detected contains the full relevant string.
-                    preceding_text_in_buffer, _, actual_func_call_payload = func_call_str_detected.partition("[FUNCALL]")
-                    if preceding_text_in_buffer and "".join(full_assistant_reply_for_history) != preceding_text_in_buffer:
-                        # This implies some part of preceding_text_in_buffer was not yielded.
-                        # This logic is complex; the sse_generator in previous steps was simpler.
-                        # For now, we assume if preceding_text_in_buffer exists, it's new.
-                        # This is a known simplification area.
-                        # TODO: Refine handling of text preceding FUNCALL when it spans multiple chunks.
-                        # For now, we focus on the tool call itself.
-                         pass # Avoid yielding potentially duplicated preceding_text from buffer.
-
-                    full_func_call_command = f"[FUNCALL]{actual_func_call_payload}"
-                    second_prompt, tool_name, tool_params_json_str, second_prompt_tokens_calc = _handle_tool_call(
-                        full_func_call_command, ctx_mgr, tool_dispatcher, runner
-                    )
-                    final_prompt_tokens_for_response = second_prompt_tokens_calc
-
-                    parsed_tool_params = {};
-                    try: parsed_tool_params = json.loads(tool_params_json_str)
-                    except: pass
-                    yield f"event: tool_call\ndata: {json.dumps({'tool_name': tool_name, 'tool_params': parsed_tool_params})}\n\n"
-                    yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': second_prompt_tokens_calc, 'context': 'after_tool_call'})}\n\n"
-
-                    full_assistant_reply_for_history.clear()
-                    accumulated_completion_tokens = 0
-
-                    stream_iterator_after_tool = runner.stream(prompt=second_prompt, **req.generation_params.model_dump())
-                    second_stream_prompt_info = next(stream_iterator_after_tool, None)
-
-                    if isinstance(second_stream_prompt_info, dict) and "prompt_tokens" in second_stream_prompt_info:
-                        if final_prompt_tokens_for_response != second_stream_prompt_info["prompt_tokens"]:
-                             final_prompt_tokens_for_response = second_stream_prompt_info["prompt_tokens"]
-                             yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': final_prompt_tokens_for_response, 'context': 'after_tool_call_runner_provided'})}\n\n"
-                    elif second_stream_prompt_info:
-                        text_chunk, tokens_in_chunk = second_stream_prompt_info
-                        full_assistant_reply_for_history.append(text_chunk)
-                        accumulated_completion_tokens += tokens_in_chunk if tokens_in_chunk is not None else 0
-                        yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
-
-                    for final_chunk, tokens_in_chunk_final in stream_iterator_after_tool:
-                        full_assistant_reply_for_history.append(final_chunk)
-                        accumulated_completion_tokens += tokens_in_chunk_final if tokens_in_chunk_final is not None else 0
-                        yield f"data: {json.dumps({'text': final_chunk, 'tokens_in_chunk': tokens_in_chunk_final})}\n\n"
-                        await asyncio.sleep(0.01)
-                # else: No tool call, all chunks (if any after first) were yielded.
-
-            except Exception as e_stream:
-                print(f"Error during streaming: {e_stream}")
-                error_content = json.dumps({"error": str(e_stream)})
+            except Exception as e_prep: # Catch other prep errors
+                print(f"Error in _prepare_context_and_initial_prompt or initial yield: {e_prep}")
+                error_content = json.dumps({"error": str(e_prep), "status_code": 500})
                 yield f"event: error\ndata: {error_content}\n\n"
-            finally:
+                return
+
+            # Main execution block for streaming and tool calls
+            try:
+                # First LLM stream
+                # Assuming runner.stream can take `prompt` (string) or `messages` (list)
+                # Based on current _prepare_context_and_initial_prompt, it's a string.
+                stream_iterator_initial = runner.stream(
+                    prompt=initial_prompt_data_for_runner, # type: ignore
+                    image_paths=req.image_paths,
+                    **req.generation_params.model_dump()
+                )
+
+                for item in stream_iterator_initial:
+                    if isinstance(item, dict):
+                        if "prompt_tokens" in item:
+                            actual_prompt_tokens_from_runner = item["prompt_tokens"]
+                            if final_prompt_tokens_for_response != actual_prompt_tokens_from_runner:
+                                print(f"Info: Runner's initial stream prompt token count ({actual_prompt_tokens_from_runner}) differs from pre-calculated ({final_prompt_tokens_for_response}). Using runner's value.")
+                                final_prompt_tokens_for_response = actual_prompt_tokens_from_runner
+                                yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': final_prompt_tokens_for_response, 'context': 'runner_provided_initial'})}\n\n"
+
+                        elif "tool_calls" in item: # Runner yields a complete tool_calls list
+                            openai_tool_calls = item["tool_calls"]
+                            if openai_tool_calls: # Ensure not empty
+                                print(f"[API sse_generator] Received tool_calls: {openai_tool_calls}")
+                                # Add assistant's turn with tool_calls to context
+                                ctx_mgr.add(role="assistant", content=None, tool_calls=openai_tool_calls)
+                                # Store for history and processing
+                                # The assistant's message in history will be one with tool_calls, not text.
+                                full_assistant_reply_for_history.append(json.dumps({"tool_calls": openai_tool_calls})) # Store as JSON string for history
+                                active_tool_calls_info = openai_tool_calls
+                                break # Exit first stream loop to process tool calls
+                        # Potentially handle other dict types like usage stats if yielded separately
+
+                    elif isinstance(item, tuple) and len(item) == 2: # (text_chunk, tokens_in_chunk)
+                        text_chunk, tokens_in_chunk = item
+                        if text_chunk: # Ensure text_chunk is not empty
+                            full_assistant_reply_for_history.append(text_chunk)
+                            accumulated_completion_tokens += tokens_in_chunk if tokens_in_chunk is not None else 0
+                            yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
+                            await asyncio.sleep(0.01) # Small sleep for stream flushing
+                    else:
+                        print(f"Warning: Unknown item type from initial stream: {item}")
+
+                # Tool Execution Phase (if active_tool_calls_info is populated)
+                if active_tool_calls_info:
+                    yield f"event: tool_calls_processing\ndata: {json.dumps(active_tool_calls_info)}\n\n"
+
+                    # Clear previous assistant reply (which was the tool_calls request)
+                    # The next LLM call will generate the actual textual response.
+                    full_assistant_reply_for_history.clear()
+                    accumulated_completion_tokens = 0 # Reset for the generation after tool calls
+
+                    for tool_call in active_tool_calls_info:
+                        tool_call_id = tool_call.get("id")
+                        tool_function = tool_call.get("function", {})
+                        tool_name = tool_function.get("name")
+                        arguments_json_str = tool_function.get("arguments")
+
+                        if not tool_call_id or not tool_name or arguments_json_str is None:
+                            print(f"Warning: Malformed tool_call object in sse_generator: {tool_call}")
+                            tool_content_str = "Error: Malformed tool_call object from LLM."
+                            # Add to context even if malformed, so LLM knows an error occurred for this ID
+                            ctx_mgr.add(role="tool", content=tool_content_str, name=tool_name or "error_tool", tool_call_id=tool_call_id or "unknown_malformed_id")
+                            yield f"event: tool_result\ndata: {json.dumps({'tool_call_id': tool_call_id, 'name': tool_name, 'error': tool_content_str})}\n\n"
+                            continue
+
+                        try:
+                            print(f"[API sse_generator] Dispatching OpenAI tool: ID='{tool_call_id}', Name='{tool_name}', Args='{arguments_json_str}'")
+                            dispatch_result = tool_dispatcher.dispatch_openai_tool_call(tool_name, arguments_json_str)
+
+                            tool_content_str = ""
+                            if dispatch_result.get("status") == "success":
+                                tool_content_str = str(dispatch_result.get("result", ""))
+                            else:
+                                tool_content_str = str(dispatch_result.get("error", "Tool execution failed."))
+
+                            ctx_mgr.add(role="tool", content=tool_content_str, name=tool_name, tool_call_id=tool_call_id)
+                            yield f"event: tool_result\ndata: {json.dumps({'tool_call_id': tool_call_id, 'name': tool_name, 'result': tool_content_str})}\n\n"
+                        except Exception as e_dispatch:
+                            print(f"Error dispatching tool '{tool_name}': {e_dispatch}")
+                            error_content_str = f"Error executing tool {tool_name}: {str(e_dispatch)}"
+                            ctx_mgr.add(role="tool", content=error_content_str, name=tool_name, tool_call_id=tool_call_id)
+                            yield f"event: tool_result\ndata: {json.dumps({'tool_call_id': tool_call_id, 'name': tool_name, 'error': error_content_str})}\n\n"
+
+                    # Second LLM Stream (after tool calls)
+                    # ctx_mgr.build_prompt() now returns List[Dict[str, Any]]
+                    prompt_messages_after_tools: List[Dict[str, Any]] = ctx_mgr.build_prompt()
+
+                    # Assuming runner.stream can now take `messages` argument
+                    stream_iterator_second = runner.stream(
+                        messages=prompt_messages_after_tools, # type: ignore
+                        image_paths=req.image_paths, # Pass images again if needed
+                        **req.generation_params.model_dump()
+                    )
+
+                    for item in stream_iterator_second:
+                        if isinstance(item, dict):
+                            if "prompt_tokens" in item: # Runner reports prompt tokens for the second call
+                                second_call_prompt_tokens = item["prompt_tokens"]
+                                if final_prompt_tokens_for_response != second_call_prompt_tokens:
+                                    # This usually means the runner has a different way of counting the full conversation
+                                    print(f"Info: Runner's second stream prompt token count ({second_call_prompt_tokens}) used. Initial was ({final_prompt_tokens_for_response}).")
+                                    final_prompt_tokens_for_response = second_call_prompt_tokens
+                                yield f"event: prompt_info\ndata: {json.dumps({'prompt_tokens': final_prompt_tokens_for_response, 'context': 'runner_provided_after_tools'})}\n\n"
+                            # Recursive tool calls not handled in this iteration.
+
+                        elif isinstance(item, tuple) and len(item) == 2: # (text_chunk, tokens_in_chunk)
+                            text_chunk, tokens_in_chunk = item
+                            if text_chunk:
+                                full_assistant_reply_for_history.append(text_chunk)
+                                accumulated_completion_tokens += tokens_in_chunk if tokens_in_chunk is not None else 0
+                                yield f"data: {json.dumps({'text': text_chunk, 'tokens_in_chunk': tokens_in_chunk})}\n\n"
+                                await asyncio.sleep(0.01)
+                        else:
+                             print(f"Warning: Unknown item type from second stream: {item}")
+
+                # If no tool calls, the first stream completed, and full_assistant_reply_for_history contains its output.
+
+            except Exception as e_stream_main:
+                print(f"Error during main streaming logic: {e_stream_main}")
+                # import traceback; traceback.print_exc() # For debugging
+                error_content = json.dumps({"error": str(e_stream_main), "status_code": 500})
+                yield f"event: error\ndata: {error_content}\n\n"
+
+            finally: # This block executes whether there was an exception or not
                 if full_assistant_reply_for_history:
+                    # Determine if the reply was a tool request or text
+                    # If active_tool_calls_info is populated, the last "message" from assistant was tool_calls.
+                    # If not, it was text.
+                    final_message_content_for_history = "".join(full_assistant_reply_for_history)
+                    if active_tool_calls_info and not any(isinstance(chunk, str) and chunk.strip() for chunk in full_assistant_reply_for_history):
+                        # If tool calls happened AND the final text content is empty/whitespace,
+                        # it implies the "reply" was the tool calls themselves.
+                        # The full_assistant_reply_for_history might contain the JSON representation of tool_calls if we stored it earlier.
+                        # The ContextManager already added the assistant's tool_calls object.
+                        # ChatHistoryRetriever needs the textual summary or representation.
+                        # For now, if tools were called, the last textual output from the LLM is what we save.
+                        # If that's empty, we might save a placeholder or the stringified tool_calls.
+                        pass # The content is already in full_assistant_reply_for_history.
+
                     try:
-                        chat_history_retriever.add_message(message_text="".join(full_assistant_reply_for_history), role="assistant")
+                        # If the last thing the assistant did was call tools, full_assistant_reply_for_history
+                        # would be the *textual response after tools*. If it only called tools and then said nothing,
+                        # it would be empty here.
+                        # If it only outputted text (no tools), that text is here.
+                        if final_message_content_for_history: # Only add if there's actual text content
+                             chat_history_retriever.add_message(message_text=final_message_content_for_history, role="assistant")
+                        elif active_tool_calls_info: # Assistant made tool calls but produced no further text
+                             # Add a representation of the tool call action to history if desired
+                             # For now, we assume ctx_mgr.add(role="assistant", content=None, tool_calls=...) is sufficient
+                             # and CHR doesn't need a separate entry for the tool calling itself beyond the subsequent tool results.
+                             # Or, we could add the JSON string of tool_calls that was in full_assistant_reply_for_history before clearing.
+                             pass
                     except Exception as e_chr_add_assist:
                         print(f"Warning: Failed to add assistant's streamed reply to ChatHistoryRetriever: {e_chr_add_assist}")
 
@@ -668,34 +753,108 @@ async def chat_endpoint(req: ChatRequest):
     # --- Synchronous (Non-Streaming) Response Logic ---
     else:
         start_time = time.time()
-        final_reply_text = ""
+        final_reply_text: Optional[str] = None # Initialize to None or empty string
         prompt_tokens_count = 0
         generated_tokens_count = 0
 
         try:
-            prompt_for_model, initial_prompt_tokens = _prepare_context_and_initial_prompt(
+            prompt_for_model, initial_prompt_tokens_estimate = _prepare_context_and_initial_prompt(
                 req, ctx_mgr, chat_history_retriever, pdf_retriever, runner
             )
-            prompt_tokens_count = initial_prompt_tokens # Initial prompt tokens
+            # This initial_prompt_tokens_estimate is from our calculation.
+            # We will use the actuals from the runner's response.
 
-            reply_text_tuple = runner.generate( # runner.generate now returns a tuple
+            # First LLM call
+            llm_response_initial: Dict[str, Any] = runner.generate(
                 prompt=prompt_for_model,
                 image_paths=req.image_paths,
                 **req.generation_params.model_dump()
             )
-            final_reply_text = reply_text
-            prompt_tokens_count = token_counts1.get("prompt_tokens", 0)
-            generated_tokens_count = token_counts1.get("completion_tokens", 0)
 
-            if reply_text.startswith('[FUNCALL]'):
-                second_prompt, _, _, _ = _handle_tool_call(reply_text, ctx_mgr, tool_dispatcher)
-                # For sync, the second call's tokens overwrite the first for simplicity of reporting one set.
-                # Or, one could sum them if that's more meaningful. Here, we report tokens for the final text-generating call.
-                final_reply_text, token_counts2 = runner.generate(second_prompt, **req.generation_params.model_dump())
-                prompt_tokens_count = token_counts2.get("prompt_tokens", 0) # Update with second prompt's tokens
-                generated_tokens_count = token_counts2.get("completion_tokens", 0) # Update with second call's completion
-                print(f"[API /chat] Final reply after tool call: {final_reply_text[:100]}...")
+            actual_prompt_tokens = llm_response_initial.get("usage", {}).get("prompt_tokens", 0)
+            initial_completion_tokens = llm_response_initial.get("usage", {}).get("completion_tokens", 0)
 
+            prompt_tokens_count = actual_prompt_tokens
+            generated_tokens_count = initial_completion_tokens
+            final_reply_text = llm_response_initial.get("text") # This might be None if tool_calls are present
+
+            openai_tool_calls = llm_response_initial.get("tool_calls")
+
+            if openai_tool_calls:
+                print(f"[API /chat] Detected OpenAI tool calls: {openai_tool_calls}")
+                # Add the LLM's message that included tool_calls to context
+                # This assumes the LLM's message (even if it's just tool_calls) should be part of history.
+                # The exact content for role='assistant' when tool_calls are present might need refinement.
+                # For now, we add a placeholder or skip if final_reply_text was None.
+                # If final_reply_text was not None (e.g. text + tool_call), it's already set.
+                # If only tool_calls, the assistant "message" is the call itself.
+                # This part of context manager interaction might need adjustment based on how
+                # OpenAI compatible models structure this. For now, we assume ctx_mgr can handle
+                # assistant messages that are primarily tool_calls.
+                # Let's assume for now, the assistant's "turn" that requests tool calls is implicitly added
+                # to context by the act of then adding the "tool" role messages.
+                # Or, if the model also returns text along with tool_calls, that text is the assistant's message.
+                # For now, we don't add a specific assistant message here if final_reply_text is None.
+                # The `ctx_mgr.add(role="assistant", tool_calls=openai_tool_calls)` would be ideal if supported.
+
+                for tool_call in openai_tool_calls:
+                    tool_call_id = tool_call.get("id")
+                    tool_function = tool_call.get("function", {})
+                    tool_name = tool_function.get("name")
+                    arguments_json_str = tool_function.get("arguments")
+
+                    if not tool_call_id or not tool_name or arguments_json_str is None:
+                        print(f"Warning: Malformed tool_call object: {tool_call}")
+                        # Potentially add an error message to context for this tool_call_id
+                        ctx_mgr.add(
+                            role="tool",
+                            content="Error: Malformed tool_call object from LLM.",
+                            name="error_tool", # Placeholder name
+                            tool_call_id=tool_call_id or "unknown_id"
+                        )
+                        continue
+
+                    print(f"[API /chat] Dispatching OpenAI tool: ID='{tool_call_id}', Name='{tool_name}', Args='{arguments_json_str}'")
+                    dispatch_result = tool_dispatcher.dispatch_openai_tool_call(tool_name, arguments_json_str)
+
+                    tool_content_str = ""
+                    if dispatch_result.get("status") == "success":
+                        tool_content_str = str(dispatch_result.get("result", ""))
+                    else:
+                        tool_content_str = str(dispatch_result.get("error", "Tool execution failed."))
+
+                    print(f"[API /chat] Tool '{tool_name}' result (ID: {tool_call_id}): {tool_content_str[:200]}")
+                    ctx_mgr.add(role="tool", content=tool_content_str, name=tool_name, tool_call_id=tool_call_id)
+
+                # All tool calls dispatched and results added to context. Now make the second LLM call.
+                prompt_after_tools = ctx_mgr.build_prompt()
+                print(f"[API /chat] Built second prompt after tool calls (len {len(prompt_after_tools)} chars):\n{prompt_after_tools[:500]}...")
+
+                llm_response_second: Dict[str, Any] = runner.generate(
+                    prompt=prompt_after_tools,
+                    image_paths=req.image_paths, # Pass images again if needed, though less common for tool-result processing
+                    **req.generation_params.model_dump()
+                )
+
+                final_reply_text = llm_response_second.get("text", "") # Get the final text response
+
+                # Token accounting for the second call
+                second_prompt_tokens = llm_response_second.get("usage", {}).get("prompt_tokens", 0)
+                second_completion_tokens = llm_response_second.get("usage", {}).get("completion_tokens", 0)
+
+                # How to sum up tokens?
+                # Option 1: OpenAI style - prompt_tokens for second call includes everything.
+                # So, total_prompt_tokens = second_prompt_tokens. Total_completion_tokens = initial_completion_tokens + second_completion_tokens.
+                prompt_tokens_count = second_prompt_tokens # This should reflect the full conversation up to that point.
+                generated_tokens_count += second_completion_tokens # Add to initial completion tokens.
+
+                print(f"[API /chat] Final reply after OpenAI tool calls: {final_reply_text[:100]}...")
+
+            # Ensure final_reply_text is not None if it was never set (e.g. first call only had tool_calls and second call somehow returned no text)
+            if final_reply_text is None:
+                final_reply_text = "" # Default to empty string if no text was generated.
+
+            # Add final assistant reply to chat history retriever
             if final_reply_text:
                 try:
                     chat_history_retriever.add_message(message_text=final_reply_text, role="assistant")
@@ -706,13 +865,14 @@ async def chat_endpoint(req: ChatRequest):
             raise
         except Exception as e:
             print(f"Error during model generation or tool call: {e}")
+            # import traceback; traceback.print_exc(); # For debugging
             raise HTTPException(status_code=500, detail=f"Error during processing: {str(e)}")
 
         end_time = time.time()
         latency_ms = (end_time - start_time) * 1000
 
         return ChatResponse(
-            reply=final_reply_text,
+            reply=final_reply_text, # Ensure final_reply_text is a string
             request_details=req,
             generated_tokens=generated_tokens_count,
             prompt_tokens=prompt_tokens_count,
