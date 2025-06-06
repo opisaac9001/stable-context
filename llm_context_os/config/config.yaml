@@ -16,14 +16,17 @@ chat_history_retriever:
   # Number of initial candidates to fetch from vector DB for re-ranking
   rerank_top_n_candidates: 25
   enable_hybrid_search: true  # Enable or disable hybrid (BM25 + dense) search
-  rrf_k_constant: 60          # RRF K constant for fusion scoring
+  rrf_k_constant: 60          # RRF K constant for fusion scoring (e.g., 60)
+  # Enable Hypothetical Document Embeddings (HyDE) for this retriever.
+  # If true, a hypothetical document is generated from the query and its embedding is used for dense search.
+  enable_hyde: false
 
 pdf_retriever:
   vector_db_path: "data/vector_dbs/yaml_configured_pdf_rag"
   # Default embedding model, e.g., 'BAAI/bge-base-en-v1.5' or 'sentence-transformers/all-MiniLM-L12-v2'
   embedding_model_name: "BAAI/bge-base-en-v1.5"
-  chunk_size: 750
-  chunk_overlap: 75
+  chunk_size: 750 # Used for "recursive" strategy
+  chunk_overlap: 75 # Used for "recursive" strategy
   recall_budget_tokens: 1536 # Example for PDF retriever
   # Model for re-ranking initial candidates, e.g., 'cross-encoder/ms-marco-MiniLM-L-6-v2'
   cross_encoder_model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -31,6 +34,40 @@ pdf_retriever:
   rerank_top_n_candidates: 25
   enable_hybrid_search: true  # Enable or disable hybrid (BM25 + dense) search
   rrf_k_constant: 60          # RRF K constant for fusion scoring
+
+  # --- Chunking Strategy ---
+  # Determines how PDF text is split into manageable chunks for embedding and retrieval.
+  # "recursive": Uses RecursiveCharacterTextSplitter for fixed-size chunking (controlled by `chunk_size` and `chunk_overlap`).
+  # "semantic": (Experimental) Uses sentence embeddings to find semantic breakpoints between sentences, aiming for more coherent chunks.
+  #   Requires `nltk` and its `punkt` tokenizer. Dependency: `nltk`
+  chunking_strategy: "recursive"
+
+  # --- Settings for Semantic Chunking (if `chunking_strategy` is "semantic") ---
+  # Embedding model used by the semantic chunker to calculate sentence similarities.
+  # If null (default), it uses the main `embedding_model_name` of the PdfRetriever.
+  # Example: "all-MiniLM-L6-v2" (a common lightweight SentenceTransformer).
+  semantic_chunker_embedding_model: null
+
+  # Method to determine semantic breakpoints between sentences.
+  # "percentile": Splits if the similarity between two adjacent sentences is below the Nth percentile of all similarities.
+  #               `semantic_chunker_breakpoint_threshold_amount` is this N (e.g., 5 for 5th percentile).
+  # "std_dev": (Future) Splits if similarity is below (mean - N * standard_deviations).
+  # "distance": (Future) Splits if cosine distance (1 - similarity) exceeds a threshold.
+  semantic_chunker_breakpoint_threshold_type: "percentile"
+
+  # Threshold value for the chosen breakpoint determination method.
+  # For "percentile": Use a value from 0 to 100 (e.g., 5 means split if similarity is in the lowest 5% of all observed similarities).
+  #                   Lower values mean fewer, larger chunks. Higher values mean more, smaller chunks.
+  # For "std_dev": (Future) e.g., 1.0, 1.5, 2.0 (number of standard deviations from the mean).
+  # For "distance": (Future) e.g., 0.5, 0.7 (cosine distance threshold).
+  semantic_chunker_breakpoint_threshold_amount: 5
+
+  # Minimum number of sentences to form a single semantic chunk.
+  # Helps prevent overly small or fragmented chunks.
+  semantic_chunker_min_chunk_sentences: 2
+  # Enable Hypothetical Document Embeddings (HyDE) for this retriever.
+  # If true, a hypothetical document is generated from the query and its embedding is used for dense search.
+  enable_hyde: false
 
 model_manager:
   default_idle_unload_sec: 1200 # e.g., 20 minutes
@@ -93,3 +130,20 @@ hf_snapshot_allow_patterns: null
 # huggingface_hub will usually auto-detect the repository type.
 # It's generally recommended to leave this as null unless specific behavior is required.
 hf_repo_type: null
+
+# --- HyDE (Hypothetical Document Embeddings) Configuration ---
+hyde:
+  # LLM identifier to use for generating hypothetical documents for HyDE.
+  # - "default": Uses the currently loaded main model via ModelManager. This is simpler but might use a large model.
+  # - Specific model ID (e.g., "TheBloke/Mistral-7B-Instruct-v0.1-GGUF"): Future enhancement could allow routing to a dedicated, possibly smaller/faster, model for HyDE.
+  llm_identifier: "default"
+
+  # Prompt template for instructing the LLM to generate a hypothetical document.
+  # The "{query}" placeholder will be replaced with the user's actual query.
+  # The goal is to create a document that, if it existed, would likely answer the query.
+  prompt_template: "Generate a concise, relevant document that could answer the following question. Focus on providing factual-sounding information directly related to the query's core subject: {query}"
+
+  # Maximum number of new tokens for the LLM to generate for the hypothetical document.
+  # Keeping this relatively low (e.g., 64-256 tokens) is recommended to ensure the
+  # hypothetical document is concise and generation is fast.
+  max_tokens_hyde_doc: 128

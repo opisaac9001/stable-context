@@ -1152,6 +1152,191 @@ class TestChatWithOpenAITools(unittest.TestCase):
             yield item
             await asyncio.sleep(0.001)
 
+# --- HyDE Integration Tests ---
+class TestChatWithHyDE(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        self.original_config = deepcopy(api_main.CONFIG) # For restoring after test-specific changes
+        self.original_pdf_retriever_enable_hyde = api_main.pdf_retriever.enable_hyde
+        self.original_chr_enable_hyde = api_main.chat_history_retriever.enable_hyde
+
+
+        # It's often cleaner to mock the specific instances used by the endpoint
+        self.patch_model_mgr = patch('llm_context_os.api.main.model_mgr')
+        self.patch_pdf_retriever_instance = patch('llm_context_os.api.main.pdf_retriever')
+        self.patch_chat_history_retriever_instance = patch('llm_context_os.api.main.chat_history_retriever')
+
+        self.mock_model_mgr = self.patch_model_mgr.start()
+        self.mock_pdf_retriever = self.patch_pdf_retriever_instance.start()
+        self.mock_chat_history_retriever = self.patch_chat_history_retriever_instance.start()
+
+        # Common mock runner setup
+        self.mock_runner = MagicMock(spec=APIRunner) # Or BaseRunner
+        self.mock_model_mgr.get.return_value = self.mock_runner
+
+        # Ensure retrievers have mockable embedding_model and encode method by default
+        self.mock_pdf_retriever.embedding_model = MagicMock()
+        self.mock_pdf_retriever.embedding_model.encode.return_value = MagicMock()
+        self.mock_pdf_retriever.embedding_model.encode.return_value.tolist.return_value = [0.1, 0.2, 0.3] # Default HyDE embedding
+        self.mock_pdf_retriever.retrieve_from_pdf.return_value = [{'r': 'retrieved_pdf_chunk', 'c': 'Mocked PDF snippet.'}]
+
+
+        self.mock_chat_history_retriever.embedding_model = MagicMock()
+        self.mock_chat_history_retriever.embedding_model.encode.return_value = MagicMock()
+        self.mock_chat_history_retriever.embedding_model.encode.return_value.tolist.return_value = [0.4, 0.5, 0.6] # Default HyDE embedding
+        self.mock_chat_history_retriever.retrieve.return_value = [{'r': 'retrieved_context', 'c': 'Mocked chat history snippet.'}]
+
+        ctx_mgr._messages = [] # Clear context manager messages
+        ctx_mgr._start = 0
+
+
+    def tearDown(self):
+        api_main.CONFIG = self.original_config # Restore global config
+        api_main.pdf_retriever.enable_hyde = self.original_pdf_retriever_enable_hyde
+        api_main.chat_history_retriever.enable_hyde = self.original_chr_enable_hyde
+        self.patch_model_mgr.stop()
+        self.patch_pdf_retriever_instance.stop()
+        self.patch_chat_history_retriever_instance.stop()
+        if model_mgr.current_runner: # Ensure any actual runner is unloaded
+            model_mgr.unload()
+        ctx_mgr._messages = []
+        ctx_mgr._start = 0
+
+    def test_chat_with_hyde_enabled_pdf_retriever(self):
+        # Configure HyDE to be enabled for PDF retriever
+        api_main.CONFIG['pdf_retriever']['enable_hyde'] = True
+        api_main.pdf_retriever.enable_hyde = True # Set on the (mocked) instance too
+        api_main.CONFIG['hyde']['prompt_template'] = "PDF HyDE: {query}"
+        hypothetical_doc_pdf = "This is a hypothetical PDF document about Paris."
+        final_response_text = "Final response after PDF RAG."
+
+        # First generate for HyDE, then for final response
+        self.mock_runner.generate.side_effect = [
+            (hypothetical_doc_pdf, {"prompt_tokens": 5, "completion_tokens": 10}), # HyDE doc
+            (final_response_text, {"prompt_tokens": 50, "completion_tokens": 20})  # Final response
+        ]
+
+        chat_payload = ChatRequest(
+            message="What about Paris?",
+            use_rag=True,
+            pdf_doc_ids_for_rag=["doc1"] # Trigger PDF RAG
+        ).model_dump()
+
+        response = self.client.post("/chat", json=chat_payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response['reply'], final_response_text)
+
+        # Check HyDE LLM call
+        self.mock_runner.generate.assert_any_call(prompt="PDF HyDE: What about Paris?", max_new_tokens=api_main.CONFIG['hyde']['max_tokens_hyde_doc'])
+        # Check embedding of hypothetical doc
+        self.mock_pdf_retriever.embedding_model.encode.assert_called_with(hypothetical_doc_pdf)
+        # Check retriever call
+        self.mock_pdf_retriever.retrieve_from_pdf.assert_called_once_with(
+            query_text="What about Paris?",
+            query_embedding_override=[0.1, 0.2, 0.3], # From mock_pdf_retriever.embedding_model.encode().tolist()
+            doc_ids=["doc1"]
+        )
+
+    def test_chat_with_hyde_enabled_chat_history_retriever(self):
+        api_main.CONFIG['chat_history_retriever']['enable_hyde'] = True
+        api_main.chat_history_retriever.enable_hyde = True # Set on the (mocked) instance
+        api_main.CONFIG['hyde']['prompt_template'] = "Chat HyDE: {query}"
+        hypothetical_doc_chat = "This is a hypothetical chat history snippet about meetings."
+        final_response_text = "Final response after Chat RAG."
+
+        self.mock_runner.generate.side_effect = [
+            (hypothetical_doc_chat, {"prompt_tokens": 6, "completion_tokens": 12}), # HyDE doc
+            (final_response_text, {"prompt_tokens": 55, "completion_tokens": 22})  # Final response
+        ]
+
+        chat_payload = ChatRequest(
+            message="Any meetings today?",
+            use_rag=True # Trigger Chat RAG (pdf_doc_ids_for_rag is None)
+        ).model_dump()
+
+        response = self.client.post("/chat", json=chat_payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response['reply'], final_response_text)
+
+        self.mock_runner.generate.assert_any_call(prompt="Chat HyDE: Any meetings today?", max_new_tokens=api_main.CONFIG['hyde']['max_tokens_hyde_doc'])
+        self.mock_chat_history_retriever.embedding_model.encode.assert_called_with(hypothetical_doc_chat)
+        self.mock_chat_history_retriever.retrieve.assert_called_once_with(
+            query_text="Any meetings today?",
+            query_embedding_override=[0.4, 0.5, 0.6], # From mock_chat_history_retriever.embedding_model.encode().tolist()
+            current_chat_history=ANY # Or more specific if needed
+        )
+
+    def test_chat_with_hyde_disabled(self):
+        api_main.CONFIG['pdf_retriever']['enable_hyde'] = False
+        api_main.pdf_retriever.enable_hyde = False
+        api_main.CONFIG['chat_history_retriever']['enable_hyde'] = False
+        api_main.chat_history_retriever.enable_hyde = False
+
+        final_response_text = "Response without HyDE."
+        # Only one call to generate for the final response, no HyDE call
+        self.mock_runner.generate.return_value = (final_response_text, {"prompt_tokens": 10, "completion_tokens": 5})
+
+        chat_payload = ChatRequest(
+            message="A query that could use RAG.",
+            use_rag=True,
+            pdf_doc_ids_for_rag=["doc1"] # Trigger PDF RAG
+        ).model_dump()
+
+        response = self.client.post("/chat", json=chat_payload)
+        self.assertEqual(response.status_code, 200)
+
+        # Check that main LLM generate was called once (for final response)
+        self.mock_runner.generate.assert_called_once()
+        # Check that retriever's embedding model was NOT called with a hypothetical doc
+        # (it would be called with original query by the retriever itself if override is None)
+        # Here, we check that the HyDE-specific call path wasn't taken.
+
+        # Assert that retrieve_from_pdf was called with query_embedding_override=None
+        self.mock_pdf_retriever.retrieve_from_pdf.assert_called_once_with(
+            query_text="A query that could use RAG.",
+            query_embedding_override=None,
+            doc_ids=["doc1"]
+        )
+        # Ensure the specific embedding mock for HyDE was not called
+        # This requires the mock on the retriever instance's model
+        self.mock_pdf_retriever.embedding_model.encode.assert_not_called()
+
+
+    def test_chat_with_hyde_llm_failure(self):
+        api_main.CONFIG['pdf_retriever']['enable_hyde'] = True
+        api_main.pdf_retriever.enable_hyde = True
+        api_main.CONFIG['hyde']['prompt_template'] = "PDF HyDE: {query}"
+
+        # First call (HyDE) raises an error, second call (final response) works
+        final_response_text = "Final response after HyDE failure."
+        self.mock_runner.generate.side_effect = [
+            Exception("LLM error during HyDE!"),
+            (final_response_text, {"prompt_tokens": 30, "completion_tokens": 10})
+        ]
+
+        chat_payload = ChatRequest(
+            message="Query for PDF RAG with failing HyDE",
+            use_rag=True,
+            pdf_doc_ids_for_rag=["doc_fail"]
+        ).model_dump()
+
+        response = self.client.post("/chat", json=chat_payload)
+        self.assertEqual(response.status_code, 200)
+        json_response = response.json()
+        self.assertEqual(json_response['reply'], final_response_text)
+
+        # HyDE LLM call was attempted
+        self.mock_runner.generate.assert_any_call(prompt="PDF HyDE: Query for PDF RAG with failing HyDE", max_new_tokens=ANY)
+        # Embedding of hypothetical doc should NOT have been called
+        self.mock_pdf_retriever.embedding_model.encode.assert_not_called()
+        # Retriever should be called with original query (override is None)
+        self.mock_pdf_retriever.retrieve_from_pdf.assert_called_once_with(
+            query_text="Query for PDF RAG with failing HyDE",
+            query_embedding_override=None,
+            doc_ids=["doc_fail"]
+        )
 
 if __name__ == '__main__':
     unittest.main()

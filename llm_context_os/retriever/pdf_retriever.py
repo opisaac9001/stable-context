@@ -6,6 +6,8 @@ import os
 import fitz  # PyMuPDF
 import shutil # For demo cleanup
 import time # For timestamp in metadata and demo cleanup delay
+import nltk
+import numpy as np
 
 # Attempt to import RecursiveCharacterTextSplitter
 LANGCHAIN_TEXT_SPLITTERS_AVAILABLE = False
@@ -60,14 +62,31 @@ class PdfRetriever:
                  cross_encoder_model_name: t.Optional[str] = "ms-marco-MiniLM-L-6-v2",
                  rerank_top_n_candidates: int = 20,
                  enable_hybrid_search: bool = True, # New default
-                 rrf_k_constant: int = 60): # New default
+                 rrf_k_constant: int = 60, # New default
+                 # Semantic Chunking specific parameters
+                 chunking_strategy: str = "recursive",
+                 semantic_chunker_embedding_model: t.Optional[str] = None,
+                 semantic_chunker_breakpoint_threshold_type: str = "percentile",
+                 semantic_chunker_breakpoint_threshold_amount: float = 5.0, # e.g. 5 for 5th percentile
+                 semantic_chunker_min_chunk_sentences: int = 2,
+                 enable_hyde: bool = False # HyDE specific
+                 ):
         self.vector_db_path = Path(vector_db_path)
         self.embedding_model_name = embedding_model_name
+        self.enable_hyde = enable_hyde # Store HyDE setting
         self.tokenizer = tokenizer
         self.recall_budget_tokens = recall_budget_tokens
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
+        self.chunk_size = chunk_size # Used for 'recursive' strategy
+        self.chunk_overlap = chunk_overlap # Used for 'recursive' strategy
         self.db_collection_name = collection_name or self.DEFAULT_COLLECTION_NAME
+
+        # Semantic chunking settings
+        self.chunking_strategy = chunking_strategy
+        self.semantic_chunker_embedding_model_name = semantic_chunker_embedding_model
+        self.semantic_chunker_breakpoint_threshold_type = semantic_chunker_breakpoint_threshold_type
+        self.semantic_chunker_breakpoint_threshold_amount = semantic_chunker_breakpoint_threshold_amount
+        self.semantic_chunker_min_chunk_sentences = semantic_chunker_min_chunk_sentences
+        self.semantic_sentence_embedder = None
 
         self.cross_encoder_model_name = cross_encoder_model_name
         self.rerank_top_n_candidates = rerank_top_n_candidates
@@ -80,9 +99,9 @@ class PdfRetriever:
         if SENTENCE_TRANSFORMERS_AVAILABLE and SentenceTransformer:
             try:
                 self.embedding_model = SentenceTransformer(self.embedding_model_name)
-                print(f"[PdfRetriever] Initialized SentenceTransformer (bi-encoder) model: {self.embedding_model_name}")
+                print(f"[PdfRetriever] Initialized main SentenceTransformer (bi-encoder) model: {self.embedding_model_name}")
             except Exception as e:
-                print(f"[PdfRetriever] Error initializing SentenceTransformer (bi-encoder) model '{self.embedding_model_name}': {e}")
+                print(f"[PdfRetriever] Error initializing main SentenceTransformer model '{self.embedding_model_name}': {e}")
 
             if self.cross_encoder_model_name:
                 try:
@@ -91,8 +110,36 @@ class PdfRetriever:
                 except Exception as e:
                     print(f"[PdfRetriever] Error initializing CrossEncoder model '{self.cross_encoder_model_name}': {e}")
                     self.cross_encoder = None # Ensure it's None if init fails
+
+            if self.chunking_strategy == "semantic":
+                sem_embed_model_to_load = self.semantic_chunker_embedding_model_name or self.embedding_model_name
+                try:
+                    self.semantic_sentence_embedder = SentenceTransformer(sem_embed_model_to_load)
+                    print(f"[PdfRetriever] Initialized SentenceTransformer for semantic chunking: {sem_embed_model_to_load}")
+                except Exception as e:
+                    print(f"[PdfRetriever] Error initializing semantic chunker SentenceTransformer model '{sem_embed_model_to_load}': {e}. Defaulting to 'recursive' chunking.")
+                    self.chunking_strategy = "recursive" # Fallback strategy
+                    self.semantic_sentence_embedder = None
         else:
-            print("[PdfRetriever] SentenceTransformers library not available. Embedding and CrossEncoder models not loaded.")
+            print("[PdfRetriever] SentenceTransformers library not available. Embedding, CrossEncoder, and Semantic Chunking models not loaded.")
+            if self.chunking_strategy == "semantic":
+                print("[PdfRetriever] Semantic chunking disabled due to missing SentenceTransformers. Defaulting to 'recursive'.")
+                self.chunking_strategy = "recursive" # Fallback strategy
+
+        # NLTK Punkt tokenizer download check (relevant for semantic chunking)
+        if self.chunking_strategy == "semantic":
+            try:
+                nltk.data.find('tokenizers/punkt')
+            except nltk.downloader.DownloadError:
+                print("[PdfRetriever] NLTK 'punkt' tokenizer not found. Attempting to download...")
+                try:
+                    nltk.download('punkt', quiet=True)
+                    print("[PdfRetriever] NLTK 'punkt' tokenizer downloaded successfully.")
+                except Exception as e_nltk:
+                    print(f"[PdfRetriever] Error downloading NLTK 'punkt': {e_nltk}. Semantic chunking may fail if 'punkt' is not available.")
+            except Exception as e_nltk_find: # Catch other potential errors from find()
+                 print(f"[PdfRetriever] Error finding NLTK 'punkt' tokenizer: {e_nltk_find}. Semantic chunking may fail.")
+
 
         self.db_client = None
         self.collection = None
@@ -208,19 +255,30 @@ class PdfRetriever:
             print(f"[PdfRetriever] {msg}")
             return False, msg, doc_id, 0
 
-        print(f"[PdfRetriever] Splitting text for document {doc_id}...")
+            print(f"[PdfRetriever] Splitting text for document {doc_id} using '{self.chunking_strategy}' strategy...")
         try:
-            # RecursiveCharacterTextSplitter's split_text method returns a list of strings.
-            raw_chunks = self.text_splitter.split_text(full_text_content)
+            if self.chunking_strategy == "semantic" and self.semantic_sentence_embedder:
+                raw_chunks = self._chunk_semantically(full_text_content)
+                print(f"[PdfRetriever] Semantic chunking produced {len(raw_chunks)} chunks for {doc_id}.")
+            elif self.text_splitter: # Existing recursive chunking
+                raw_chunks = self.text_splitter.split_text(full_text_content)
+                print(f"[PdfRetriever] Recursive chunking produced {len(raw_chunks)} chunks for {doc_id}.")
+            else: # Fallback if no splitter configured or semantic failed to init
+                raw_chunks = [full_text_content] # Treat full document as one chunk
+                print(f"[PdfRetriever] Warning: No text splitter available (semantic or recursive). Using full document as one chunk for {doc_id}.")
         except Exception as e_split:
-            msg = f"Error during text splitting for document {doc_id}: {e_split}"
+            msg = f"Error during text splitting for document {doc_id} with strategy '{self.chunking_strategy}': {e_split}"
             print(f"[PdfRetriever] {msg}")
             return False, msg, doc_id, 0
 
         if not self.embedding_model:
-            return False, "Embedding model not available. Cannot process document.", doc_id, 0
+            msg = "Embedding model not available. Cannot process document."
+            print(f"[PdfRetriever] {msg}")
+            return False, msg, doc_id, 0
         if not self.collection:
-            return False, "Vector database (ChromaDB collection) not available. Cannot process document.", doc_id, 0
+            msg = "Vector database (ChromaDB collection) not available. Cannot process document."
+            print(f"[PdfRetriever] {msg}")
+            return False, msg, doc_id, 0
 
         current_doc_chunk_texts = []
         current_doc_chunk_ids = []
@@ -280,8 +338,104 @@ class PdfRetriever:
             return False, msg, doc_id, 0
 
 
-    def retrieve_from_pdf(self, query_text: str, doc_ids: t.Optional[t.List[str]] = None, top_k: int = 3) -> t.List[t.Dict[str, str]]:
-        print(f"\n[PdfRetriever] retrieve_from_pdf called. Query: '{query_text[:50]}...', Target Docs: {doc_ids or 'all'}, Top K: {top_k}")
+    def _chunk_semantically(self, text: str) -> t.List[str]:
+        if not self.semantic_sentence_embedder:
+            print("[PdfRetriever] Semantic sentence embedder not available. Falling back to single chunk.")
+            return [text]
+        if not nltk: # Should not happen if init checks passed, but good for safety
+            print("[PdfRetriever] NLTK not available for semantic chunking. Falling back.")
+            return [text]
+
+        try:
+            sentences = nltk.sent_tokenize(text)
+        except Exception as e_sent_tokenize:
+            print(f"[PdfRetriever] Error tokenizing sentences with NLTK: {e_sent_tokenize}. Falling back to single chunk.")
+            return [text]
+
+        if len(sentences) < self.semantic_chunker_min_chunk_sentences:
+            print(f"[PdfRetriever] Number of sentences ({len(sentences)}) is less than min_chunk_sentences ({self.semantic_chunker_min_chunk_sentences}). Returning as single chunk.")
+            return [" ".join(sentences)] if sentences else [] # Join sentences if any, else empty list
+
+        try:
+            print(f"[PdfRetriever] Embedding {len(sentences)} sentences for semantic chunking...")
+            sentence_embeddings = self.semantic_sentence_embedder.encode(sentences)
+        except Exception as e_embed:
+            print(f"[PdfRetriever] Error embedding sentences for semantic chunking: {e_embed}. Falling back.")
+            return [text] # Fallback to full text as one chunk
+
+        if len(sentence_embeddings) <= 1: # Need at least 2 embeddings for similarity
+            return [" ".join(sentences)] if sentences else []
+
+        # Calculate cosine similarities between adjacent sentence embeddings
+        similarities = []
+        for i in range(len(sentence_embeddings) - 1):
+            emb1 = sentence_embeddings[i]
+            emb2 = sentence_embeddings[i+1]
+            norm1 = np.linalg.norm(emb1)
+            norm2 = np.linalg.norm(emb2)
+            if norm1 == 0 or norm2 == 0: # Handle zero vectors, though unlikely for ST
+                similarity = 0.0
+            else:
+                similarity = np.dot(emb1, emb2) / (norm1 * norm2)
+            similarities.append(similarity)
+
+        if not similarities: # Only one sentence after filtering, or some other edge case
+             return [" ".join(sentences)] if sentences else []
+
+        # Determine split points based on threshold type
+        if self.semantic_chunker_breakpoint_threshold_type == "percentile":
+            if not similarities: return [" ".join(sentences)] # Avoid error on empty similarities
+            threshold_val = np.percentile(similarities, self.semantic_chunker_breakpoint_threshold_amount)
+            print(f"[PdfRetriever] Semantic chunking: Percentile ({self.semantic_chunker_breakpoint_threshold_amount}th) threshold for similarity: {threshold_val:.4f}")
+        # Add other threshold types (std_dev, distance) here if implemented later
+        else: # Default or unknown, treat as a direct similarity threshold (though not fully specified)
+            print(f"[PdfRetriever] Warning: Unsupported semantic_chunker_breakpoint_threshold_type: {self.semantic_chunker_breakpoint_threshold_type}. Using raw amount as similarity threshold.")
+            threshold_val = self.semantic_chunker_breakpoint_threshold_amount # Assuming amount is a direct similarity value
+
+        chunks = []
+        current_chunk_sentences = []
+        for i, sentence in enumerate(sentences):
+            current_chunk_sentences.append(sentence)
+            # Check if this is a breakpoint (i.e., split *after* this sentence)
+            # Similarities list is one shorter than sentences list. similarities[i] is between sentences[i] and sentences[i+1]
+            if i < len(similarities):
+                if similarities[i] < threshold_val:
+                    if len(current_chunk_sentences) >= self.semantic_chunker_min_chunk_sentences:
+                        chunks.append(" ".join(current_chunk_sentences))
+                        current_chunk_sentences = []
+                    # else: continue accumulating to meet min_chunk_sentences, even if it crosses a low similarity point.
+                    # This logic might need refinement: do we prioritize min_length or similarity break?
+                    # Current: prioritize min_length if current chunk is too short, otherwise split.
+                    # If we split, the next chunk starts fresh.
+            # For the last sentence, if there's an accumulated chunk, add it.
+            elif i == len(sentences) - 1 and current_chunk_sentences:
+                 # If the last chunk is too short after a split, merge it with the previous one.
+                if chunks and len(current_chunk_sentences) < self.semantic_chunker_min_chunk_sentences:
+                    chunks[-1] += " " + " ".join(current_chunk_sentences)
+                else: # Add as a new chunk if it meets min length or is the only chunk
+                    chunks.append(" ".join(current_chunk_sentences))
+                current_chunk_sentences = [] # Clear for safety, though loop ends
+
+        # If loop finishes and current_chunk_sentences is not empty (e.g. no breakpoint hit for a while)
+        if current_chunk_sentences:
+            if chunks and len(current_chunk_sentences) < self.semantic_chunker_min_chunk_sentences : # If last chunk is too small and there's a previous one
+                 chunks[-1] += " " + " ".join(current_chunk_sentences) # Append to previous
+            elif not chunks and len(current_chunk_sentences) < self.semantic_chunker_min_chunk_sentences: # Only one chunk, but too small
+                 chunks.append(" ".join(current_chunk_sentences)) # Still add it
+            elif len(current_chunk_sentences) >= self.semantic_chunker_min_chunk_sentences:
+                 chunks.append(" ".join(current_chunk_sentences))
+
+
+        return chunks if chunks else [" ".join(sentences)] # Fallback to single chunk if logic produced nothing
+
+
+    def retrieve_from_pdf(self,
+                          query_text: str,
+                          doc_ids: t.Optional[t.List[str]] = None,
+                          top_k: int = 3,
+                          query_embedding_override: t.Optional[t.List[float]] = None
+                          ) -> t.List[t.Dict[str, str]]:
+        print(f"\n[PdfRetriever] retrieve_from_pdf called. Query: '{query_text[:50]}...', Target Docs: {doc_ids or 'all'}, Top K: {top_k}, HyDE active: {query_embedding_override is not None}")
 
         self._build_bm25_index_if_needed() # Ensure BM25 index is ready
 
@@ -295,17 +449,18 @@ class PdfRetriever:
             print("[PdfRetriever] Error: Tokenizer not available for budgeting. Cannot reliably size snippets.")
             return []
 
-        if not self.tokenizer:
-            print("[PdfRetriever] Error: Tokenizer not available for budgeting. Cannot reliably size snippets.")
-            return []
-
         doc_details_cache = {} # To store full details for RRF reconstruction & final snippet generation
         candidate_items_for_cross_encoder = []
+        dense_results_list = [] # To hold items from dense search if hybrid is off
 
         # --- Dense Retrieval (ChromaDB) ---
         try:
-            print(f"[PdfRetriever] Embedding query for dense retrieval: '{query_text[:100]}...'")
-            query_embedding = self.embedding_model.encode(query_text).tolist()
+            if query_embedding_override is not None:
+                query_embedding = query_embedding_override
+                print(f"[PdfRetriever] Using HyDE provided query embedding for dense retrieval.")
+            else:
+                print(f"[PdfRetriever] Embedding original query for dense retrieval: '{query_text[:100]}...'")
+                query_embedding = self.embedding_model.encode(query_text).tolist()
 
             chroma_filter: t.Optional[t.Dict[str, t.Any]] = None
             if doc_ids:

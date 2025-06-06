@@ -60,7 +60,8 @@ DEFAULT_CONFIG = {
         "cross_encoder_model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2", # Default from class
         "rerank_top_n_candidates": 20, # Default from class
         "enable_hybrid_search": True,
-        "rrf_k_constant": 60
+        "rrf_k_constant": 60,
+        "enable_hyde": False # Default for HyDE
     },
     "pdf_retriever": {
         "vector_db_path": "data/vector_dbs/api_default_pdf_rag",
@@ -70,12 +71,24 @@ DEFAULT_CONFIG = {
         "cross_encoder_model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2", # Default from class
         "rerank_top_n_candidates": 20, # Default from class
         "enable_hybrid_search": True,
-        "rrf_k_constant": 60
+        "rrf_k_constant": 60,
+        # New semantic chunking defaults
+        "chunking_strategy": "recursive",
+        "semantic_chunker_embedding_model": None,
+        "semantic_chunker_breakpoint_threshold_type": "percentile",
+        "semantic_chunker_breakpoint_threshold_amount": 5, # e.g., 5th percentile
+        "semantic_chunker_min_chunk_sentences": 2,
+        "enable_hyde": False # Default for HyDE
     },
     "model_manager": {"default_idle_unload_sec": 900},
     "token_estimator_for_rag_budgeting": {"type": "tiktoken", "model_name": "cl100k_base"},
     "model_discovery": { # Added model_discovery default
         "scan_directories": [] # Default to no scan directories
+    },
+    "hyde": { # New HyDE defaults
+        "llm_identifier": "default",
+        "prompt_template": "Generate a concise, relevant document that could answer the following question. Focus on providing factual-sounding information directly related to the query's core subject: {query}",
+        "max_tokens_hyde_doc": 128
     }
 }
 CONFIG = DEFAULT_CONFIG.copy() # Start with defaults
@@ -144,11 +157,13 @@ chat_history_retriever = ChatHistoryRetriever(
     embedding_model_name=chr_config.get('embedding_model_name'),
     cross_encoder_model_name=chr_config.get('cross_encoder_model_name'),
     rerank_top_n_candidates=chr_config.get('rerank_top_n_candidates'),
-    enable_hybrid_search=chr_config.get('enable_hybrid_search', True), # Get with default
-    rrf_k_constant=chr_config.get('rrf_k_constant', 60)               # Get with default
+    enable_hybrid_search=chr_config.get('enable_hybrid_search', True),
+    rrf_k_constant=chr_config.get('rrf_k_constant', 60),
+    enable_hyde=chr_config.get('enable_hyde', False) # Pass HyDE setting
 )
 print(f"ChatHistoryRetriever initialized with: budget={chat_history_retriever.recall_budget_tokens}, "
       f"db_path='{chat_history_retriever.vector_db_full_path}', model='{chat_history_retriever.embedding_model_name}', "
+      f"enable_hyde='{chat_history_retriever.enable_hyde}', "
       f"cross_encoder='{chat_history_retriever.cross_encoder_model_name}', rerank_top_n={chat_history_retriever.rerank_top_n_candidates}, "
       f"hybrid_search={chat_history_retriever.enable_hybrid_search}, rrf_k={chat_history_retriever.rrf_k_constant}")
 
@@ -162,10 +177,18 @@ pdf_retriever = PdfRetriever(
     chunk_overlap=pdf_retriever_config.get('chunk_overlap'),
     cross_encoder_model_name=pdf_retriever_config.get('cross_encoder_model_name'),
     rerank_top_n_candidates=pdf_retriever_config.get('rerank_top_n_candidates'),
-    enable_hybrid_search=pdf_retriever_config.get('enable_hybrid_search', True), # Get with default
-    rrf_k_constant=pdf_retriever_config.get('rrf_k_constant', 60)               # Get with default
+    enable_hybrid_search=pdf_retriever_config.get('enable_hybrid_search', True),
+    rrf_k_constant=pdf_retriever_config.get('rrf_k_constant', 60),
+    # Semantic chunking parameters
+    chunking_strategy=pdf_retriever_config.get('chunking_strategy', 'recursive'),
+    semantic_chunker_embedding_model=pdf_retriever_config.get('semantic_chunker_embedding_model'),
+    semantic_chunker_breakpoint_threshold_type=pdf_retriever_config.get('semantic_chunker_breakpoint_threshold_type', 'percentile'),
+    semantic_chunker_breakpoint_threshold_amount=pdf_retriever_config.get('semantic_chunker_breakpoint_threshold_amount', 5),
+    semantic_chunker_min_chunk_sentences=pdf_retriever_config.get('semantic_chunker_min_chunk_sentences', 2),
+    enable_hyde=pdf_retriever_config.get('enable_hyde', False) # Pass HyDE setting
 )
 print(f"PdfRetriever initialized with: db_path='{pdf_retriever.vector_db_path}', model='{pdf_retriever.embedding_model_name}', "
+      f"chunk_strategy='{pdf_retriever.chunking_strategy}', enable_hyde='{pdf_retriever.enable_hyde}', "
       f"cross_encoder='{pdf_retriever.cross_encoder_model_name}', rerank_top_n={pdf_retriever.rerank_top_n_candidates}, "
       f"hybrid_search={pdf_retriever.enable_hybrid_search}, rrf_k={pdf_retriever.rrf_k_constant}")
 
@@ -627,14 +650,89 @@ async def chat_endpoint(req: ChatRequest):
         if current_req.use_rag and not current_req.pdf_doc_ids_for_rag:
             print('[API /chat] Chat History RAG enabled. Retrieving snippets...')
             history_for_rag = current_ctx_mgr._messages[:-1] if len(current_ctx_mgr._messages) > 1 else []
-            chat_snippets = current_chat_history_retriever.retrieve(query_text=current_req.message, current_chat_history=history_for_rag)
+
+            # HyDE for Chat History
+            hyde_query_embedding_chat = None
+            # Check instance attribute on the CHR, which was set from its specific config section
+            if chat_history_retriever.enable_hyde:
+                hyde_config = CONFIG.get('hyde', {}) # Get global HyDE settings
+                # hyde_llm_id = hyde_config.get('llm_identifier', 'default') # Currently only default runner is used
+                hyde_prompt_template = hyde_config.get('prompt_template')
+                hyde_max_tokens = hyde_config.get('max_tokens_hyde_doc', 128)
+
+                if hyde_prompt_template:
+                    hyde_prompt = hyde_prompt_template.format(query=current_req.message)
+                    # Use the main loaded runner for HyDE generation.
+                    # A dedicated, possibly smaller/faster model for HyDE is a future enhancement.
+                    hyde_runner = runner # Use the already fetched main runner for the chat endpoint
+                    if hyde_runner:
+                        try:
+                            print(f"[API HyDE Chat] Generating hypothetical doc for query: '{current_req.message[:50]}...'")
+                            # Assuming runner.generate returns a dict with 'text' or a tuple (text, usage_dict)
+                            hypothetical_doc_response_obj = hyde_runner.generate(prompt=hyde_prompt, max_new_tokens=hyde_max_tokens)
+
+                            hypothetical_doc_text = None
+                            if isinstance(hypothetical_doc_response_obj, dict) and "text" in hypothetical_doc_response_obj:
+                                hypothetical_doc_text = hypothetical_doc_response_obj["text"]
+                            elif isinstance(hypothetical_doc_response_obj, tuple) and len(hypothetical_doc_response_obj) > 0 and isinstance(hypothetical_doc_response_obj[0], str):
+                                hypothetical_doc_text = hypothetical_doc_response_obj[0]
+                            elif isinstance(hypothetical_doc_response_obj, str): # Direct string response
+                                 hypothetical_doc_text = hypothetical_doc_response_obj
+
+                            if hypothetical_doc_text and chat_history_retriever.embedding_model:
+                                hyde_query_embedding_chat = chat_history_retriever.embedding_model.encode(hypothetical_doc_text).tolist()
+                                print(f"[API HyDE Chat] Generated & embedded hypothetical doc (len {len(hypothetical_doc_text)}): '{hypothetical_doc_text[:100]}...'")
+                            elif not hypothetical_doc_text:
+                                print("[API HyDE Chat] Warning: HyDE LLM generated empty or invalid document.")
+                        except Exception as e_hyde:
+                            print(f"[API HyDE Chat] Error during HyDE document generation: {e_hyde}")
+
+            chat_snippets = current_chat_history_retriever.retrieve(
+                query_text=current_req.message,
+                query_embedding_override=hyde_query_embedding_chat, # Pass potential HyDE embedding
+                current_chat_history=history_for_rag
+            )
             retrieved_snippets.extend(chat_snippets)
             print(f'[API /chat] Retrieved {len(chat_snippets)} CHAT snippets.')
 
         if current_req.use_rag and current_req.pdf_doc_ids_for_rag:
             print(f'[API /chat] PDF RAG enabled for doc IDs: {current_req.pdf_doc_ids_for_rag}. Retrieving snippets...')
+
+            # HyDE for PDF
+            hyde_query_embedding_pdf = None
+            if pdf_retriever.enable_hyde: # Check instance attribute
+                hyde_config = CONFIG.get('hyde', {}) # Global HyDE settings
+                # hyde_llm_id = hyde_config.get('llm_identifier', 'default')
+                hyde_prompt_template = hyde_config.get('prompt_template')
+                hyde_max_tokens = hyde_config.get('max_tokens_hyde_doc', 128)
+
+                if hyde_prompt_template:
+                    hyde_prompt = hyde_prompt_template.format(query=current_req.message)
+                    hyde_runner = runner # Use the main chat runner
+                    if hyde_runner:
+                        try:
+                            print(f"[API HyDE PDF] Generating hypothetical doc for query: '{current_req.message[:50]}...'")
+                            hypothetical_doc_response_obj = hyde_runner.generate(prompt=hyde_prompt, max_new_tokens=hyde_max_tokens)
+
+                            hypothetical_doc_text = None
+                            if isinstance(hypothetical_doc_response_obj, dict) and "text" in hypothetical_doc_response_obj:
+                                hypothetical_doc_text = hypothetical_doc_response_obj["text"]
+                            elif isinstance(hypothetical_doc_response_obj, tuple) and len(hypothetical_doc_response_obj) > 0 and isinstance(hypothetical_doc_response_obj[0], str):
+                                hypothetical_doc_text = hypothetical_doc_response_obj[0]
+                            elif isinstance(hypothetical_doc_response_obj, str):
+                                 hypothetical_doc_text = hypothetical_doc_response_obj
+
+                            if hypothetical_doc_text and pdf_retriever.embedding_model:
+                                hyde_query_embedding_pdf = pdf_retriever.embedding_model.encode(hypothetical_doc_text).tolist()
+                                print(f"[API HyDE PDF] Generated & embedded hypothetical doc (len {len(hypothetical_doc_text)}): '{hypothetical_doc_text[:100]}...'")
+                            elif not hypothetical_doc_text:
+                                print("[API HyDE PDF] Warning: HyDE LLM generated empty or invalid document.")
+                        except Exception as e_hyde_pdf:
+                             print(f"[API HyDE PDF] Error during HyDE document generation: {e_hyde_pdf}")
+
             pdf_snippets = current_pdf_retriever.retrieve_from_pdf(
                 query_text=current_req.message,
+                query_embedding_override=hyde_query_embedding_pdf, # Pass potential HyDE embedding
                 doc_ids=current_req.pdf_doc_ids_for_rag
             )
             retrieved_snippets.extend(pdf_snippets)

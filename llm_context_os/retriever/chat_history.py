@@ -72,8 +72,9 @@ class ChatHistoryRetriever:
                  collection_name: t.Optional[str] = None,
                  cross_encoder_model_name: t.Optional[str] = "ms-marco-MiniLM-L-6-v2",
                  rerank_top_n_candidates: int = 20,
-                 enable_hybrid_search: bool = True, # New default
-                 rrf_k_constant: int = 60): # New default
+                 enable_hybrid_search: bool = True,
+                 rrf_k_constant: int = 60,
+                 enable_hyde: bool = False): # HyDE specific
         """
         Initializes the ChatHistoryRetriever.
         """
@@ -83,6 +84,7 @@ class ChatHistoryRetriever:
         self.rerank_top_n_candidates = rerank_top_n_candidates
         self.enable_hybrid_search = enable_hybrid_search
         self.rrf_k_constant = rrf_k_constant
+        self.enable_hyde = enable_hyde # Store HyDE setting
 
         self.db_collection_name = collection_name or self.DEFAULT_COLLECTION_NAME
         self.vector_db_full_path = os.path.join(vector_db_path, self.DEFAULT_DB_SUBDIR)
@@ -226,7 +228,13 @@ class ChatHistoryRetriever:
             return None
 
 
-    def retrieve(self, query_text: str, current_chat_history: t.Optional[t.List[t.Dict[str, str]]] = None, n_results: int = 5) -> t.List[t.Dict[str, str]]:
+    def retrieve(self,
+                 query_text: str,
+                 current_chat_history: t.Optional[t.List[t.Dict[str, str]]] = None,
+                 n_results: int = 5,
+                 query_embedding_override: t.Optional[t.List[float]] = None
+                 ) -> t.List[t.Dict[str, str]]:
+        print(f"\n[ChatHistoryRetriever] retrieve called. Query: '{query_text[:50]}...', HyDE active: {query_embedding_override is not None}")
         self._build_bm25_index_if_needed() # Ensure BM25 index is ready
 
         if not self.embedding_model or not self.collection or not self.tokenizer:
@@ -248,8 +256,12 @@ class ChatHistoryRetriever:
         # --- Dense Retrieval (ChromaDB) ---
         if has_vector_content:
             try:
-                print(f"[ChatHistoryRetriever] Embedding query for dense retrieval: '{query_text[:100]}...'")
-                query_embedding = self.embedding_model.encode(query_text).tolist()
+                if query_embedding_override is not None:
+                    query_embedding = query_embedding_override
+                    print(f"[ChatHistoryRetriever] Using HyDE provided query embedding for dense retrieval.")
+                else:
+                    print(f"[ChatHistoryRetriever] Embedding original query for dense retrieval: '{query_text[:100]}...'")
+                    query_embedding = self.embedding_model.encode(query_text).tolist()
 
                 num_dense_to_fetch = self.rerank_top_n_candidates
 

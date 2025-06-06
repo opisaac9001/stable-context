@@ -11,19 +11,13 @@ from llm_context_os.retriever.pdf_retriever import (
     PdfRetriever,
     LANGCHAIN_TEXT_SPLITTERS_AVAILABLE,
     SENTENCE_TRANSFORMERS_AVAILABLE,
-    CHROMADB_AVAILABLE
+    CHROMADB_AVAILABLE,
+    # PdfRetriever now imports nltk and numpy directly
 )
-# PyPDF2 is imported directly in the module, so we'll patch its PdfReader
-# tiktoken availability is handled by PdfRetriever's internal tokenizer fallback
+import nltk # For mocking nltk.sent_tokenize and nltk.download
+import numpy as np # For creating dummy embeddings
 
-# --- Conditional import for PyPDF2 to check its availability for skipping tests ---
-PYPDF2_AVAILABLE = False
-try:
-    from PyPDF2 import PdfReader # Check if it's importable for the test suite itself
-    PYPDF2_AVAILABLE = True # Keep for conditional skipping if some tests remain for it, though likely remove
-except ImportError:
-    PYPDF2_AVAILABLE = False # Ensure it's False if not found
-    PdfReader = None # type: ignore
+# PyPDF2 related imports are no longer needed as PyMuPDF (fitz) is the primary PDF parser.
 
 FITZ_AVAILABLE = False
 try:
@@ -32,6 +26,10 @@ try:
 except ImportError:
     fitz = None # type: ignore
     print("PyMuPDF (fitz) not installed. Some PdfRetriever tests might be skipped or fail.")
+
+# Mock NLTK data find and download for tests
+@patch('nltk.data.find')
+@patch('nltk.download')
 
 
 @unittest.skipUnless(
@@ -47,42 +45,61 @@ except ImportError:
 @patch('llm_context_os.retriever.pdf_retriever.chromadb.PersistentClient')
 class TestPdfRetriever(unittest.TestCase):
 
-    def setUp(self, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi): # Order matters
-        # Store mock classes passed by decorators
+    def setUp(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi): # Order of mocks matters
+        # Store mock classes/functions passed by decorators
+        self.MockNltkDownload = MockNltkDownload
+        self.MockNltkDataFind = MockNltkDataFind
         self.MockFitzOpen = MockFitzOpen
         self.MockSplitter = MockSplitter
         self.MockSentenceTransformer = MockSentenceTransformer
         self.MockChromaDBClient = MockChromaDBClient
         self.MockBM25Okapi = MockBM25Okapi
 
+        # Default behavior for nltk.data.find (e.g., 'punkt' is found)
+        self.MockNltkDataFind.return_value = True
 
         # Configure the mock instances that will be returned by the patched constructors/functions
         self.mock_fitz_doc_instance = self.MockFitzOpen.return_value
         self.mock_fitz_page_instance = MagicMock()
-        self.mock_fitz_page_instance.get_text.return_value = "Page 1 text from PyMuPDF."
+        self.mock_fitz_page_instance.get_text.return_value = "Page 1 text from PyMuPDF. Sentence two. Sentence three."
         self.mock_fitz_doc_instance.load_page.return_value = self.mock_fitz_page_instance
-        self.mock_fitz_doc_instance.__len__.return_value = 1 # Simulate one page
+        self.mock_fitz_doc_instance.__len__.return_value = 1
 
         self.mock_splitter_instance = self.MockSplitter.return_value
-        self.mock_splitter_instance.split_text.return_value = ["PyMuPDF chunk 1.", "PyMuPDF chunk 2."]
+        self.mock_splitter_instance.split_text.return_value = ["Recursive chunk 1.", "Recursive chunk 2."]
 
-        # Mock for the bi-encoder (embedding_model)
-        self.mock_bi_encoder_instance = MagicMock()
-        mock_bi_embedding_array = MagicMock()
-        mock_bi_embedding_array.tolist.return_value = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]] # Embeddings for two chunks
-        self.mock_bi_encoder_instance.encode.return_value = mock_bi_embedding_array
+        # Mocks for SentenceTransformer instances
+        self.mock_main_embedding_model_instance = MagicMock(name="MainEmbeddingModel")
+        # self.mock_main_embedding_model_instance.encode.return_value.tolist.return_value = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        # Configure .encode(...).tolist() in two steps for clarity if needed, or direct for simple cases.
+        # For now, encode will return a mock that has a tolist method.
+        mock_main_encode_output = MagicMock()
+        mock_main_encode_output.tolist.return_value = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        self.mock_main_embedding_model_instance.encode.return_value = mock_main_encode_output
 
-        # Mock for the cross-encoder (if initialized)
-        self.mock_cross_encoder_instance = MagicMock()
-        # self.mock_cross_encoder_instance.predict.return_value = [0.9, 0.1] # Example scores
+
+        self.mock_semantic_embedder_instance = MagicMock(name="SemanticChunkerEmbeddingModel")
+        # Default for semantic embedder (can be overridden in tests)
+        # This should return a direct numpy array as per SentenceTransformer.encode()
+        self.mock_semantic_embedder_instance.encode.return_value = np.array([
+            [0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [0.9, 0.9, 0.9]
+        ])
+
+
+        self.mock_cross_encoder_instance = MagicMock(name="CrossEncoderModel")
 
         # SentenceTransformer class mock will provide these instances based on model name
-        def sentence_transformer_side_effect(model_name_or_path):
+        def sentence_transformer_side_effect(model_name_or_path, **kwargs): # Added **kwargs
             if model_name_or_path == 'fake-embedding-model':
-                return self.mock_bi_encoder_instance
+                return self.mock_main_embedding_model_instance
+            elif model_name_or_path == 'fake-semantic-chunker-model' or \
+                 (self.retriever and model_name_or_path == self.retriever.embedding_model_name and self.retriever.chunking_strategy == "semantic" and not self.retriever.semantic_chunker_embedding_model_name): # if semantic model is None and strategy is semantic
+                return self.mock_semantic_embedder_instance
             elif model_name_or_path == 'fake-cross-encoder-model':
                 return self.mock_cross_encoder_instance
-            raise ValueError(f"Unexpected model name for SentenceTransformer mock: {model_name_or_path}")
+            # Fallback for unexpected model names, useful for debugging tests
+            print(f"Warning: MockSentenceTransformer called with unhandled model name: {model_name_or_path}")
+            return MagicMock()
         self.MockSentenceTransformer.side_effect = sentence_transformer_side_effect
 
         self.mock_chromadb_client_instance = self.MockChromaDBClient.return_value
@@ -91,26 +108,27 @@ class TestPdfRetriever(unittest.TestCase):
         self.mock_chromadb_client_instance.get_or_create_collection.return_value = self.mock_collection
 
         self.mock_tokenizer = MagicMock()
-        def mock_encode_for_len(text_input):
-            # Simple mock: token count is number of words
-            return [1] * len(text_input.split())
-        self.mock_tokenizer.encode = MagicMock(side_effect=mock_encode_for_len)
+        self.mock_tokenizer.encode = MagicMock(side_effect=lambda t: [1] * len(t.split()))
         self.mock_tokenizer.count_tokens = MagicMock(side_effect=lambda t: len(t.split()))
 
         self.mock_bm25_index_instance = self.MockBM25Okapi.return_value
-        self.mock_bm25_index_instance.get_scores.return_value = [] # Default to no BM25 scores
-
+        self.mock_bm25_index_instance.get_scores.return_value = []
 
         self.test_db_base_path = "temp_test_pdf_retriever_db_unit"
-        # Initialize PdfRetriever for each test
-        self._reinit_retriever() # Calls with default params including hybrid search enabled
+        self._reinit_retriever()
 
 
     def _reinit_retriever(self,
                           cross_encoder_name='fake-cross-encoder-model',
                           rerank_top_n=5,
-                          enable_hybrid_search=True, # New param
-                          rrf_k=60):                 # New param
+                          enable_hybrid_search=True,
+                          rrf_k=60,
+                          chunking_strategy="recursive", # New param for chunking
+                          semantic_chunker_model_name=None, # New
+                          semantic_breakpoint_type="percentile", # New
+                          semantic_breakpoint_amount=5.0, # New
+                          semantic_min_sentences=2 # New
+                          ):
         # Helper to re-initialize retriever
         self.retriever = PdfRetriever(
             vector_db_path=self.test_db_base_path,
@@ -121,29 +139,44 @@ class TestPdfRetriever(unittest.TestCase):
             chunk_overlap=2,
             cross_encoder_model_name=cross_encoder_name,
             rerank_top_n_candidates=rerank_top_n,
-            enable_hybrid_search=enable_hybrid_search, # Pass to constructor
-            rrf_k_constant=rrf_k                     # Pass to constructor
+            enable_hybrid_search=enable_hybrid_search,
+            rrf_k_constant=rrf_k,
+            # Semantic chunking params
+            chunking_strategy=chunking_strategy,
+            semantic_chunker_embedding_model=semantic_chunker_model_name,
+            semantic_chunker_breakpoint_threshold_type=semantic_breakpoint_type,
+            semantic_chunker_breakpoint_threshold_amount=semantic_breakpoint_amount,
+            semantic_chunker_min_chunk_sentences=semantic_min_sentences
         )
         # Reset instance mocks
         self.mock_fitz_doc_instance.reset_mock()
         self.mock_fitz_page_instance.reset_mock()
         self.mock_splitter_instance.reset_mock()
-        self.mock_bi_encoder_instance.reset_mock()
+        self.mock_main_embedding_model_instance.reset_mock() # Changed from mock_bi_encoder_instance
+        self.mock_semantic_embedder_instance.reset_mock() # Added
         self.mock_cross_encoder_instance.reset_mock()
         self.mock_chromadb_client_instance.reset_mock()
         self.mock_collection.reset_mock()
-        self.mock_bm25_index_instance.reset_mock() # Reset BM25 mock
+        self.mock_bm25_index_instance.reset_mock()
 
-        # Re-apply default return values
+        # Re-apply default return values and behaviors
         self.MockFitzOpen.return_value = self.mock_fitz_doc_instance
         self.mock_fitz_doc_instance.load_page.return_value = self.mock_fitz_page_instance
         self.mock_fitz_doc_instance.__len__.return_value = 1
-        self.mock_fitz_page_instance.get_text.return_value = "Page 1 text from PyMuPDF."
+        self.mock_fitz_page_instance.get_text.return_value = "Page 1 text from PyMuPDF. Sentence two. Sentence three."
 
         self.MockSplitter.return_value = self.mock_splitter_instance
-        self.mock_splitter_instance.split_text.return_value = ["PyMuPDF chunk 1.", "PyMuPDF chunk 2."]
+        self.mock_splitter_instance.split_text.return_value = ["Recursive chunk 1.", "Recursive chunk 2."]
 
-        self.mock_bi_encoder_instance.encode.return_value.tolist.return_value = [[0.1,0.2,0.3],[0.4,0.5,0.6]]
+        # Main embedding model encode output
+        mock_main_encode_output = MagicMock()
+        mock_main_encode_output.tolist.return_value = [[0.1,0.2,0.3],[0.4,0.5,0.6]]
+        self.mock_main_embedding_model_instance.encode.return_value = mock_main_encode_output
+
+        # Semantic embedder encode output (direct numpy array)
+        self.mock_semantic_embedder_instance.encode.return_value = np.array([
+            [0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [0.9, 0.9, 0.9]
+        ])
 
         self.MockChromaDBClient.return_value = self.mock_chromadb_client_instance
         self.mock_chromadb_client_instance.get_or_create_collection.return_value = self.mock_collection
@@ -182,23 +215,35 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertIs(self.retriever.tokenizer, self.mock_tokenizer)
 
     @patch('llm_context_os.retriever.pdf_retriever.LANGCHAIN_TEXT_SPLITTERS_AVAILABLE', False)
-    def test_initialization_no_splitter_lib(self, MockPdfReader, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        retriever_no_splitter = PdfRetriever(vector_db_path=self.test_db_base_path, tokenizer=self.mock_tokenizer)
-        self.assertIsNone(retriever_no_splitter.text_splitter)
+    def test_initialization_no_splitter_lib(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        # Ensure that when re-initing, chunking_strategy is recursive if splitter is not available.
+        # The PdfRetriever init logic itself doesn't set strategy based on LANGCHAIN_TEXT_SPLITTERS_AVAILABLE,
+        # but rather if self.text_splitter ends up being None.
+        with patch('llm_context_os.retriever.pdf_retriever.RecursiveCharacterTextSplitter', None): # Make it None after import
+             retriever_no_splitter = PdfRetriever(vector_db_path=self.test_db_base_path, tokenizer=self.mock_tokenizer, chunking_strategy="recursive")
+             self.assertIsNone(retriever_no_splitter.text_splitter)
+
 
     @patch('llm_context_os.retriever.pdf_retriever.SENTENCE_TRANSFORMERS_AVAILABLE', False)
-    def test_initialization_no_embedding_lib(self, MockPdfReader, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        retriever_no_embed = PdfRetriever(vector_db_path=self.test_db_base_path, tokenizer=self.mock_tokenizer)
+    def test_initialization_no_embedding_lib(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        # Side effect for SentenceTransformer should be None or raise error if SENTENCE_TRANSFORMERS_AVAILABLE is False
+        original_st_side_effect = self.MockSentenceTransformer.side_effect
+        self.MockSentenceTransformer.side_effect = Exception("ST not available")
+        retriever_no_embed = PdfRetriever(vector_db_path=self.test_db_base_path, tokenizer=self.mock_tokenizer, chunking_strategy="semantic")
         self.assertIsNone(retriever_no_embed.embedding_model)
+        self.assertIsNone(retriever_no_embed.semantic_sentence_embedder)
+        self.assertEqual(retriever_no_embed.chunking_strategy, "recursive") # Should fallback
+        self.MockSentenceTransformer.side_effect = original_st_side_effect # Restore
 
     @patch('llm_context_os.retriever.pdf_retriever.CHROMADB_AVAILABLE', False)
-    def test_initialization_no_chromadb_lib(self, MockPdfReader, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
+    def test_initialization_no_chromadb_lib(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         retriever_no_db = PdfRetriever(vector_db_path=self.test_db_base_path, tokenizer=self.mock_tokenizer)
         self.assertIsNone(retriever_no_db.db_client)
         self.assertIsNone(retriever_no_db.collection)
 
-    def test_upload_document_success(self, MockPdfReader, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        fake_pdf_path_str = "dummy_document.pdf"
+    def test_upload_document_success_recursive_strategy(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        self._reinit_retriever(chunking_strategy="recursive")
+        fake_pdf_path_str = "dummy_document_recursive.pdf"
         with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
@@ -214,21 +259,21 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertIn("Successfully extracted, embedded, and stored", msg)
 
         self.MockFitzOpen.assert_called_with(fake_pdf_path_str)
-        self.mock_fitz_doc_instance.load_page.assert_called_with(0) # Page number 0 for first page
+        self.mock_fitz_doc_instance.load_page.assert_called_with(0)
         self.mock_fitz_page_instance.get_text.assert_called_with("text")
-        self.mock_splitter_instance.split_text.assert_called_with("Page 1 text from PyMuPDF.")
-        self.mock_bi_encoder_instance.encode.assert_called_with(["PyMuPDF chunk 1.", "PyMuPDF chunk 2."])
+        self.mock_splitter_instance.split_text.assert_called_with("Page 1 text from PyMuPDF. Sentence two. Sentence three.")
+        self.mock_main_embedding_model_instance.encode.assert_called_with(["Recursive chunk 1.", "Recursive chunk 2."]) # Changed from mock_bi_encoder_instance
 
         self.mock_collection.add.assert_called_once()
         add_args = self.mock_collection.add.call_args[1]
         self.assertEqual(len(add_args['ids']), 2)
         self.assertEqual(add_args['embeddings'], [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
-        self.assertEqual(add_args['documents'], ["PyMuPDF chunk 1.", "PyMuPDF chunk 2."])
-        self.assertEqual(add_args['metadatas'][0]['doc_id'], "dummy_document")
+        self.assertEqual(add_args['documents'], ["Recursive chunk 1.", "Recursive chunk 2."])
+        self.assertEqual(add_args['metadatas'][0]['doc_id'], "dummy_document_recursive")
         self.assertEqual(add_args['metadatas'][0]['pdf_path'], fake_pdf_path_str)
 
-    def test_upload_document_pdf_read_error(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        self.MockFitzOpen.side_effect = Exception("PyMuPDF Read Error") # Simulate fitz.open failing
+    def test_upload_document_pdf_read_error(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        self.MockFitzOpen.side_effect = Exception("PyMuPDF Read Error")
         fake_pdf_path_str = "error.pdf"
         with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
@@ -240,10 +285,10 @@ class TestPdfRetriever(unittest.TestCase):
 
         self.assertFalse(success)
         self.assertIn("Error parsing PDF file error.pdf with PyMuPDF: PyMuPDF Read Error", msg)
-        self.assertEqual(doc_id, "error") # doc_id should still be derived if path was valid initially
+        self.assertEqual(doc_id, "error")
 
-    def test_upload_document_no_text_extracted(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        self.mock_fitz_page_instance.get_text.return_value = "" # Simulate no text from page
+    def test_upload_document_no_text_extracted(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        self.mock_fitz_page_instance.get_text.return_value = ""
         fake_pdf_path_str = "empty_text.pdf"
         with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
@@ -257,8 +302,8 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertIn("No text could be extracted from PDF using PyMuPDF", msg)
         self.assertEqual(num_chunks, 0)
 
-    def test_upload_document_embedding_error(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        self.mock_bi_encoder_instance.encode.side_effect = Exception("Embedding Error")
+    def test_upload_document_embedding_error(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        self.mock_main_embedding_model_instance.encode.side_effect = Exception("Embedding Error") # Changed from mock_bi_encoder_instance
         fake_pdf_path_str = "embed_error.pdf"
         with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
@@ -271,7 +316,7 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("Error during embedding or storing chunks", msg)
 
-    def test_upload_document_db_add_error(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
+    def test_upload_document_db_add_error(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self.mock_collection.add.side_effect = Exception("DB Add Error")
         fake_pdf_path_str = "db_add_error.pdf"
         with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
@@ -285,8 +330,135 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("Error during embedding or storing chunks", msg)
 
-    def test_retrieve_from_pdf_success_no_rerank(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        # Ensure no cross-encoder for this test
+    # Test for NLTK punkt download process
+    def test_nltk_punkt_download_flow(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        # First call to find() raises DownloadError, second call (after download) succeeds
+        MockNltkDataFind.side_effect = [nltk.downloader.DownloadError, True]
+        MockNltkDownload.return_value = True # Simulate successful download
+
+        self._reinit_retriever(chunking_strategy="semantic")
+
+        MockNltkDataFind.assert_any_call('tokenizers/punkt')
+        MockNltkDownload.assert_called_once_with('punkt', quiet=True)
+        self.assertIsNotNone(self.retriever.semantic_sentence_embedder) # Should still init if download "succeeds"
+
+    # --- Semantic Chunking Specific Tests ---
+    @patch('nltk.sent_tokenize')
+    def test_chunk_semantically_logic(self, mock_sent_tokenize, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        self._reinit_retriever(
+            chunking_strategy="semantic",
+            semantic_chunker_model_name='fake-semantic-chunker-model', # Ensure semantic_sentence_embedder is set
+            semantic_breakpoint_type="percentile",
+            semantic_breakpoint_amount=25, # Split if similarity < 25th percentile
+            semantic_min_sentences=1
+        )
+        self.assertIsNotNone(self.retriever.semantic_sentence_embedder)
+
+        sample_text = "Sentence one. Sentence two is related. Sentence three is very different. Sentence four is a bit related to three."
+        mock_sentences = ["Sentence one.", "Sentence two is related.", "Sentence three is very different.", "Sentence four is a bit related to three."]
+        mock_sent_tokenize.return_value = mock_sentences
+
+        # Mock embeddings for clearer splits: S1, S2 close. S3 far. S4 far.
+        clear_mock_embeddings = np.array([
+            [1.0, 0.0, 0.0], # S1
+            [0.9, 0.1, 0.0], # S2 (similar to S1)
+            [0.0, 1.0, 0.0], # S3 (different from S1/S2)
+            [0.0, 0.9, 0.1]  # S4 (similar to S3, different from S1/S2)
+        ])
+        # Expected similarities: sim(S1,S2) ~0.9. sim(S2,S3) ~0.01. sim(S3,S4) ~0.9.
+        # If percentile amount is 25, threshold will be around 0.01. So split S2-S3.
+        self.mock_semantic_embedder_instance.encode.return_value = clear_mock_embeddings # Use the correct mock instance
+
+        expected_chunks = [
+            "Sentence one. Sentence two is related.",
+            "Sentence three is very different. Sentence four is a bit related to three."
+        ]
+
+        # Mock numpy.percentile to return a value that causes the desired split
+        # Given similarities [~0.9, ~0.01, ~0.9], the 25th percentile would be ~0.01
+        # If threshold_val is 0.1, then sim(S2,S3) < 0.1, so it splits.
+        with patch('numpy.percentile', return_value=0.1) as mock_np_percentile:
+            chunks = self.retriever._chunk_semantically(sample_text)
+
+        mock_sent_tokenize.assert_called_once_with(sample_text)
+        self.mock_semantic_embedder_instance.encode.assert_called_once_with(mock_sentences)
+        mock_np_percentile.assert_called_once()
+        self.assertEqual(chunks, expected_chunks)
+
+
+    @patch('llm_context_os.retriever.pdf_retriever.PdfRetriever._chunk_semantically')
+    def test_upload_document_with_semantic_chunking_strategy(self, mock_chunk_semantically, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        self._reinit_retriever(chunking_strategy="semantic", semantic_chunker_model_name='fake-semantic-chunker-model')
+        self.assertTrue(self.retriever.chunking_strategy == "semantic")
+        self.assertIsNotNone(self.retriever.semantic_sentence_embedder)
+
+        predefined_semantic_chunks = ["Semantic chunk A.", "Semantic chunk B is longer."]
+        mock_chunk_semantically.return_value = predefined_semantic_chunks
+
+        fake_pdf_path = "semantic_test.pdf"
+        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+            mock_path_instance = MagicMock()
+            mock_path_instance.exists.return_value = True
+            mock_path_instance.is_file.return_value = True
+            mock_path_instance.stem = "semantic_test"
+            mock_path_constructor.return_value = mock_path_instance
+
+            self.retriever.upload_document(fake_pdf_path)
+
+        mock_chunk_semantically.assert_called_once_with("Page 1 text from PyMuPDF. Sentence two. Sentence three.")
+        self.mock_splitter_instance.split_text.assert_not_called()
+
+        self.mock_main_embedding_model_instance.encode.assert_called_with(predefined_semantic_chunks)
+        self.mock_collection.add.assert_called_once()
+        added_docs = self.mock_collection.add.call_args[1]['documents']
+        self.assertEqual(added_docs, predefined_semantic_chunks)
+
+
+    def test_upload_document_semantic_chunking_fallback_to_recursive(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
+        # Simulate SentenceTransformer failing to load semantic_sentence_embedder
+        # Store original side_effect
+        original_st_side_effect = self.MockSentenceTransformer.side_effect
+
+        def sentence_transformer_error_side_effect(model_name_or_path, **kwargs):
+            if model_name_or_path == 'fake-embedding-model': # Main model loads fine
+                return self.mock_main_embedding_model_instance
+            elif model_name_or_path == 'fake-semantic-chunker-model-intended-to-fail':
+                print(f"Simulating load failure for: {model_name_or_path}") # Debug print
+                raise ValueError("Simulated failure to load semantic model")
+            elif model_name_or_path == 'fake-cross-encoder-model':
+                return self.mock_cross_encoder_instance
+            print(f"Mock ST called with unhandled model: {model_name_or_path}")
+            return MagicMock() # Fallback for other unexpected calls
+        self.MockSentenceTransformer.side_effect = sentence_transformer_error_side_effect
+
+        # Reinitialize retriever, expecting it to fallback
+        self._reinit_retriever(
+            chunking_strategy="semantic",
+            semantic_chunker_model_name='fake-semantic-chunker-model-intended-to-fail'
+        )
+
+        # The __init__ logic in PdfRetriever should catch the error and set strategy to "recursive"
+        self.assertEqual(self.retriever.chunking_strategy, "recursive", "Chunking strategy should fallback to recursive")
+        self.assertIsNone(self.retriever.semantic_sentence_embedder, "Semantic embedder should be None after fallback")
+
+        fake_pdf_path = "semantic_fallback.pdf"
+        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+            mock_path_instance = MagicMock()
+            mock_path_instance.exists.return_value = True
+            mock_path_instance.is_file.return_value = True
+            mock_path_instance.stem = "semantic_fallback"
+            mock_path_constructor.return_value = mock_path_instance
+
+            self.retriever.upload_document(fake_pdf_path)
+
+        self.mock_splitter_instance.split_text.assert_called_once()
+        self.mock_main_embedding_model_instance.encode.assert_called_with(["Recursive chunk 1.", "Recursive chunk 2."])
+
+        # Restore original side_effect for other tests
+        self.MockSentenceTransformer.side_effect = original_st_side_effect
+
+
+    def test_retrieve_from_pdf_success_no_rerank(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self._reinit_retriever(cross_encoder_name=None)
         self.assertIsNone(self.retriever.cross_encoder)
 

@@ -44,12 +44,44 @@ The `PdfRetriever` is responsible for extracting text from PDF documents, chunki
 *   **Configuration (in `config.yaml` under `pdf_retriever`):**
     *   `embedding_model_name`: Model for embedding PDF chunks (e.g., `"BAAI/bge-base-en-v1.5"`).
     *   `vector_db_path`: Path for ChromaDB store.
-    *   `chunk_size`, `chunk_overlap`: Text splitting parameters.
     *   `recall_budget_tokens`: Max tokens for returned snippets.
+    *   `chunking_strategy`: How text is split. Options: `"recursive"`, `"semantic"`. (See "Chunking Strategies" below).
+    *   `chunk_size`, `chunk_overlap`: Parameters for the `"recursive"` chunking strategy.
+    *   `semantic_chunker_embedding_model`, `semantic_chunker_breakpoint_threshold_type`, `semantic_chunker_breakpoint_threshold_amount`, `semantic_chunker_min_chunk_sentences`: Parameters for the `"semantic"` chunking strategy.
     *   `enable_hybrid_search`: `true` or `false` to enable/disable BM25 + RRF fusion.
     *   `rrf_k_constant`: Constant for the RRF algorithm (e.g., `60`).
     *   `cross_encoder_model_name`: Cross-encoder model for re-ranking (e.g., `"cross-encoder/ms-marco-MiniLM-L-6-v2"`).
     *   `rerank_top_n_candidates`: Number of candidates passed to the cross-encoder (also used for initial dense/sparse fetches if hybrid search is on).
+    *   `enable_hyde`: `true` or `false` to enable Hypothetical Document Embeddings (HyDE) for this retriever.
+
+### Chunking Strategies for PdfRetriever
+
+The `PdfRetriever` supports different strategies for chunking PDF text content before embedding:
+
+1.  **`recursive` (Default):**
+    *   Uses `langchain_text_splitters.RecursiveCharacterTextSplitter`.
+    *   This method splits text based on a list of separators (e.g., newlines, spaces) and aims to create chunks of a fixed size.
+    *   Configuration options:
+        *   `chunk_size`: Approximate size of each chunk in characters.
+        *   `chunk_overlap`: Number of characters to overlap between adjacent chunks to maintain context.
+
+2.  **`semantic` (Experimental):**
+    *   Aims to create more contextually coherent chunks by splitting text based on semantic similarity between sentences.
+    *   **How it works:**
+        1.  The document text is first split into individual sentences using `nltk.sent_tokenize`.
+        2.  Each sentence is then embedded using a SentenceTransformer model.
+        3.  Cosine similarities between adjacent sentence embeddings are calculated.
+        4.  Breakpoints (splits) are identified where the similarity between adjacent sentences drops below a certain threshold. This indicates a potential shift in topic.
+        5.  Sentences are grouped into chunks based on these breakpoints.
+    *   **Goal:** To produce chunks that are more semantically self-contained, potentially improving retrieval quality by better aligning chunk content with query intent.
+    *   **Configuration options (in `config.yaml` under `pdf_retriever`):**
+        *   `chunking_strategy: "semantic"` (to enable this strategy).
+        *   `semantic_chunker_embedding_model`: The SentenceTransformer model used to embed sentences for similarity calculation. If `null`, the main `embedding_model_name` of the `PdfRetriever` is used. This can be set to a different, possibly lighter-weight, model optimized for sentence similarity tasks.
+        *   `semantic_chunker_breakpoint_threshold_type`: Method to determine the similarity threshold for splitting. Currently, `"percentile"` is the primary supported method.
+            *   `"percentile"`: Splits if the similarity is below the Nth percentile of all calculated adjacent sentence similarities.
+        *   `semantic_chunker_breakpoint_threshold_amount`: The value for the chosen threshold type. For `"percentile"`, this is N (e.g., `5` for the 5th percentile). A lower percentile value (e.g., 5) means splits occur at points of very low similarity, leading to larger, more distinct chunks. A higher value (e.g., 25) will create more, smaller chunks.
+        *   `semantic_chunker_min_chunk_sentences`: The minimum number of sentences required to form a valid chunk. This prevents overly short or fragmented chunks.
+    *   **Dependencies:** This strategy requires the `nltk` library and its `punkt` sentence tokenizer data. The system will attempt to download `punkt` automatically if it's not found, but an internet connection would be needed for this first-time download.
 
 ## ChatHistoryRetriever
 
@@ -68,5 +100,32 @@ The `ChatHistoryRetriever` stores and retrieves messages from past conversations
     *   `rrf_k_constant`: Constant for RRF (e.g., `60`).
     *   `cross_encoder_model_name`: Cross-encoder model for re-ranking.
     *   `rerank_top_n_candidates`: Number of candidates for cross-encoder.
+    *   `enable_hyde`: `true` or `false` to enable Hypothetical Document Embeddings (HyDE) for this retriever.
 
 By using these configurable retrieval stages, the LLM Context OS can provide highly relevant information to the LLM. Remember to install `rank_bm25` if using the hybrid search feature.
+
+## Advanced Retrieval Techniques
+
+### Hypothetical Document Embeddings (HyDE)
+
+**Concept:**
+HyDE is a technique that aims to improve the relevance of dense retrieval, especially for queries that might be vague, use different terminology than the source documents, or require inferential reasoning. Instead of directly embedding the user's raw query, HyDE first uses a Large Language Model (LLM) to generate a "hypothetical" document that *could* answer the query. This generated document is then embedded, and its embedding is used for the dense vector search against the actual document chunks.
+
+**Benefits:**
+*   **Improved Semantic Matching:** The hypothetical document often captures the underlying intent and expected information structure better than the raw query, leading to embeddings that are closer to relevant document chunks in the vector space.
+*   **Addresses Keyword Mismatch:** Helpful when the query uses synonyms or related concepts not explicitly present in the target documents.
+
+**Configuration:**
+HyDE can be enabled independently for `PdfRetriever` and `ChatHistoryRetriever` via the `enable_hyde: true` flag in their respective sections in `config.yaml`.
+
+Global HyDE settings are configured under a top-level `hyde:` section in `config.yaml`:
+*   `llm_identifier`: Specifies the LLM to use for generating the hypothetical documents. `"default"` uses the currently loaded main model in the `ModelManager`. (Future versions might allow specifying a dedicated, possibly smaller/faster model for HyDE).
+*   `prompt_template`: The template used to instruct the LLM. It must include a `{query}` placeholder, which will be replaced by the user's actual query. Example: `"Generate a concise, relevant document that could answer the following question...: {query}"`
+*   `max_tokens_hyde_doc`: The maximum number of tokens for the generated hypothetical document. Keeping this relatively low (e.g., 64-256) is recommended for conciseness and speed.
+
+**Interaction with Other Retrieval Stages:**
+*   **Dense Search:** The embedding of the *hypothetical document* is used for the dense vector search (e.g., ChromaDB query).
+*   **BM25 Sparse Search:** If hybrid search is enabled, BM25 always uses the *original user query* for keyword matching.
+*   **Cross-Encoder Re-ranking:** The cross-encoder, if enabled, always re-ranks candidates against the *original user query* to ensure final relevance to what the user actually asked.
+
+This ensures that while HyDE assists in finding semantically relevant candidates, the final filtering and ranking stages are still grounded in the original query.
