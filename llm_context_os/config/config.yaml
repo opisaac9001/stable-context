@@ -8,15 +8,25 @@ context_manager:
 
 chat_history_retriever:
   recall_budget_tokens: 600
-  embedding_model_name: "sentence-transformers/all-MiniLM-L6-v2" # Full name for clarity
+  # Default embedding model, e.g., 'BAAI/bge-base-en-v1.5' or 'sentence-transformers/all-MiniLM-L6-v2'
+  embedding_model_name: "BAAI/bge-base-en-v1.5"
   vector_db_path: "data/vector_dbs/yaml_configured_chat_history" # Unique path
+  # Model for re-ranking initial candidates, e.g., 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+  cross_encoder_model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  # Number of initial candidates to fetch from vector DB for re-ranking
+  rerank_top_n_candidates: 25
 
 pdf_retriever:
   vector_db_path: "data/vector_dbs/yaml_configured_pdf_rag"
-  embedding_model_name: "sentence-transformers/all-MiniLM-L12-v2" # Example different model
+  # Default embedding model, e.g., 'BAAI/bge-base-en-v1.5' or 'sentence-transformers/all-MiniLM-L12-v2'
+  embedding_model_name: "BAAI/bge-base-en-v1.5"
   chunk_size: 750
   chunk_overlap: 75
   recall_budget_tokens: 1536 # Example for PDF retriever
+  # Model for re-ranking initial candidates, e.g., 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+  cross_encoder_model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  # Number of initial candidates to fetch from vector DB for re-ranking
+  rerank_top_n_candidates: 25
 
 model_manager:
   default_idle_unload_sec: 1200 # e.g., 20 minutes

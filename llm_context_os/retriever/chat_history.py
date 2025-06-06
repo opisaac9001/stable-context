@@ -59,35 +59,46 @@ class ChatHistoryRetriever:
                  tokenizer: t.Any = None,
                  vector_db_path: str = 'data/vector_dbs', # Base path for all vector DBs
                  embedding_model_name: t.Optional[str] = None,
-                 collection_name: t.Optional[str] = None):
+                 collection_name: t.Optional[str] = None,
+                 cross_encoder_model_name: t.Optional[str] = "ms-marco-MiniLM-L-6-v2", # Default from plan
+                 rerank_top_n_candidates: int = 20): # Default from plan
         """
         Initializes the ChatHistoryRetriever.
         """
         self.recall_budget_tokens = recall_budget_tokens
         self.embedding_model_name = embedding_model_name or self.DEFAULT_EMBEDDING_MODEL
+        self.cross_encoder_model_name = cross_encoder_model_name
+        self.rerank_top_n_candidates = rerank_top_n_candidates
 
         self.db_collection_name = collection_name or self.DEFAULT_COLLECTION_NAME
         self.vector_db_full_path = os.path.join(vector_db_path, self.DEFAULT_DB_SUBDIR)
 
         self.embedding_model = None
+        self.cross_encoder = None
         self.db_client = None
         self.collection = None
 
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
-            print(f"Error: SentenceTransformers library is required but not installed.")
-            # Or raise an exception, depending on desired strictness
+            print(f"Error: SentenceTransformers library is required but not installed. Embedding and re-ranking will not function.")
             return
         if not CHROMADB_AVAILABLE:
-            print(f"Error: ChromaDB library is required but not installed.")
+            print(f"Error: ChromaDB library is required but not installed. Vector storage will not function.")
             return
 
         try:
-            print(f"Initializing SentenceTransformer model: {self.embedding_model_name}")
+            print(f"Initializing SentenceTransformer (bi-encoder) model: {self.embedding_model_name}")
             self.embedding_model = SentenceTransformer(self.embedding_model_name)
         except Exception as e:
-            print(f"Error initializing SentenceTransformer model '{self.embedding_model_name}': {e}")
-            # Fallback or re-raise
-            return
+            print(f"Error initializing SentenceTransformer (bi-encoder) model '{self.embedding_model_name}': {e}")
+            return # Critical failure if bi-encoder can't load
+
+        if self.cross_encoder_model_name:
+            try:
+                print(f"Initializing CrossEncoder model: {self.cross_encoder_model_name}")
+                self.cross_encoder = SentenceTransformer(self.cross_encoder_model_name)
+            except Exception as e:
+                print(f"Warning: Error initializing CrossEncoder model '{self.cross_encoder_model_name}': {e}. Re-ranking will be disabled.")
+                self.cross_encoder = None # Ensure it's None if init fails
 
         try:
             print(f"Initializing ChromaDB client at path: {self.vector_db_full_path}")
@@ -175,10 +186,21 @@ class ChatHistoryRetriever:
         try:
             query_embedding = self.embedding_model.encode(query_text).tolist()
 
+            # Determine number of candidates to fetch for potential re-ranking
+            num_initial_candidates = self.rerank_top_n_candidates if self.cross_encoder else n_results
+
+            query_n_results = min(num_initial_candidates, self.collection.count())
+            if query_n_results == 0 and self.collection.count() > 0: # Ensure we query for at least 1 if collection is not empty
+                 query_n_results = 1 # Avoid error with n_results=0 if rerank_top_n is 0 but collection has items
+
+            if query_n_results == 0: # No items to query for
+                print("[ChatHistoryRetriever] No items to query in collection.")
+                return []
+
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=min(n_results, self.collection.count()), # Ensure n_results <= collection size
-                include=['documents', 'metadatas', 'distances'] # Request these fields
+                n_results=query_n_results,
+                include=['documents', 'metadatas', 'distances']
             )
         except Exception as e:
             print(f"Error querying ChromaDB: {e}")
@@ -191,55 +213,73 @@ class ChatHistoryRetriever:
         ids = results['ids'][0]
         documents = results['documents'][0]
         metadatas = results['metadatas'][0]
-        distances = results['distances'][0] # Lower distance is better
+        distances = results['distances'][0]
 
-        print(f"\nChatHistoryRetriever: Querying for '{query_text[:100]}...', found {len(ids)} candidates.")
+        print(f"\nChatHistoryRetriever: Querying for '{query_text[:100]}...', found {len(ids)} initial candidates.")
 
+        candidate_items = []
         for i in range(len(ids)):
             doc_id = ids[i]
             doc_text = documents[i]
             doc_meta = metadatas[i]
             doc_dist = distances[i]
 
-            # Avoid retrieving messages that are identical to the query or very recent in `current_chat_history`
-            # (Simple check, more sophisticated logic could be added)
-            if doc_text == query_text: # Simple exact match skip
+            if doc_text == query_text:
                 print(f"  Skipping identical document ID {doc_id}.")
                 continue
-            if current_chat_history: # Check if snippet is already in recent context
-                 if any(hist_msg.get('c') == doc_text for hist_msg in current_chat_history):
-                    print(f"  Skipping document ID {doc_id} as it's in current_chat_history.")
-                    continue
+            if current_chat_history and any(hist_msg.get('c') == doc_text for hist_msg in current_chat_history):
+                print(f"  Skipping document ID {doc_id} as it's in current_chat_history.")
+                continue
 
+            candidate_items.append({
+                "id": doc_id, "text": doc_text, "metadata": doc_meta, "distance": doc_dist
+            })
 
-            role = doc_meta.get('role', 'context')
-            timestamp_str = f" (at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(doc_meta.get('timestamp', 0)))})" \
-                            if doc_meta.get('timestamp') else ""
-
-            # Format snippet for context injection
-            # Using a more structured way for retrieved context
-            snippet_text = f"Previously, {role} said{timestamp_str}: \"{doc_text}\""
-
+        # Re-ranking step
+        if self.cross_encoder and candidate_items:
+            print(f"[ChatHistoryRetriever] Re-ranking {len(candidate_items)} candidates with CrossEncoder: {self.cross_encoder_model_name}")
             try:
-                # Use the .encode() method of the tokenizer for counting, as it's more consistent
-                # with how tiktoken's Encoding object works (len(encoding.encode(text)))
+                pairs_for_reranking = [(query_text, item['text']) for item in candidate_items]
+                cross_scores = self.cross_encoder.predict(pairs_for_reranking)
+
+                for i, item in enumerate(candidate_items):
+                    item['cross_score'] = cross_scores[i]
+
+                candidate_items.sort(key=lambda x: x.get('cross_score', -float('inf')), reverse=True)
+                if candidate_items:
+                    print(f"[ChatHistoryRetriever] Re-ranking complete. Top score: {candidate_items[0].get('cross_score', 'N/A'):.4f}")
+            except Exception as e_rerank:
+                print(f"[ChatHistoryRetriever] Error during CrossEncoder prediction/re-ranking: {e_rerank}. Proceeding with original ranking.")
+
+        # Process final candidates (either re-ranked or original ChromaDB order)
+        for item in candidate_items:
+            if len(retrieved_snippets) >= n_results: # Apply final n_results limit
+                break
+
+            role = item['metadata'].get('role', 'context')
+            timestamp_val = item['metadata'].get('timestamp', 0)
+            timestamp_str = f" (at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp_val))})" if timestamp_val else ""
+
+            cross_score_val = item.get('cross_score', 'N/A')
+            cross_score_str = f"{cross_score_val:.4f}" if isinstance(cross_score_val, float) else "N/A"
+
+            snippet_text = (f"Previously, {role} said{timestamp_str} "
+                            f"(~distance {item['distance']:.4f}, ~rerank_score {cross_score_str}): "
+                            f"\"{item['text']}\"")
+            try:
                 snippet_tokens = len(self.tokenizer.encode(snippet_text))
             except Exception as e:
-                print(f"Warning: Error tokenizing snippet, falling back to char count for budgeting: {e}")
-                snippet_tokens = len(snippet_text) # Fallback for budgeting if tokenizer fails
+                print(f"Warning: Error tokenizing snippet for budgeting ('{str(e)}'), falling back to char count.")
+                snippet_tokens = len(snippet_text)
 
             if current_token_count + snippet_tokens <= self.recall_budget_tokens:
                 retrieved_snippets.append({'r': 'retrieved_context', 'c': snippet_text})
                 current_token_count += snippet_tokens
-                print(f"  Added snippet (ID: {doc_id}, dist: {doc_dist:.4f}, tokens: {snippet_tokens}): '{snippet_text[:100]}...'")
+                log_score = f"cross_score: {cross_score_str}" if 'cross_score' in item else f"dist: {item['distance']:.4f}"
+                print(f"  Added snippet (ID: {item['id']}, {log_score}, tokens: {snippet_tokens}): '{snippet_text[:100]}...'")
             else:
-                print(f"  Budget exceeded with snippet ID {doc_id} (tokens: {snippet_tokens}). Total: {current_token_count}. Stopping.")
+                print(f"  Budget exceeded with snippet ID {item['id']} (tokens: {snippet_tokens}). Total: {current_token_count}. Stopping.")
                 break
-
-        # Optional: Re-sort snippets by original timestamp if desired, though ChromaDB results are by relevance.
-        # For chat history, chronological order of retrieved snippets might be useful.
-        # This would require parsing timestamp from snippet_text or having it in metadata consistently.
-        # For now, they are relevance-sorted.
 
         return retrieved_snippets
 

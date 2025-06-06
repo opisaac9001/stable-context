@@ -44,8 +44,9 @@ from llm_context_os.tools.tool_dispatcher import ToolDispatcher
 # --- Application Setup ---
 app = FastAPI(
     title="LLM Context OS API",
-    description="API for managing local LLM models, context, RAG, and generation.",
-    version="0.1.2" # Incremented version for config changes
+    description="API for managing local LLM models, context, RAG, and tool-enhanced generation. "
+                "Supports OpenAI-compatible tool calling and schema retrieval.",
+    version="0.1.3" # Incremented version for tool call and RAG enhancements
 )
 
 # --- Configuration Loading ---
@@ -53,14 +54,16 @@ DEFAULT_CONFIG = {
     "context_manager": {"system_prompt": "You are a helpful AI assistant.", "max_tokens": 4096},
     "chat_history_retriever": {
         "recall_budget_tokens": 512,
-        "embedding_model_name": "all-MiniLM-L6-v2",
+        "embedding_model_name": "BAAI/bge-base-en-v1.5", # Updated default
         "vector_db_path": "data/vector_dbs/api_default_chat_history"
+        # cross_encoder_model_name and rerank_top_n_candidates will use class defaults if not specified here or in YAML
     },
     "pdf_retriever": {
         "vector_db_path": "data/vector_dbs/api_default_pdf_rag",
-        "embedding_model_name": "all-MiniLM-L6-v2",
+        "embedding_model_name": "BAAI/bge-base-en-v1.5", # Updated default
         "chunk_size": 500,
         "chunk_overlap": 50
+        # cross_encoder_model_name and rerank_top_n_candidates will use class defaults if not specified here or in YAML
     },
     "model_manager": {"default_idle_unload_sec": 900},
     "token_estimator_for_rag_budgeting": {"type": "tiktoken", "model_name": "cl100k_base"},
@@ -128,23 +131,30 @@ print(f"ContextManager initialized with: system_prompt='{ctx_mgr_config['system_
 # Chat History Retriever
 chr_config = CONFIG.get('chat_history_retriever', DEFAULT_CONFIG['chat_history_retriever'])
 chat_history_retriever = ChatHistoryRetriever(
-    recall_budget_tokens=chr_config['recall_budget_tokens'],
+    recall_budget_tokens=chr_config.get('recall_budget_tokens'), # Use .get for robustness
     tokenizer=rag_tokenizer,
-    vector_db_path=chr_config['vector_db_path'],
-    embedding_model_name=chr_config['embedding_model_name']
+    vector_db_path=chr_config.get('vector_db_path'),
+    embedding_model_name=chr_config.get('embedding_model_name'),
+    cross_encoder_model_name=chr_config.get('cross_encoder_model_name'), # Pass from config
+    rerank_top_n_candidates=chr_config.get('rerank_top_n_candidates') # Pass from config
 )
-print(f"ChatHistoryRetriever initialized with: budget={chr_config['recall_budget_tokens']}, db_path='{chr_config['vector_db_path']}', model='{chr_config['embedding_model_name']}'")
+print(f"ChatHistoryRetriever initialized with: budget={chat_history_retriever.recall_budget_tokens}, "
+      f"db_path='{chat_history_retriever.vector_db_full_path}', model='{chat_history_retriever.embedding_model_name}', "
+      f"cross_encoder='{chat_history_retriever.cross_encoder_model_name}', rerank_top_n={chat_history_retriever.rerank_top_n_candidates}")
 
 # PDF Retriever
 pdf_retriever_config = CONFIG.get('pdf_retriever', DEFAULT_CONFIG['pdf_retriever'])
 pdf_retriever = PdfRetriever(
-    vector_db_path=pdf_retriever_config['vector_db_path'],
-    embedding_model_name=pdf_retriever_config['embedding_model_name'],
-    tokenizer=rag_tokenizer, # Pass tokenizer for potential future use (e.g. chunk size by tokens)
-    chunk_size=pdf_retriever_config['chunk_size'],
-    chunk_overlap=pdf_retriever_config['chunk_overlap']
+    vector_db_path=pdf_retriever_config.get('vector_db_path'),
+    embedding_model_name=pdf_retriever_config.get('embedding_model_name'),
+    tokenizer=rag_tokenizer,
+    chunk_size=pdf_retriever_config.get('chunk_size'),
+    chunk_overlap=pdf_retriever_config.get('chunk_overlap'),
+    cross_encoder_model_name=pdf_retriever_config.get('cross_encoder_model_name'), # Pass from config
+    rerank_top_n_candidates=pdf_retriever_config.get('rerank_top_n_candidates') # Pass from config
 )
-print(f"PdfRetriever initialized with: db_path='{pdf_retriever_config['vector_db_path']}', model='{pdf_retriever_config['embedding_model_name']}'")
+print(f"PdfRetriever initialized with: db_path='{pdf_retriever.vector_db_path}', model='{pdf_retriever.embedding_model_name}', "
+      f"cross_encoder='{pdf_retriever.cross_encoder_model_name}', rerank_top_n={pdf_retriever.rerank_top_n_candidates}")
 
 
 # Model Manager
@@ -340,7 +350,11 @@ async def list_tools_endpoint():
 @app.get("/tools/openai_schemas", response_model=t.List[t.Dict[str, t.Any]])
 async def get_openai_tool_schemas_endpoint():
     """
-    Returns a list of OpenAI-compatible tool schemas for enabled local tools.
+    Returns a list of OpenAI-compatible tool schemas for currently enabled local tools.
+
+    This endpoint allows applications to discover the available tools and their
+    expected parameters in a format compatible with OpenAI's function calling feature.
+    The schemas can be used to inform an LLM about available functions.
     """
     try:
         schemas = tool_dispatcher.get_openai_tool_schemas()
@@ -449,6 +463,31 @@ async def upload_document_api(file: UploadFile = File(...)):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
+    """
+    Handles chat requests, supporting both synchronous and streaming responses,
+    RAG capabilities, and OpenAI-style tool calls.
+
+    If the loaded LLM supports tool calling and identifies a need to use a tool,
+    this endpoint will:
+    1. Receive the LLM's intent to call tools (as `tool_calls` in the conceptual response).
+    2. Execute the requested tools using the `ToolDispatcher`.
+    3. Send the tool results back to the LLM.
+    4. The LLM then generates a final textual response based on the tool outputs.
+
+    **Tool Calling Notes:**
+    - The system primarily uses an OpenAI-compatible `tool_calls` mechanism.
+    - The older `[FUNCALL]` string-based method is being phased out but might still exist in some parts of the ToolDispatcher for backward compatibility.
+      For new integrations, relying on OpenAI-style tool calls is recommended.
+
+    **Streaming SSE Events for Tool Calls:**
+    If `stream=True` and tool calls occur, the following Server-Sent Events (SSE) may be emitted in sequence:
+    - `event: prompt_info` (for the initial user prompt)
+    - `event: tool_calls_processing` (contains the `tool_calls` objects requested by the LLM)
+    - `event: tool_result` (one for each tool call, contains `tool_call_id`, `name`, and `result` or `error`)
+    - `event: prompt_info` (for the prompt sent to LLM after tool results are incorporated)
+    - `data: {...}` (standard text chunks for the LLM's final response)
+    - `event: stream_end` (final summary)
+    """
     print(f"Received /chat request: {req.model_dump(exclude={'generation_params', 'stream'})}, Stream: {req.stream}") # Log stream state
 
     runner = model_mgr.get()

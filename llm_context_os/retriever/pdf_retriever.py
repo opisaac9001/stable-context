@@ -3,8 +3,9 @@ import typing as t
 from pathlib import Path
 import uuid
 import os
-from PyPDF2 import PdfReader # Added for PDF text extraction
+import fitz  # PyMuPDF
 import shutil # For demo cleanup
+import time # For timestamp in metadata and demo cleanup delay
 
 # Attempt to import RecursiveCharacterTextSplitter
 LANGCHAIN_TEXT_SPLITTERS_AVAILABLE = False
@@ -41,10 +42,12 @@ class PdfRetriever:
                  vector_db_path: str = "data/vector_dbs/pdf_rag_db", # More specific default path
                  embedding_model_name: str = "all-MiniLM-L6-v2",
                  tokenizer = None,
-                 recall_budget_tokens: int = 1024, # Retained for retrieve method, not used in upload
+                 recall_budget_tokens: int = 1024,
                  chunk_size: int = 500,
                  chunk_overlap: int = 50,
-                 collection_name: t.Optional[str] = None):
+                 collection_name: t.Optional[str] = None,
+                 cross_encoder_model_name: t.Optional[str] = "ms-marco-MiniLM-L-6-v2", # Default from plan
+                 rerank_top_n_candidates: int = 20): # Default from plan
         self.vector_db_path = Path(vector_db_path)
         self.embedding_model_name = embedding_model_name
         self.tokenizer = tokenizer
@@ -53,15 +56,27 @@ class PdfRetriever:
         self.chunk_overlap = chunk_overlap
         self.db_collection_name = collection_name or self.DEFAULT_COLLECTION_NAME
 
+        self.cross_encoder_model_name = cross_encoder_model_name
+        self.rerank_top_n_candidates = rerank_top_n_candidates
+        self.cross_encoder = None
+
         self.embedding_model = None
         if SENTENCE_TRANSFORMERS_AVAILABLE and SentenceTransformer:
             try:
                 self.embedding_model = SentenceTransformer(self.embedding_model_name)
-                print(f"[PdfRetriever] Initialized SentenceTransformer model: {self.embedding_model_name}")
+                print(f"[PdfRetriever] Initialized SentenceTransformer (bi-encoder) model: {self.embedding_model_name}")
             except Exception as e:
-                print(f"[PdfRetriever] Error initializing SentenceTransformer model '{self.embedding_model_name}': {e}")
+                print(f"[PdfRetriever] Error initializing SentenceTransformer (bi-encoder) model '{self.embedding_model_name}': {e}")
+
+            if self.cross_encoder_model_name:
+                try:
+                    self.cross_encoder = SentenceTransformer(self.cross_encoder_model_name)
+                    print(f"[PdfRetriever] Initialized CrossEncoder model: {self.cross_encoder_model_name}")
+                except Exception as e:
+                    print(f"[PdfRetriever] Error initializing CrossEncoder model '{self.cross_encoder_model_name}': {e}")
+                    self.cross_encoder = None # Ensure it's None if init fails
         else:
-            print("[PdfRetriever] SentenceTransformers library not available. Embedding model not loaded.")
+            print("[PdfRetriever] SentenceTransformers library not available. Embedding and CrossEncoder models not loaded.")
 
         self.db_client = None
         self.collection = None
@@ -107,32 +122,34 @@ class PdfRetriever:
         print(f"[PdfRetriever] Processing document ID: {doc_id} from path: {pdf_path}")
 
         try:
-            reader = PdfReader(pdf_path)
+            doc = fitz.open(pdf_path) # Open PDF with PyMuPDF
             extracted_text_parts = []
-            # page_map = {} # To map char offset to page number for chunks - for future refinement
-            # current_char_offset = 0
-            for page_num, page in enumerate(reader.pages):
+            num_pages_processed = 0
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
                 try:
-                    page_text = page.extract_text()
-                    if page_text: # Ensure text was extracted
+                    page_text = page.get_text("text") # Extract plain text
+                    if page_text:
                         extracted_text_parts.append(page_text)
-                        # page_map[current_char_offset] = page_num + 1
-                        # current_char_offset += len(page_text)
-                except Exception as e_page: # Handle errors on specific pages
-                    print(f"[PdfRetriever] Warning: Could not extract text from page {page_num + 1} of {doc_id}: {e_page}")
+                    num_pages_processed +=1
+                except Exception as e_page:
+                    print(f"[PdfRetriever] Warning: Could not extract text from page {page_num + 1} of {doc_id} using PyMuPDF: {e_page}")
+
+            doc.close() # Close the document
 
             if not extracted_text_parts:
-                msg = f"Error: No text could be extracted from PDF: {pdf_path}"
+                msg = f"Error: No text could be extracted from PDF using PyMuPDF: {pdf_path}"
                 print(f"[PdfRetriever] {msg}")
-                return False, msg, doc_id, 0 # Return doc_id as it was identified
+                return False, msg, doc_id, 0
 
-            full_text_content = "\n".join(extracted_text_parts) # Join pages with newlines
-            print(f"[PdfRetriever] Extracted ~{len(full_text_content)} characters from {len(reader.pages)} pages in {doc_id}.")
+            full_text_content = "\n\n".join(extracted_text_parts) # Join pages with double newlines for better separation
+            print(f"[PdfRetriever] Extracted ~{len(full_text_content)} characters from {num_pages_processed} pages in {doc_id} using PyMuPDF.")
 
         except Exception as e:
-            msg = f"Error parsing PDF file {pdf_path}: {e}"
+            # This will catch fitz.errors.FitzError for invalid PDFs too
+            msg = f"Error parsing PDF file {pdf_path} with PyMuPDF: {e}"
             print(f"[PdfRetriever] {msg}")
-            return False, msg, None, 0 # No doc_id if parsing failed early
+            return False, msg, doc_id, 0 # Return doc_id if available, else it might be None if error was early
 
         if not self.text_splitter:
             msg = "Error: Text splitter not available (e.g., langchain-text-splitters not installed). Cannot process document."
@@ -230,13 +247,14 @@ class PdfRetriever:
             print(f"[PdfRetriever] Applying ChromaDB filter: {chroma_filter}")
 
         try:
-            # Retrieve more initially to allow for re-ranking or filtering if needed, then apply top_k.
-            # Also gives more options if some results are too long for the token budget.
-            num_candidates = top_k * 3
-            print(f"[PdfRetriever] Querying ChromaDB collection (requesting {num_candidates} candidates).")
+            # Retrieve more candidates for potential re-ranking.
+            # Use self.rerank_top_n_candidates if re-ranker is present, otherwise a smaller set.
+            num_initial_candidates = self.rerank_top_n_candidates if self.cross_encoder else top_k * 3
+
+            print(f"[PdfRetriever] Querying ChromaDB collection (requesting {num_initial_candidates} candidates).")
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=num_candidates,
+                n_results=num_initial_candidates,
                 where=chroma_filter,
                 include=['documents', 'metadatas', 'distances']
             )
@@ -254,11 +272,11 @@ class PdfRetriever:
 
         # Process results (ids, documents, metadatas, distances are all lists of lists, take the first list for our single query)
         result_ids = results['ids'][0]
-        result_documents = results['documents'][0] if results['documents'] else [""] * len(result_ids) # Handle empty documents list
+        result_documents = results['documents'][0] if results['documents'] else [""] * len(result_ids)
         result_metadatas = results['metadatas'][0] if results['metadatas'] else [{}] * len(result_ids)
         result_distances = results['distances'][0] if results['distances'] else [float('inf')] * len(result_ids)
 
-        processed_results = []
+        candidate_items = []
         for i in range(len(result_ids)):
             doc_text = result_documents[i] if result_documents[i] is not None else "Content not available"
             metadata = result_metadatas[i] if result_metadatas[i] is not None else {}
@@ -268,25 +286,59 @@ class PdfRetriever:
                 print(f"  Skipping retrieved chunk identical to query: '{doc_text[:50]}...'")
                 continue
 
-            processed_results.append({
+            candidate_items.append({
                 "text": doc_text,
                 "metadata": metadata,
-                "distance": distance
+                "distance": distance,
+                "id": result_ids[i]
             })
 
-        # ChromaDB query results are typically sorted by distance already.
+        # Re-ranking step
+        if self.cross_encoder and candidate_items:
+            print(f"[PdfRetriever] Re-ranking {len(candidate_items)} candidates with CrossEncoder: {self.cross_encoder_model_name}")
+            try:
+                pairs = [(query_text, item['text']) for item in candidate_items]
+                cross_scores = self.cross_encoder.predict(pairs)
 
-        for res_item in processed_results:
+                for i, item in enumerate(candidate_items):
+                    item['cross_score'] = cross_scores[i]
+
+                # Sort by cross_score in descending order (higher is better)
+                candidate_items.sort(key=lambda x: x.get('cross_score', -float('inf')), reverse=True)
+                print(f"[PdfRetriever] Re-ranking complete. Top score: {candidate_items[0].get('cross_score', 'N/A'):.4f} if results exist.")
+            except Exception as e_rerank:
+                print(f"[PdfRetriever] Error during CrossEncoder prediction/re-ranking: {e_rerank}. Proceeding with original ranking.")
+        else:
+            # If no cross-encoder, ChromaDB results are already sorted by distance (ascending, lower is better)
+            # No explicit sort needed here as we iterate and take top_k.
+            pass
+
+
+        for res_item in candidate_items: # Iterate through potentially re-ranked items
             if len(retrieved_snippets) >= top_k: # Apply final top_k limit
                 break
 
             doc_id_meta = res_item['metadata'].get('doc_id', 'UnknownDoc')
             page_num_meta = res_item['metadata'].get('page_number', 'N/A')
+            cross_score_val = res_item.get('cross_score', 'N/A')
+            if isinstance(cross_score_val, float):
+                cross_score_str = f"{cross_score_val:.4f}"
+            else:
+                cross_score_str = "N/A"
 
-            snippet_text = f"Retrieved from '{doc_id_meta}' (Page {page_num_meta}, ~distance {res_item['distance']:.4f}): \"{res_item['text']}\""
+            snippet_text = (f"Retrieved from '{doc_id_meta}' "
+                            f"(Page {page_num_meta}, ~distance {res_item['distance']:.4f}, ~rerank_score {cross_score_str}): "
+                            f"\"{res_item['text']}\"")
 
             try:
-                snippet_tokens = len(self.tokenizer.encode(snippet_text))
+                # Ensure tokenizer is available and has an encode method
+                if hasattr(self.tokenizer, 'encode'):
+                    snippet_tokens = len(self.tokenizer.encode(snippet_text))
+                elif hasattr(self.tokenizer, 'count_tokens'): # Fallback to count_tokens if encode not present
+                    snippet_tokens = self.tokenizer.count_tokens(snippet_text)
+                else: # Last resort, character count
+                    print(f"[PdfRetriever] Warning: Tokenizer has no 'encode' or 'count_tokens' method. Using char length for budgeting.")
+                    snippet_tokens = len(snippet_text)
             except Exception as e_tok:
                 print(f"[PdfRetriever] Warning: Tokenizer error for snippet budgeting ('{str(e_tok)}'). Falling back to char length.")
                 snippet_tokens = len(snippet_text)
@@ -294,7 +346,8 @@ class PdfRetriever:
             if current_token_count + snippet_tokens <= self.recall_budget_tokens:
                 retrieved_snippets.append({'r': 'retrieved_pdf_chunk', 'c': snippet_text})
                 current_token_count += snippet_tokens
-                print(f"  Added snippet (dist: {res_item['distance']:.4f}, tokens: {snippet_tokens}): '{snippet_text[:100]}...'")
+                log_score = f"cross_score: {cross_score_str}" if 'cross_score' in res_item else f"dist: {res_item['distance']:.4f}"
+                print(f"  Added snippet ({log_score}, tokens: {snippet_tokens}): '{snippet_text[:100]}...'")
             else:
                 print(f"[PdfRetriever] Recall budget ({self.recall_budget_tokens} tokens) reached. Current: {current_token_count}, Snippet: {snippet_tokens}. Stopping.")
                 break
@@ -353,124 +406,64 @@ if __name__ == '__main__':
     dummy_pdf_path1 = dummy_pdf_root / "climate_report_demo.pdf"
     dummy_pdf_path2 = dummy_pdf_root / "ai_ethics_demo.pdf"
 
-    # Create dummy text files (PyPDF2 will attempt to parse them)
+    # Create dummy text files. PyMuPDF will fail to open these, which is fine for this demo's purpose
+    # as we are testing the library switch and error handling, not successful PDF parsing in the demo.
+    # A real test with actual PDFs would be separate.
     with open(dummy_pdf_path1, 'w') as f:
-        f.write("Climate Change Overview Document.\nSection 1: Introduction to climate science. The earth's climate is warming significantly. "
-                "Section 2: Impacts of global warming on ecosystems and human society. Rising sea levels are a major global concern. We must act now. "
-                "Section 3: Mitigation strategies including renewable energy and carbon capture technologies. International cooperation is absolutely key for success.")
+        f.write("This is not a real PDF, but a text file for demo purposes. PyMuPDF should gracefully fail to open it.")
     with open(dummy_pdf_path2, 'w') as f:
-        f.write("The Future of AI.\nChapter 1: Current state of artificial intelligence. LLMs show great promise for humanity. "
-                "Chapter 2: AI Ethics and Governance. Ensuring fairness, accountability, and transparency is crucial. "
-                "Chapter 3: Speculative future applications of AGI. Potential for solving complex global problems like disease and poverty.")
+        f.write("Another text file disguised as a PDF for the PdfRetriever demo.")
 
     if pdf_retriever.embedding_model and pdf_retriever.collection and pdf_retriever.text_splitter:
         print("\n--- Upload Documents (will attempt embedding and ChromaDB storage) ---")
-        s1, m1, id1, nc1 = pdf_retriever.upload_document(str(dummy_pdf_path1))
-        print(f"Upload 1 ('{id1}'): Success={s1}, Chunks={nc1}, Msg: {m1}")
-        s2, m2, id2, nc2 = pdf_retriever.upload_document(str(dummy_pdf_path2))
-        print(f"Upload 2 ('{id2}'): Success={s2}, Chunks={nc2}, Msg: {m2}")
+        # Wrap upload_document in try-except as PyMuPDF will likely fail on these text files
+        try:
+            print(f"Attempting to upload (expected to fail gracefully with PyMuPDF): {dummy_pdf_path1}")
+            s1, m1, id1, nc1 = pdf_retriever.upload_document(str(dummy_pdf_path1))
+            print(f"Upload 1 ('{id1}'): Success={s1}, Chunks={nc1}, Msg: {m1}")
+        except Exception as e_upload1:
+            print(f"Caught exception during upload of {dummy_pdf_path1}: {e_upload1}")
 
-        if id1 and pdf_retriever.collection:
+        try:
+            print(f"Attempting to upload (expected to fail gracefully with PyMuPDF): {dummy_pdf_path2}")
+            s2, m2, id2, nc2 = pdf_retriever.upload_document(str(dummy_pdf_path2))
+            print(f"Upload 2 ('{id2}'): Success={s2}, Chunks={nc2}, Msg: {m2}")
+        except Exception as e_upload2:
+            print(f"Caught exception during upload of {dummy_pdf_path2}: {e_upload2}")
+
+        # Since uploads are expected to fail with text files, collection count will be 0
+        if pdf_retriever.collection:
             print(f"\nTotal items in ChromaDB collection '{pdf_retriever.db_collection_name}': {pdf_retriever.collection.count()}")
 
+        # Retrieval attempts will also likely yield no results due to failed uploads
         print("\n--- Retrieve from all PDFs (query: 'climate change mitigation') ---")
-        # This will currently print "not implemented" and return []
         retrieved_all = pdf_retriever.retrieve_from_pdf("climate change mitigation", top_k=3)
-        if not retrieved_all: print("  (Retrieval not yet implemented or no results)")
+        if not retrieved_all: print("  (Retrieval expected to yield no results due to upload failures or empty DB)")
 
-        if id2:
-            print(f"\n--- Retrieve from '{id2}' only (query: 'AI ethics LLMs') ---")
-            retrieved_specific = pdf_retriever.retrieve_from_pdf("AI ethics LLMs", doc_ids=[id2], top_k=2)
-            if not retrieved_specific: print("  (Retrieval not yet implemented or no results)")
     else:
         print("\n[Demo] PdfRetriever not fully initialized (missing SentenceTransformer, ChromaDB, or TextSplitter). Skipping upload/retrieve demo.")
 
-    # Cleanup dummy files and DB directory
+    # Cleanup dummy files and DB directory (same as before)
     try:
         if dummy_pdf_path1.exists(): os.remove(dummy_pdf_path1)
         if dummy_pdf_path2.exists(): os.remove(dummy_pdf_path2)
-        if not any(dummy_pdf_root.iterdir()): # Check if directory is empty
+        if not any(dummy_pdf_root.iterdir()):
             os.rmdir(dummy_pdf_root)
 
-        # Cleanup the specific DB path used by this retriever instance
         if actual_demo_db_path.exists():
             print(f"\nCleaning up demo DB at: {actual_demo_db_path}")
-            # Ensure client/collection are not locking files if they were initialized
             if hasattr(pdf_retriever, 'collection') and pdf_retriever.collection: del pdf_retriever.collection
             if hasattr(pdf_retriever, 'db_client') and pdf_retriever.db_client: del pdf_retriever.db_client
-            time.sleep(0.1) # Brief pause for file handles
+            time.sleep(0.1)
             shutil.rmtree(actual_demo_db_path)
             print(f"Successfully removed demo DB directory: {actual_demo_db_path}")
-            # Clean up base path if it's now empty and was part of the demo structure
             if actual_demo_db_path.parent == Path(DEMO_DB_BASE_PATH).resolve() and not os.listdir(DEMO_DB_BASE_PATH):
                  shutil.rmtree(DEMO_DB_BASE_PATH)
                  print(f"Successfully removed demo base DB directory: {DEMO_DB_BASE_PATH}")
-
     except OSError as e:
         print(f"Error during demo cleanup: {e}")
 
     print("\nPdfRetriever demo complete.")
-    dummy_pdf_root.mkdir(parents=True, exist_ok=True)
-
-    dummy_pdf_path1 = dummy_pdf_root / "climate_change_overview.pdf"
-    dummy_pdf_path2 = dummy_pdf_root / "future_of_ai_report.pdf"
-
-    # Create dummy PDF files with some content for the demo
-    with open(dummy_pdf_path1, 'w') as f:
-        f.write("Climate Change Overview Document. Section 1: Introduction to climate science. The earth's climate is warming. "
-                "Section 2: Impacts of global warming on ecosystems and human society. Rising sea levels are a major concern. "
-                "Section 3: Mitigation strategies including renewable energy and carbon capture technologies. International cooperation is key.")
-    with open(dummy_pdf_path2, 'w') as f:
-        f.write("The Future of AI. Chapter 1: Current state of artificial intelligence. LLMs show great promise. "
-                "Chapter 2: AI Ethics and Governance. Ensuring fairness and transparency. "
-                "Chapter 3: Speculative future applications of AGI. Potential for solving complex global problems.")
-
-    # Initialize retriever with a smaller chunk size for more demo chunks
-    pdf_retriever = PdfRetriever(
-        vector_db_path="data/pdf_retriever_test_db_main",
-        chunk_size=100, # Small chunk size for demo
-        chunk_overlap=20, # Small overlap for demo
-        recall_budget_tokens=500 # Budget for total length of returned snippets
-    )
-    if LANGCHAIN_TEXT_SPLITTERS_AVAILABLE:
-        print("RecursiveCharacterTextSplitter is available for this demo.")
-    else:
-        print("RecursiveCharacterTextSplitter is NOT available. Demo might not fully work as expected for splitting.")
-
-
-    print("\n--- Upload Documents ---")
-    s1, m1, id1, nc1 = pdf_retriever.upload_document(str(dummy_pdf_path1))
-    print(f"Upload 1: {s1}, {m1[:50]}..., ID: {id1}, Chunks: {nc1}")
-    s2, m2, id2, nc2 = pdf_retriever.upload_document(str(dummy_pdf_path2))
-    print(f"Upload 2: {s2}, {m2[:50]}..., ID: {id2}, Chunks: {nc2}")
-
-    print(f"\nTotal documents processed: {len(pdf_retriever.document_chunks)}")
-
-    print("\n--- Retrieve from all PDFs (query: 'climate change mitigation') ---")
-    retrieved_all = pdf_retriever.retrieve_from_pdf("climate change mitigation", top_k=3)
-    for i, snippet in enumerate(retrieved_all):
-        print(f"  Snippet {i+1}: {snippet['c'][:120]}... ({len(snippet['c'])} chars)")
-
-    if id2:
-        print(f"\n--- Retrieve from '{id2}' only (query: 'AI ethics LLMs') ---")
-        retrieved_specific = pdf_retriever.retrieve_from_pdf("AI ethics LLMs", doc_ids=[id2], top_k=2)
-        for i, snippet in enumerate(retrieved_specific):
-            print(f"  Snippet {i+1}: {snippet['c'][:120]}... ({len(snippet['c'])} chars)")
-
-    print("\n--- Retrieve with query that might not match well ---")
-    retrieved_nomatch = pdf_retriever.retrieve_from_pdf("quantum physics explained", top_k=2)
-    print(f"  Number of snippets for no match: {len(retrieved_nomatch)}")
-
-
-    # Cleanup dummy files and directory
-    # try:
-    #     os.remove(dummy_pdf_path1)
-    #     os.remove(dummy_pdf_path2)
-    #     if not any(dummy_pdf_root.iterdir()): # Check if directory is empty
-    #         os.rmdir(dummy_pdf_root)
-    #     if pdf_retriever.vector_db_path.exists(): # Clean up test DB dir
-    #         shutil.rmtree(pdf_retriever.vector_db_path)
-    # except OSError as e:
-    #     print(f"Error during cleanup: {e}")
-
-    print("\nPdfRetriever demo complete. Manual cleanup of 'data/dummy_pdfs_for_retriever' and 'data/pdf_retriever_test_db_main' may be needed.")
+    # The following was a duplicate of the demo setup from an earlier version, removing it.
+    # dummy_pdf_root.mkdir(parents=True, exist_ok=True)
+    # ... (rest of duplicated demo code removed) ...
