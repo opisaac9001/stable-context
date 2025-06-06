@@ -40,18 +40,21 @@ except ImportError:
     "One or more core dependencies (PyMuPDF, langchain-text-splitters, sentence-transformers, chromadb) not available. Skipping PdfRetriever tests."
 )
 # Remove PdfReader patch, add fitz.open patch
+@patch('llm_context_os.retriever.pdf_retriever.BM25Okapi') # Add BM25Okapi patch
 @patch('llm_context_os.retriever.pdf_retriever.fitz.open')
 @patch('llm_context_os.retriever.pdf_retriever.RecursiveCharacterTextSplitter')
-@patch('llm_context_os.retriever.pdf_retriever.SentenceTransformer') # This patches ST for both bi-encoder and cross-encoder
+@patch('llm_context_os.retriever.pdf_retriever.SentenceTransformer')
 @patch('llm_context_os.retriever.pdf_retriever.chromadb.PersistentClient')
 class TestPdfRetriever(unittest.TestCase):
 
-    def setUp(self, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen): # Order matters
+    def setUp(self, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi): # Order matters
         # Store mock classes passed by decorators
         self.MockFitzOpen = MockFitzOpen
         self.MockSplitter = MockSplitter
-        self.MockSentenceTransformer = MockSentenceTransformer # This is the class
+        self.MockSentenceTransformer = MockSentenceTransformer
         self.MockChromaDBClient = MockChromaDBClient
+        self.MockBM25Okapi = MockBM25Okapi
+
 
         # Configure the mock instances that will be returned by the patched constructors/functions
         self.mock_fitz_doc_instance = self.MockFitzOpen.return_value
@@ -94,49 +97,57 @@ class TestPdfRetriever(unittest.TestCase):
         self.mock_tokenizer.encode = MagicMock(side_effect=mock_encode_for_len)
         self.mock_tokenizer.count_tokens = MagicMock(side_effect=lambda t: len(t.split()))
 
+        self.mock_bm25_index_instance = self.MockBM25Okapi.return_value
+        self.mock_bm25_index_instance.get_scores.return_value = [] # Default to no BM25 scores
+
 
         self.test_db_base_path = "temp_test_pdf_retriever_db_unit"
         # Initialize PdfRetriever for each test
-        self._reinit_retriever()
+        self._reinit_retriever() # Calls with default params including hybrid search enabled
 
 
-    def _reinit_retriever(self, cross_encoder_name='fake-cross-encoder-model', rerank_top_n=5):
-        # Helper to re-initialize retriever, useful if constructor logic changes or needs testing with different params
+    def _reinit_retriever(self,
+                          cross_encoder_name='fake-cross-encoder-model',
+                          rerank_top_n=5,
+                          enable_hybrid_search=True, # New param
+                          rrf_k=60):                 # New param
+        # Helper to re-initialize retriever
         self.retriever = PdfRetriever(
             vector_db_path=self.test_db_base_path,
             embedding_model_name='fake-embedding-model',
             tokenizer=self.mock_tokenizer,
-            recall_budget_tokens=100, # Small for testing budget
-            chunk_size=10, # Small for testing
+            recall_budget_tokens=100,
+            chunk_size=10,
             chunk_overlap=2,
             cross_encoder_model_name=cross_encoder_name,
-            rerank_top_n_candidates=rerank_top_n
+            rerank_top_n_candidates=rerank_top_n,
+            enable_hybrid_search=enable_hybrid_search, # Pass to constructor
+            rrf_k_constant=rrf_k                     # Pass to constructor
         )
-        # Reset instance mocks that might be called by __init__ or other methods
+        # Reset instance mocks
         self.mock_fitz_doc_instance.reset_mock()
         self.mock_fitz_page_instance.reset_mock()
         self.mock_splitter_instance.reset_mock()
         self.mock_bi_encoder_instance.reset_mock()
-        self.mock_cross_encoder_instance.reset_mock() # if it was created
+        self.mock_cross_encoder_instance.reset_mock()
         self.mock_chromadb_client_instance.reset_mock()
         self.mock_collection.reset_mock()
+        self.mock_bm25_index_instance.reset_mock() # Reset BM25 mock
 
-        # Re-apply default return values for mocks that might be altered by specific tests
-        # These are mocks of the *classes* or factory functions
+        # Re-apply default return values
         self.MockFitzOpen.return_value = self.mock_fitz_doc_instance
         self.mock_fitz_doc_instance.load_page.return_value = self.mock_fitz_page_instance
         self.mock_fitz_doc_instance.__len__.return_value = 1
         self.mock_fitz_page_instance.get_text.return_value = "Page 1 text from PyMuPDF."
 
-
         self.MockSplitter.return_value = self.mock_splitter_instance
         self.mock_splitter_instance.split_text.return_value = ["PyMuPDF chunk 1.", "PyMuPDF chunk 2."]
 
-        # self.MockSentenceTransformer.return_value is handled by side_effect now
         self.mock_bi_encoder_instance.encode.return_value.tolist.return_value = [[0.1,0.2,0.3],[0.4,0.5,0.6]]
 
         self.MockChromaDBClient.return_value = self.mock_chromadb_client_instance
         self.mock_chromadb_client_instance.get_or_create_collection.return_value = self.mock_collection
+        self.MockBM25Okapi.return_value = self.mock_bm25_index_instance
 
 
     def tearDown(self):
@@ -292,22 +303,29 @@ class TestPdfRetriever(unittest.TestCase):
         snippets = self.retriever.retrieve_from_pdf(query_text, doc_ids=["pdf1"], top_k=1)
 
         self.mock_bi_encoder_instance.encode.assert_called_with(query_text)
-        # n_results should be top_k * 3 when no cross-encoder
+        # n_results for dense query when no cross-encoder and no hybrid search:
+        # num_initial_candidates = self.rerank_top_n_candidates if self.cross_encoder else top_k * 3
+        # If cross-encoder is also None (as per this test's reinit), then it's top_k * 3.
+        expected_n_results = 1 * 3
         self.mock_collection.query.assert_called_once_with(
             query_embeddings=[[0.1, 0.2, 0.3]],
-            n_results=1 * 3,
+            n_results=expected_n_results,
             where={"doc_id": "pdf1"},
             include=['documents', 'metadatas', 'distances']
         )
         self.assertEqual(len(snippets), 1)
         self.assertIn("Retrieved Doc 1 text.", snippets[0]['c'])
-        self.assertIn("~rerank_score N/A", snippets[0]['c'])
+        self.assertIn("~rerank_score N/A", snippets[0]['c']) # Cross-encoder score
+        self.assertIn("rrf: N/A", snippets[0]['c']) # RRF score
         self.assertEqual(snippets[0]['r'], 'retrieved_pdf_chunk')
 
 
-    def test_retrieve_with_reranking_success(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        self._reinit_retriever(cross_encoder_name='fake-cross-encoder-model', rerank_top_n=3) # Rerank top 3
+    def test_retrieve_with_reranking_success(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient, MockBM25Okapi):
+        # Hybrid search should be enabled by default by _reinit_retriever call in setUp
+        # This test focuses on the cross-encoder part after RRF (or dense if hybrid is off)
+        self._reinit_retriever(cross_encoder_name='fake-cross-encoder-model', rerank_top_n=3, enable_hybrid_search=False)
         self.assertIsNotNone(self.retriever.cross_encoder)
+        self.assertFalse(self.retriever.enable_hybrid_search) # Explicitly testing non-hybrid path to cross-encoder
 
         self.mock_collection.count.return_value = 3
         # Initial Chroma results (lower distance is better)
@@ -334,23 +352,25 @@ class TestPdfRetriever(unittest.TestCase):
         self.mock_bi_encoder_instance.encode.assert_called_with(query_text)
         self.mock_collection.query.assert_called_once_with(
             query_embeddings=[[0.5,0.5,0.5]],
-            n_results=3, # self.retriever.rerank_top_n_candidates
+            n_results=3, # This is rerank_top_n_candidates from _reinit_retriever
             where=None,
             include=['documents', 'metadatas', 'distances']
         )
+        # cross_encoder receives the top `rerank_top_n` from dense results because hybrid is False
         self.mock_cross_encoder_instance.predict.assert_called_once_with([
-            (query_text, 'Doc A text.'), (query_text, 'Doc B text.'), (query_text, 'Doc C text.')
+            (query_text, 'Doc B text.'), (query_text, 'Doc C text.'), (query_text, 'Doc A text.') # Order from dense
         ])
 
         self.assertEqual(len(snippets), 2)
-        self.assertIn("Doc C text.", snippets[0]['c']) # Doc C had score 0.9
-        self.assertIn("~rerank_score 0.9000", snippets[0]['c'])
-        self.assertIn("Doc A text.", snippets[1]['c']) # Doc A had score 0.7
-        self.assertIn("~rerank_score 0.7000", snippets[1]['c'])
+        # Based on cross_encoder scores [0.7 for A, 0.1 for B, 0.9 for C], after re-sorting
+        self.assertIn("Doc C text.", snippets[0]['c'])
+        self.assertIn("cross: 0.9000", snippets[0]['c'])
+        self.assertIn("Doc A text.", snippets[1]['c'])
+        self.assertIn("cross: 0.7000", snippets[1]['c'])
 
 
-    def test_retrieve_reranking_cross_encoder_error(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        self._reinit_retriever(cross_encoder_name='fake-cross-encoder-model')
+    def test_retrieve_reranking_cross_encoder_error(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient, MockBM25Okapi):
+        self._reinit_retriever(cross_encoder_name='fake-cross-encoder-model', enable_hybrid_search=False)
         self.assertIsNotNone(self.retriever.cross_encoder)
         self.mock_cross_encoder_instance.predict.side_effect = Exception("CrossEncoder failed")
 
@@ -366,29 +386,99 @@ class TestPdfRetriever(unittest.TestCase):
 
         snippets = self.retriever.retrieve_from_pdf(query_text, top_k=1)
 
-        # Should fall back to distance-based ranking
+        # Should fall back to pre-cross-encoder order (dense only in this test setup)
         self.assertEqual(len(snippets), 1)
-        self.assertIn("Doc B text.", snippets[0]['c']) # Doc B has lower distance (0.1)
-        self.assertIn("~rerank_score N/A", snippets[0]['c']) # Rerank score should be N/A
+        self.assertIn("Doc B text.", snippets[0]['c'])
+        self.assertIn("cross: N/A", snippets[0]['c'])
 
 
-    def test_retrieve_from_pdf_token_budget(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
-        self._reinit_retriever(cross_encoder_name=None) # No reranking for this specific budget test simplicity
-        self.retriever.recall_budget_tokens = 25 # Small budget
+    def test_retrieve_hybrid_search_enabled_and_bm25_works(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient, MockBM25Okapi):
+        self._reinit_retriever(enable_hybrid_search=True, rerank_top_n=3) # Ensure hybrid is on
+        self.assertTrue(self.retriever.enable_hybrid_search)
+        self.assertIsNotNone(self.retriever.bm25_index, "BM25 index should be mocked via _reinit_retriever if BM25Okapi is patched")
 
-        # Mock tokenizer to count "words" (space separated strings)
-        # Snippet format: "Retrieved from '{doc_id_meta}' (Page {page_num_meta}, ~distance {res_item['distance']:.4f}, ~rerank_score {cross_score_str}): \"{res_item['text']}\""
-        # Example: "Retrieved from 'd1' (Page 1, ~distance 0.1000, ~rerank_score N/A): "Chunk one."" has 14 "words"
-        # Example: "Retrieved from 'd1' (Page 2, ~distance 0.2000, ~rerank_score N/A): "Chunk two is longer."" has 16 "words"
+        # Setup BM25 corpus (as if documents were uploaded)
+        self.retriever.bm25_corpus_texts = ["BM25 doc 1", "BM25 doc 2: better match", "Common doc also in dense"]
+        self.retriever.bm25_chunk_ids = ["bm25_id1", "bm25_id2", "common_id1"]
+        self.retriever.is_bm25_index_built = False # Force rebuild
+
+        # Mock BM25 scores (higher is better)
+        # Query: "match" -> bm25_doc2 (0.8), common_doc (0.5), bm25_doc1 (0.2)
+        self.mock_bm25_index_instance.get_scores.return_value = [0.2, 0.8, 0.5]
+
+        # Mock Dense (ChromaDB) results (lower distance is better)
+        # common_doc (0.1), dense_doc_only (0.2)
+        self.mock_collection.count.return_value = 2
+        self.mock_collection.query.return_value = {
+            'ids': [['common_id1', 'dense_only_id1']],
+            'documents': [['Common doc also in dense', 'Dense only doc text']],
+            'metadatas': [[{'doc_id': 'pdf1', 'page_number': 1}], [{'doc_id': 'pdf2', 'page_number': 1}]],
+            'distances': [[0.1, 0.2]]
+        }
+        self.mock_bi_encoder_instance.encode.return_value.tolist.return_value = [[0.7]*3] # Query embedding
+
+        # Mock Cross-encoder (higher is better)
+        # Let's say cross-encoder boosts "BM25 doc 2: better match"
+        def cross_encoder_predict_side_effect(pairs):
+            scores = []
+            for q, doc_text in pairs:
+                if "BM25 doc 2" in doc_text: scores.append(0.95)
+                elif "Common doc" in doc_text: scores.append(0.85)
+                elif "Dense only" in doc_text: scores.append(0.75)
+                else: scores.append(0.1)
+            return scores
+        self.mock_cross_encoder_instance.predict.side_effect = cross_encoder_predict_side_effect
+
+        snippets = self.retriever.retrieve_from_pdf("match", top_k=2)
+
+        self.MockBM25Okapi.assert_called_with([['bm25', 'doc', '1'], ['bm25', 'doc', '2:', 'better', 'match'], ['common', 'doc', 'also', 'in', 'dense']])
+        self.mock_bm25_index_instance.get_scores.assert_called_once()
+        self.mock_collection.query.assert_called_once() # Dense query
+        self.mock_cross_encoder_instance.predict.assert_called_once() # Cross-encoder on RRF results
+
+        # RRF expected order (approx): bm25_id2 (BM25 high), common_id1 (Dense high, BM25 mid), dense_only_id1 (Dense mid)
+        # Cross-encoder re-ranks these.
+        self.assertEqual(len(snippets), 2)
+        self.assertIn("BM25 doc 2: better match", snippets[0]['c']) # Expected top due to cross-encoder
+        self.assertIn("cross: 0.9500", snippets[0]['c'])
+        self.assertIn("Common doc also in dense", snippets[1]['c'])
+        self.assertIn("cross: 0.8500", snippets[1]['c'])
+
+
+    def test_retrieve_hybrid_search_disabled(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient, MockBM25Okapi):
+        self._reinit_retriever(enable_hybrid_search=False, rerank_top_n=2)
+        self.assertFalse(self.retriever.enable_hybrid_search)
+
+        self.mock_collection.count.return_value = 2
+        self.mock_collection.query.return_value = {
+            'ids': [['id1', 'id2']], 'documents': [['Dense Doc 1', 'Dense Doc 2']],
+            'metadatas': [[{}, {}]], 'distances': [[0.1, 0.2]]
+        }
+        self.mock_bi_encoder_instance.encode.return_value.tolist.return_value = [[0.1]*3]
+        self.mock_cross_encoder_instance.predict.return_value = [0.9, 0.8] # Scores for Doc1, Doc2
+
+        snippets = self.retriever.retrieve_from_pdf("query", top_k=1)
+
+        self.mock_bm25_index_instance.get_scores.assert_not_called() # BM25 should not be called
+        self.mock_collection.query.assert_called_once() # Dense query
+        self.mock_cross_encoder_instance.predict.assert_called_once() # Cross-encoder still runs on dense
+
+        self.assertEqual(len(snippets), 1)
+        self.assertIn("Dense Doc 1", snippets[0]['c']) # Based on cross-encoder score
+        self.assertIn("cross: 0.9000", snippets[0]['c'])
+        self.assertIn("sparse: N/A", snippets[0]['c']) # No sparse score
+        self.assertIn("rrf: N/A", snippets[0]['c'])   # No RRF score
+
+
+    def test_retrieve_from_pdf_token_budget(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient, MockBM25Okapi):
+        self._reinit_retriever(cross_encoder_name=None, enable_hybrid_search=False) # No rerank/hybrid for budget test simplicity
+        self.retriever.recall_budget_tokens = 25
 
         doc1_text = "Chunk one."
         doc2_text = "Chunk two is longer."
-
         mock_query_results = {
-            'ids': [['id1', 'id2']],
-            'documents': [[doc1_text, doc2_text]],
-            'metadatas': [[{'doc_id': 'd1', 'page_number': 1}],
-                          [{'doc_id': 'd1', 'page_number': 2}]],
+            'ids': [['id1', 'id2']], 'documents': [[doc1_text, doc2_text]],
+            'metadatas': [[{'doc_id': 'd1', 'page_number': 1}], [{'doc_id': 'd1', 'page_number': 2}]],
             'distances': [[0.1, 0.2]]
         }
         self.mock_collection.query.return_value = mock_query_results
@@ -396,21 +486,23 @@ class TestPdfRetriever(unittest.TestCase):
 
         snippets = self.retriever.retrieve_from_pdf("Query for budgeting", top_k=2)
 
-        self.assertEqual(len(snippets), 1) # Only first snippet should fit
+        self.assertEqual(len(snippets), 1)
         self.assertIn(doc1_text, snippets[0]['c'])
 
-    def test_retrieve_from_pdf_no_results(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
+    def test_retrieve_from_pdf_no_results(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient, MockBM25Okapi):
         self.mock_collection.query.return_value = {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
-        self.mock_collection.count.return_value = 0 # Or just no results from query
+        self.mock_collection.count.return_value = 0
+        self.mock_bm25_index_instance.get_scores.return_value = [] # BM25 also returns no results
+
         snippets = self.retriever.retrieve_from_pdf("Query for no results")
         self.assertEqual(len(snippets), 0)
 
-    def test_retrieve_unavailable_components(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient):
+    def test_retrieve_unavailable_components(self, MockFitzOpen, MockSplitter, MockSentenceTransformer, MockChromaDBClient, MockBM25Okapi):
         original_embed_model = self.retriever.embedding_model
         self.retriever.embedding_model = None
         snippets = self.retriever.retrieve_from_pdf("Query")
         self.assertEqual(snippets, [])
-        self.retriever.embedding_model = original_embed_model # Restore
+        self.retriever.embedding_model = original_embed_model
 
         original_collection = self.retriever.collection
         self.retriever.collection = None

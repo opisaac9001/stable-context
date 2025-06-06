@@ -54,16 +54,22 @@ DEFAULT_CONFIG = {
     "context_manager": {"system_prompt": "You are a helpful AI assistant.", "max_tokens": 4096},
     "chat_history_retriever": {
         "recall_budget_tokens": 512,
-        "embedding_model_name": "BAAI/bge-base-en-v1.5", # Updated default
-        "vector_db_path": "data/vector_dbs/api_default_chat_history"
-        # cross_encoder_model_name and rerank_top_n_candidates will use class defaults if not specified here or in YAML
+        "embedding_model_name": "BAAI/bge-base-en-v1.5",
+        "vector_db_path": "data/vector_dbs/api_default_chat_history",
+        "cross_encoder_model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2", # Default from class
+        "rerank_top_n_candidates": 20, # Default from class
+        "enable_hybrid_search": True,
+        "rrf_k_constant": 60
     },
     "pdf_retriever": {
         "vector_db_path": "data/vector_dbs/api_default_pdf_rag",
-        "embedding_model_name": "BAAI/bge-base-en-v1.5", # Updated default
+        "embedding_model_name": "BAAI/bge-base-en-v1.5",
         "chunk_size": 500,
-        "chunk_overlap": 50
-        # cross_encoder_model_name and rerank_top_n_candidates will use class defaults if not specified here or in YAML
+        "chunk_overlap": 50,
+        "cross_encoder_model_name": "cross-encoder/ms-marco-MiniLM-L-6-v2", # Default from class
+        "rerank_top_n_candidates": 20, # Default from class
+        "enable_hybrid_search": True,
+        "rrf_k_constant": 60
     },
     "model_manager": {"default_idle_unload_sec": 900},
     "token_estimator_for_rag_budgeting": {"type": "tiktoken", "model_name": "cl100k_base"},
@@ -135,12 +141,15 @@ chat_history_retriever = ChatHistoryRetriever(
     tokenizer=rag_tokenizer,
     vector_db_path=chr_config.get('vector_db_path'),
     embedding_model_name=chr_config.get('embedding_model_name'),
-    cross_encoder_model_name=chr_config.get('cross_encoder_model_name'), # Pass from config
-    rerank_top_n_candidates=chr_config.get('rerank_top_n_candidates') # Pass from config
+    cross_encoder_model_name=chr_config.get('cross_encoder_model_name'),
+    rerank_top_n_candidates=chr_config.get('rerank_top_n_candidates'),
+    enable_hybrid_search=chr_config.get('enable_hybrid_search', True), # Get with default
+    rrf_k_constant=chr_config.get('rrf_k_constant', 60)               # Get with default
 )
 print(f"ChatHistoryRetriever initialized with: budget={chat_history_retriever.recall_budget_tokens}, "
       f"db_path='{chat_history_retriever.vector_db_full_path}', model='{chat_history_retriever.embedding_model_name}', "
-      f"cross_encoder='{chat_history_retriever.cross_encoder_model_name}', rerank_top_n={chat_history_retriever.rerank_top_n_candidates}")
+      f"cross_encoder='{chat_history_retriever.cross_encoder_model_name}', rerank_top_n={chat_history_retriever.rerank_top_n_candidates}, "
+      f"hybrid_search={chat_history_retriever.enable_hybrid_search}, rrf_k={chat_history_retriever.rrf_k_constant}")
 
 # PDF Retriever
 pdf_retriever_config = CONFIG.get('pdf_retriever', DEFAULT_CONFIG['pdf_retriever'])
@@ -150,11 +159,14 @@ pdf_retriever = PdfRetriever(
     tokenizer=rag_tokenizer,
     chunk_size=pdf_retriever_config.get('chunk_size'),
     chunk_overlap=pdf_retriever_config.get('chunk_overlap'),
-    cross_encoder_model_name=pdf_retriever_config.get('cross_encoder_model_name'), # Pass from config
-    rerank_top_n_candidates=pdf_retriever_config.get('rerank_top_n_candidates') # Pass from config
+    cross_encoder_model_name=pdf_retriever_config.get('cross_encoder_model_name'),
+    rerank_top_n_candidates=pdf_retriever_config.get('rerank_top_n_candidates'),
+    enable_hybrid_search=pdf_retriever_config.get('enable_hybrid_search', True), # Get with default
+    rrf_k_constant=pdf_retriever_config.get('rrf_k_constant', 60)               # Get with default
 )
 print(f"PdfRetriever initialized with: db_path='{pdf_retriever.vector_db_path}', model='{pdf_retriever.embedding_model_name}', "
-      f"cross_encoder='{pdf_retriever.cross_encoder_model_name}', rerank_top_n={pdf_retriever.rerank_top_n_candidates}")
+      f"cross_encoder='{pdf_retriever.cross_encoder_model_name}', rerank_top_n={pdf_retriever.rerank_top_n_candidates}, "
+      f"hybrid_search={pdf_retriever.enable_hybrid_search}, rrf_k={pdf_retriever.rrf_k_constant}")
 
 
 # Model Manager

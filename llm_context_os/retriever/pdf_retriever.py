@@ -36,18 +36,31 @@ except ImportError:
     print("Warning: chromadb library not found. PDF vector storage will not function.")
     chromadb = None
 
+# Attempt to import BM25Okapi
+BM25OKAPI_AVAILABLE = False
+try:
+    from rank_bm25 import BM25Okapi
+    BM25OKAPI_AVAILABLE = True
+    print("Successfully imported BM25Okapi from rank_bm25.")
+except ImportError:
+    print("Warning: rank_bm25 library not found. BM25 retrieval will not function.")
+    BM25Okapi = None # Placeholder
+
+
 class PdfRetriever:
     DEFAULT_COLLECTION_NAME = "pdf_document_chunks_v1"
     def __init__(self,
-                 vector_db_path: str = "data/vector_dbs/pdf_rag_db", # More specific default path
+                 vector_db_path: str = "data/vector_dbs/pdf_rag_db",
                  embedding_model_name: str = "all-MiniLM-L6-v2",
                  tokenizer = None,
                  recall_budget_tokens: int = 1024,
                  chunk_size: int = 500,
                  chunk_overlap: int = 50,
                  collection_name: t.Optional[str] = None,
-                 cross_encoder_model_name: t.Optional[str] = "ms-marco-MiniLM-L-6-v2", # Default from plan
-                 rerank_top_n_candidates: int = 20): # Default from plan
+                 cross_encoder_model_name: t.Optional[str] = "ms-marco-MiniLM-L-6-v2",
+                 rerank_top_n_candidates: int = 20,
+                 enable_hybrid_search: bool = True, # New default
+                 rrf_k_constant: int = 60): # New default
         self.vector_db_path = Path(vector_db_path)
         self.embedding_model_name = embedding_model_name
         self.tokenizer = tokenizer
@@ -59,6 +72,9 @@ class PdfRetriever:
         self.cross_encoder_model_name = cross_encoder_model_name
         self.rerank_top_n_candidates = rerank_top_n_candidates
         self.cross_encoder = None
+
+        self.enable_hybrid_search = enable_hybrid_search
+        self.rrf_k_constant = rrf_k_constant
 
         self.embedding_model = None
         if SENTENCE_TRANSFORMERS_AVAILABLE and SentenceTransformer:
@@ -108,6 +124,42 @@ class PdfRetriever:
             self.text_splitter = None
 
         print(f"[PdfRetriever] Initialized. Embedding: '{self.embedding_model_name if self.embedding_model else 'N/A'}'")
+
+        # BM25 specific initializations
+        self.bm25_corpus_texts: t.List[str] = []
+        self.bm25_chunk_ids: t.List[str] = [] # To map BM25 results back to original chunk IDs
+        self.bm25_index: t.Optional[BM25Okapi] = None
+        self.bm25_corpus_tokenized: t.Optional[t.List[t.List[str]]] = None
+        self.is_bm25_index_built: bool = False
+
+        if not BM25OKAPI_AVAILABLE:
+            print("[PdfRetriever] BM25Okapi not available from rank_bm25. BM25 features will be disabled.")
+
+
+    def _tokenize_for_bm25(self, text: str) -> t.List[str]:
+        # Basic tokenizer for BM25: lowercase and split by space.
+        # Can be replaced with a more sophisticated tokenizer if needed.
+        return text.lower().split()
+
+    def _build_bm25_index_if_needed(self):
+        if not BM25OKAPI_AVAILABLE: # Do nothing if library isn't there
+            return
+
+        if not self.is_bm25_index_built and self.bm25_corpus_texts:
+            print(f"[PdfRetriever] Building BM25 index for {len(self.bm25_corpus_texts)} chunks...")
+            try:
+                self.bm25_corpus_tokenized = [self._tokenize_for_bm25(text) for text in self.bm25_corpus_texts]
+                self.bm25_index = BM25Okapi(self.bm25_corpus_tokenized)
+                self.is_bm25_index_built = True
+                print(f"[PdfRetriever] BM25 index built successfully.")
+            except Exception as e_bm25_build:
+                print(f"[PdfRetriever] Error building BM25 index: {e_bm25_build}. BM25 will be unavailable.")
+                self.bm25_index = None # Ensure it's None if build fails
+                self.is_bm25_index_built = False # Mark as not built
+        elif not self.bm25_corpus_texts:
+            print("[PdfRetriever] No corpus texts for BM25 index. Skipping build.")
+            self.bm25_index = None
+            self.is_bm25_index_built = False
 
 
     def upload_document(self, pdf_path: str) -> t.Tuple[bool, str, t.Optional[str], t.Optional[int]]:
@@ -170,53 +222,68 @@ class PdfRetriever:
         if not self.collection:
             return False, "Vector database (ChromaDB collection) not available. Cannot process document.", doc_id, 0
 
-        chunk_texts_to_embed = []
-        chunk_metadatas = []
-        chunk_ids = []
+        current_doc_chunk_texts = []
+        current_doc_chunk_ids = []
+
+        chunk_embeddings_to_add = []
+        chunk_docs_to_add = []
+        chunk_metadatas_to_add = []
+        chunk_unique_ids_to_add = []
 
         for i, chunk_text_content in enumerate(raw_chunks):
-            chunk_id_val = str(uuid.uuid4())
-            chunk_texts_to_embed.append(chunk_text_content)
-            page_num_est = (i * (self.chunk_size - self.chunk_overlap)) // self.chunk_size + 1
-            chunk_metadatas.append({
-                'doc_id': doc_id, # Original document ID (filename stem)
-                'pdf_path': str(pdf_path), # Store full path to original PDF
+            chunk_id_val = str(uuid.uuid4()) # This is the ID for ChromaDB
+
+            current_doc_chunk_texts.append(chunk_text_content)
+            current_doc_chunk_ids.append(chunk_id_val) # Store mapping for BM25
+
+            chunk_docs_to_add.append(chunk_text_content)
+            page_num_est = (i * (self.chunk_size - self.chunk_overlap)) // self.chunk_size + 1 # Basic estimation
+            chunk_metadatas_to_add.append({
+                'doc_id': doc_id,
+                'pdf_path': str(pdf_path),
                 'page_number': page_num_est,
                 'chunk_index': i,
                 'text_length_chars': len(chunk_text_content),
                 'timestamp': time.time()
             })
-            chunk_ids.append(chunk_id_val) # Unique ID for each chunk
+            chunk_unique_ids_to_add.append(chunk_id_val)
 
-        if not chunk_texts_to_embed:
+        if not chunk_docs_to_add:
             msg = f"No text chunks produced for document {doc_id} after splitting."
             print(f"[PdfRetriever] {msg}")
             return True, msg, doc_id, 0
 
         try:
-            print(f"[PdfRetriever] Embedding {len(chunk_texts_to_embed)} chunks for document {doc_id}...")
-            embeddings = self.embedding_model.encode(chunk_texts_to_embed).tolist()
+            print(f"[PdfRetriever] Embedding {len(chunk_docs_to_add)} chunks for document {doc_id}...")
+            chunk_embeddings_to_add = self.embedding_model.encode(chunk_docs_to_add).tolist()
 
-            print(f"[PdfRetriever] Adding {len(chunk_ids)} chunks to ChromaDB collection '{self.db_collection_name}' for document {doc_id}...")
+            print(f"[PdfRetriever] Adding {len(chunk_unique_ids_to_add)} chunks to ChromaDB for document {doc_id}...")
             self.collection.add(
-                ids=chunk_ids,
-                embeddings=embeddings,
-                documents=chunk_texts_to_embed, # Store the actual text of the chunk
-                metadatas=chunk_metadatas
+                ids=chunk_unique_ids_to_add,
+                embeddings=chunk_embeddings_to_add,
+                documents=chunk_docs_to_add,
+                metadatas=chunk_metadatas_to_add
             )
-            num_processed_chunks = len(chunk_ids)
-            msg = f"Successfully extracted, embedded, and stored {num_processed_chunks} chunks for document: {doc_id} in collection '{self.db_collection_name}'."
+
+            # Add to BM25 corpus only after successful ChromaDB add
+            self.bm25_corpus_texts.extend(current_doc_chunk_texts)
+            self.bm25_chunk_ids.extend(current_doc_chunk_ids)
+            self.is_bm25_index_built = False # Mark BM25 index for rebuild
+
+            num_processed_chunks = len(chunk_unique_ids_to_add)
+            msg = f"Successfully extracted, embedded, and stored {num_processed_chunks} chunks for document: {doc_id}."
             print(f"[PdfRetriever] {msg}")
             return True, msg, doc_id, num_processed_chunks
         except Exception as e:
             msg = f"Error during embedding or storing chunks for document {doc_id}: {e}"
             print(f"[PdfRetriever] {msg}")
-            # import traceback; traceback.print_exc() # For debugging
             return False, msg, doc_id, 0
 
 
     def retrieve_from_pdf(self, query_text: str, doc_ids: t.Optional[t.List[str]] = None, top_k: int = 3) -> t.List[t.Dict[str, str]]:
         print(f"\n[PdfRetriever] retrieve_from_pdf called. Query: '{query_text[:50]}...', Target Docs: {doc_ids or 'all'}, Top K: {top_k}")
+
+        self._build_bm25_index_if_needed() # Ensure BM25 index is ready
 
         if not self.embedding_model:
             print("[PdfRetriever] Error: Embedding model not available for retrieval.")
@@ -225,113 +292,161 @@ class PdfRetriever:
             print("[PdfRetriever] Error: Vector database (ChromaDB collection) not available for retrieval.")
             return []
         if not self.tokenizer:
-            # This was set to BasicCharTokenizer in __init__ if tiktoken failed, so it should always exist.
-            # However, if it somehow became None, or if BasicCharTokenizer is deemed insufficient:
             print("[PdfRetriever] Error: Tokenizer not available for budgeting. Cannot reliably size snippets.")
             return []
 
+        if not self.tokenizer:
+            print("[PdfRetriever] Error: Tokenizer not available for budgeting. Cannot reliably size snippets.")
+            return []
+
+        doc_details_cache = {} # To store full details for RRF reconstruction & final snippet generation
+        candidate_items_for_cross_encoder = []
+
+        # --- Dense Retrieval (ChromaDB) ---
         try:
-            print(f"[PdfRetriever] Embedding query for retrieval: '{query_text[:100]}...'")
+            print(f"[PdfRetriever] Embedding query for dense retrieval: '{query_text[:100]}...'")
             query_embedding = self.embedding_model.encode(query_text).tolist()
-        except Exception as e:
-            print(f"[PdfRetriever] Error embedding query '{query_text[:100]}...': {e}")
-            return []
 
-        chroma_filter: t.Optional[t.Dict[str, t.Any]] = None
-        if doc_ids:
-            if len(doc_ids) == 1:
-                chroma_filter = {"doc_id": doc_ids[0]}
-            else:
-                # Ensure doc_ids are strings, as ChromaDB metadata values are typically str, int, float, bool
-                chroma_filter = {"doc_id": {"$in": [str(did) for did in doc_ids]}}
-            print(f"[PdfRetriever] Applying ChromaDB filter: {chroma_filter}")
+            chroma_filter: t.Optional[t.Dict[str, t.Any]] = None
+            if doc_ids:
+                chroma_filter = {"doc_id": {"$in": [str(did) for did in doc_ids]}} if len(doc_ids) > 1 else {"doc_id": str(doc_ids[0])}
+                print(f"[PdfRetriever] Applying ChromaDB filter for dense search: {chroma_filter}")
 
-        try:
-            # Retrieve more candidates for potential re-ranking.
-            # Use self.rerank_top_n_candidates if re-ranker is present, otherwise a smaller set.
-            num_initial_candidates = self.rerank_top_n_candidates if self.cross_encoder else top_k * 3
-
-            print(f"[PdfRetriever] Querying ChromaDB collection (requesting {num_initial_candidates} candidates).")
-            results = self.collection.query(
+            num_dense_to_fetch = self.rerank_top_n_candidates
+            print(f"[PdfRetriever] Querying ChromaDB for dense results (requesting {num_dense_to_fetch} candidates).")
+            chroma_results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=num_initial_candidates,
+                n_results=num_dense_to_fetch,
                 where=chroma_filter,
-                include=['documents', 'metadatas', 'distances']
+                include=['documents', 'metadatas', 'distances'] # Ensure 'ids' is implicitly included or add it
             )
+
+            if chroma_results and chroma_results.get('ids') and chroma_results['ids'][0]:
+                for i in range(len(chroma_results['ids'][0])):
+                    chunk_id = chroma_results['ids'][0][i]
+                    doc_text = chroma_results['documents'][0][i] if chroma_results['documents'] and chroma_results['documents'][0][i] is not None else "Content not available"
+                    metadata = chroma_results['metadatas'][0][i] if chroma_results['metadatas'] else {}
+                    distance = chroma_results['distances'][0][i] if chroma_results['distances'] else float('inf')
+
+                    if doc_text.strip().lower() == query_text.strip().lower(): continue
+
+                    # Store with a score where higher is better (e.g., negative distance)
+                    doc_details_cache[chunk_id] = {"id": chunk_id, "text": doc_text, "metadata": metadata, "dense_score": -distance, "source": "dense"}
+                print(f"[PdfRetriever] Dense retrieval found {len(doc_details_cache)} candidates.")
         except Exception as e:
-            print(f"[PdfRetriever] Error querying ChromaDB: {e}")
-            # import traceback; traceback.print_exc()
-            return []
+            print(f"[PdfRetriever] Error during dense retrieval: {e}")
 
-        retrieved_snippets: t.List[t.Dict[str, str]] = []
-        current_token_count = 0
-
-        if not results or not results.get('ids') or not results['ids'][0]:
-            print("[PdfRetriever] No initial results from ChromaDB query for the given criteria.")
-            return []
-
-        # Process results (ids, documents, metadatas, distances are all lists of lists, take the first list for our single query)
-        result_ids = results['ids'][0]
-        result_documents = results['documents'][0] if results['documents'] else [""] * len(result_ids)
-        result_metadatas = results['metadatas'][0] if results['metadatas'] else [{}] * len(result_ids)
-        result_distances = results['distances'][0] if results['distances'] else [float('inf')] * len(result_ids)
-
-        candidate_items = []
-        for i in range(len(result_ids)):
-            doc_text = result_documents[i] if result_documents[i] is not None else "Content not available"
-            metadata = result_metadatas[i] if result_metadatas[i] is not None else {}
-            distance = result_distances[i] if result_distances[i] is not None else float('inf')
-
-            if doc_text.strip().lower() == query_text.strip().lower(): # Avoid exact match of query
-                print(f"  Skipping retrieved chunk identical to query: '{doc_text[:50]}...'")
-                continue
-
-            candidate_items.append({
-                "text": doc_text,
-                "metadata": metadata,
-                "distance": distance,
-                "id": result_ids[i]
-            })
-
-        # Re-ranking step
-        if self.cross_encoder and candidate_items:
-            print(f"[PdfRetriever] Re-ranking {len(candidate_items)} candidates with CrossEncoder: {self.cross_encoder_model_name}")
+        if self.enable_hybrid_search and self.bm25_index and self.bm25_chunk_ids:
+            print(f"[PdfRetriever] Performing BM25 sparse retrieval for query: '{query_text[:100]}...'")
             try:
-                pairs = [(query_text, item['text']) for item in candidate_items]
+                tokenized_query = self._tokenize_for_bm25(query_text)
+                bm25_scores = self.bm25_index.get_scores(tokenized_query)
+
+                # Combine BM25 scores with existing doc_details or add new entries
+                for i, chunk_id in enumerate(self.bm25_chunk_ids):
+                    score = bm25_scores[i]
+                    if score > 0: # Only consider documents with a positive BM25 score
+                        if chunk_id in doc_details_cache:
+                            doc_details_cache[chunk_id]['sparse_score'] = score
+                            doc_details_cache[chunk_id]['source'] += ",sparse"
+                        else: # Chunk found by BM25 but not by dense
+                            # Need to fetch text and metadata for these.
+                            # This requires bm25_corpus_texts and a way to map bm25_chunk_ids to metadata.
+                            # For now, we'll assume if not in dense, we can't easily get metadata for sparse-only.
+                            # This means sparse-only results might lack some details for cross-encoder or snippet.
+                            # A get_by_ids from Chroma could fetch metadata for these if needed.
+                            doc_details_cache[chunk_id] = {
+                                "id": chunk_id,
+                                "text": self.bm25_corpus_texts[i], # Text from BM25 corpus
+                                "metadata": {}, # Placeholder metadata for sparse-only
+                                "sparse_score": score,
+                                "source": "sparse_only"
+                            }
+                print(f"[PdfRetriever] BM25 scores computed/merged for {len(self.bm25_chunk_ids)} items. Cache size: {len(doc_details_cache)}")
+            except Exception as e_bm25:
+                print(f"[PdfRetriever] Error during BM25 retrieval: {e_bm25}")
+
+            # --- Reciprocal Rank Fusion (RRF) ---
+            fused_scores: t.Dict[str, float] = {}
+
+            # Dense results ranking (higher dense_score is better)
+            # Sort by dense_score to get ranks for RRF
+            sorted_dense_for_rrf = sorted([d for d in doc_details_cache.values() if 'dense_score' in d], key=lambda x: x['dense_score'], reverse=True)
+            for rank, doc in enumerate(sorted_dense_for_rrf):
+                fused_scores[doc["id"]] = fused_scores.get(doc["id"], 0.0) + (1.0 / (self.rrf_k_constant + rank))
+
+            # Sparse results ranking (higher sparse_score is better)
+            sorted_sparse_for_rrf = sorted([d for d in doc_details_cache.values() if 'sparse_score' in d], key=lambda x: x['sparse_score'], reverse=True)
+            for rank, doc in enumerate(sorted_sparse_for_rrf):
+                fused_scores[doc["id"]] = fused_scores.get(doc["id"], 0.0) + (1.0 / (self.rrf_k_constant + rank))
+
+            if fused_scores:
+                sorted_fused_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
+                print(f"[PdfRetriever] RRF resulted in {len(sorted_fused_ids)} unique candidates. Top RRF score: {fused_scores[sorted_fused_ids[0]]:.4f} if any.")
+
+                # Prepare candidates for cross-encoder using RRF sorted IDs
+                for chunk_id in sorted_fused_ids[:self.rerank_top_n_candidates]: # Take top N from RRF
+                    if chunk_id in doc_details_cache:
+                        item = doc_details_cache[chunk_id]
+                        item['rrf_score'] = fused_scores[chunk_id]
+                        candidate_items_for_cross_encoder.append(item)
+                    # Else: ID from fused_scores somehow not in cache, should not happen.
+            else: # No scores to fuse, means neither dense nor sparse returned anything with score
+                print("[PdfRetriever] No results from dense or sparse retrieval to fuse.")
+                # candidate_items_for_cross_encoder will remain empty.
+
+        else: # Hybrid search disabled, use only dense results
+            print("[PdfRetriever] Hybrid search disabled. Using only dense retrieval results.")
+            # Populate candidate_items_for_cross_encoder from dense_results_list directly
+            # dense_results_list is already sorted by dense_score (descending, higher is better)
+            candidate_items_for_cross_encoder = dense_results_list[:self.rerank_top_n_candidates]
+
+
+        if not candidate_items_for_cross_encoder:
+            print("[PdfRetriever] No candidates to process for cross-encoding or snippet generation.")
+            return []
+
+        # --- Cross-encoder Re-ranking ---
+        # The list `candidate_items_for_cross_encoder` now holds the items to be re-ranked.
+        # It's either top N from RRF (if hybrid) or top N from dense (if not hybrid).
+        if self.cross_encoder and candidate_items_for_cross_encoder:
+            print(f"[PdfRetriever] Cross-encoding {len(candidate_items_for_cross_encoder)} candidates with: {self.cross_encoder_model_name}")
+            try:
+                pairs = [(query_text, item['text']) for item in candidate_items_for_cross_encoder]
                 cross_scores = self.cross_encoder.predict(pairs)
 
                 for i, item in enumerate(candidate_items):
                     item['cross_score'] = cross_scores[i]
 
                 # Sort by cross_score in descending order (higher is better)
-                candidate_items.sort(key=lambda x: x.get('cross_score', -float('inf')), reverse=True)
-                print(f"[PdfRetriever] Re-ranking complete. Top score: {candidate_items[0].get('cross_score', 'N/A'):.4f} if results exist.")
+                candidate_items_for_cross_encoder.sort(key=lambda x: x.get('cross_score', -float('inf')), reverse=True)
+                if candidate_items_for_cross_encoder:
+                    print(f"[PdfRetriever] Cross-encoding complete. Top cross_score: {candidate_items_for_cross_encoder[0].get('cross_score', 'N/A'):.4f}")
             except Exception as e_rerank:
-                print(f"[PdfRetriever] Error during CrossEncoder prediction/re-ranking: {e_rerank}. Proceeding with original ranking.")
-        else:
-            # If no cross-encoder, ChromaDB results are already sorted by distance (ascending, lower is better)
-            # No explicit sort needed here as we iterate and take top_k.
-            pass
+                print(f"[PdfRetriever] Error during CrossEncoder prediction/re-ranking: {e_rerank}. Proceeding with pre-cross-encoder sorted list.")
 
+        # Snippet generation from final candidate_items (which are now sorted by cross-encoder if enabled, else by RRF/dense)
+        final_candidates_for_snippets = candidate_items_for_cross_encoder
 
-        for res_item in candidate_items: # Iterate through potentially re-ranked items
-            if len(retrieved_snippets) >= top_k: # Apply final top_k limit
+        retrieved_snippets: t.List[t.Dict[str, str]] = []
+        current_token_count = 0
+        for res_item in final_candidates_for_snippets:
+            if len(retrieved_snippets) >= top_k: # Apply final top_k limit from original request
                 break
 
             doc_id_meta = res_item['metadata'].get('doc_id', 'UnknownDoc')
             page_num_meta = res_item['metadata'].get('page_number', 'N/A')
-            cross_score_val = res_item.get('cross_score', 'N/A')
-            if isinstance(cross_score_val, float):
-                cross_score_str = f"{cross_score_val:.4f}"
-            else:
-                cross_score_str = "N/A"
+
+            dense_score_val = res_item.get('dense_score') # This is negative distance
+            dense_dist_str = f"{-dense_score_val:.4f}" if dense_score_val is not None else "N/A"
+            sparse_score_str = f"{res_item['sparse_score']:.4f}" if 'sparse_score' in res_item else "N/A"
+            rrf_score_str = f"{res_item['rrf_score']:.4f}" if 'rrf_score' in res_item else "N/A"
+            cross_score_str = f"{res_item['cross_score']:.4f}" if 'cross_score' in res_item else "N/A"
 
             snippet_text = (f"Retrieved from '{doc_id_meta}' "
-                            f"(Page {page_num_meta}, ~distance {res_item['distance']:.4f}, ~rerank_score {cross_score_str}): "
+                            f"(Page {page_num_meta}, dense_dist: {dense_dist_str}, sparse: {sparse_score_str}, rrf: {rrf_score_str}, cross: {cross_score_str}): "
                             f"\"{res_item['text']}\"")
-
             try:
-                # Ensure tokenizer is available and has an encode method
                 if hasattr(self.tokenizer, 'encode'):
                     snippet_tokens = len(self.tokenizer.encode(snippet_text))
                 elif hasattr(self.tokenizer, 'count_tokens'): # Fallback to count_tokens if encode not present
