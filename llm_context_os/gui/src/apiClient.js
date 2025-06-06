@@ -1,4 +1,4 @@
-// llm_context_os/gui/src/apiClient.js
+// yawl/gui/src/apiClient.js
 const API_BASE_URL = 'http://localhost:8000'; // Assuming backend runs on port 8000
 
 async function request(endpoint, method = 'GET', body = null) {

@@ -1,4 +1,4 @@
-# llm_context_os/runners/vllm_runner.py
+# yawl/runners/vllm_runner.py
 import typing as t
 import json
 import httpx # Added
@@ -10,7 +10,10 @@ class VLLMRunner(BaseRunner):
         self.model_name = model_name # This is the 'model' field in the OpenAI-compatible API payload
         self.api_url = api_url # This should be the base URL, e.g., http://localhost:8000
         self.api_key = api_key
-        self.completion_endpoint = "/v1/completions" # Standard for prompt-based completions
+        # For OpenAI-compatible vLLM, the endpoint is typically /v1/completions or /v1/chat/completions
+        # Assuming /v1/completions for now as per original structure.
+        # If using /v1/chat/completions, the payload structure in generate/stream would need to change.
+        self.completion_endpoint = "/v1/completions"
 
         self.http_client = httpx.Client(
             base_url=self.api_url,
@@ -26,34 +29,31 @@ class VLLMRunner(BaseRunner):
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs) -> str:
+    def generate(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Tuple[str, t.Dict[str, int]]:
         if image_paths:
             print(f"[VLLMRunner] Warning: image_paths provided but standard vLLM OpenAI-compatible /v1/completions endpoint does not support them directly. Ignoring images: {image_paths}")
 
         headers = self._prepare_headers()
-        # Common parameters for vLLM OpenAI-compatible /v1/completions
-        # Note: vLLM might have specific names for some parameters or additional ones.
-        # Refer to vLLM documentation for exact payload structure if different from standard OpenAI.
         payload = {
             "model": self.model_name,
             "prompt": prompt,
             "max_tokens": kwargs.get('max_new_tokens', kwargs.get('max_tokens', 128)),
             "temperature": kwargs.get('temperature', 0.7),
-            "top_p": kwargs.get('top_p', 1.0), # Default 1.0 for vLLM if not specified
-            "n": kwargs.get('n', 1), # Number of completions to generate
-            "stop": kwargs.get('stop', None), # List of stop sequences
+            "top_p": kwargs.get('top_p', 1.0),
+            "n": kwargs.get('n', 1),
+            "stop": kwargs.get('stop', None),
             "stream": False,
-            # Other potential params: presence_penalty, frequency_penalty, best_of, logprobs, etc.
-            # Add them from kwargs if needed.
         }
-        # Filter out None values to avoid sending them if they are not set
         payload = {k: v for k, v in payload.items() if v is not None}
-        # Add any other kwargs passed, assuming they are valid for the API
-        payload.update(kwargs)
+        # Allow direct pass-through of other kwargs that might be vLLM specific for /completions
+        payload.update({k:v for k,v in kwargs.items() if k not in payload})
 
 
         print(f"[VLLMRunner] Calling generate on {self.completion_endpoint} for model '{self.model_name}'")
-        # print(f"Payload: {json.dumps(payload, indent=2)}") # Can be verbose
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        generated_text = ""
 
         try:
             response = self.http_client.post(
@@ -65,26 +65,41 @@ class VLLMRunner(BaseRunner):
             response_data = response.json()
 
             generated_text = response_data.get("choices", [{}])[0].get("text", "").strip()
-            # TODO: Extract token counts if vLLM provides them in the 'usage' field like OpenAI
-            return generated_text
+
+            if "usage" in response_data:
+                prompt_tokens = response_data["usage"].get("prompt_tokens", 0)
+                completion_tokens = response_data["usage"].get("completion_tokens", 0)
+            else: # Fallback if no usage field
+                if hasattr(self, 'count_tokens') and callable(self.count_tokens): # Check if count_tokens is available
+                    prompt_tokens_est = self.count_tokens(prompt)
+                    prompt_tokens = prompt_tokens_est if prompt_tokens_est is not None else 0
+
+                    completion_tokens_est = self.count_tokens(generated_text)
+                    completion_tokens = completion_tokens_est if completion_tokens_est is not None else 0
+                else: # Absolute fallback
+                    prompt_tokens = len(prompt.split())
+                    completion_tokens = len(generated_text.split())
+
+            return generated_text, {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+
         except httpx.HTTPStatusError as e:
             error_detail = f"HTTP error {e.response.status_code} from vLLM server: {e.response.text}"
             print(f"[VLLMRunner] {error_detail}")
-            return f"[VLLMRunner] Error: {error_detail}"
+            return f"[VLLMRunner] Error: {error_detail}", {"prompt_tokens": prompt_tokens, "completion_tokens": 0}
         except httpx.RequestError as e:
             error_detail = f"Request error connecting to vLLM server: {str(e)}"
             print(f"[VLLMRunner] {error_detail}")
-            return f"[VLLMRunner] Error: {error_detail}"
+            return f"[VLLMRunner] Error: {error_detail}", {"prompt_tokens": prompt_tokens, "completion_tokens": 0}
         except json.JSONDecodeError as e:
             error_detail = f"Failed to decode JSON response from vLLM server: {str(e)}"
             print(f"[VLLMRunner] {error_detail}")
-            return f"[VLLMRunner] Error: {error_detail}"
+            return f"[VLLMRunner] Error: {error_detail}", {"prompt_tokens": prompt_tokens, "completion_tokens": 0}
         except Exception as e:
             error_detail = f"Unexpected error processing vLLM response: {str(e)}"
             print(f"[VLLMRunner] {error_detail}")
-            return f"[VLLMRunner] Error: {error_detail}"
+            return f"[VLLMRunner] Error: {error_detail}", {"prompt_tokens": prompt_tokens, "completion_tokens": 0}
 
-    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs) -> t.Generator[str, None, None]:
+    def stream(self, prompt: str, image_paths: t.Optional[t.List[str]] = None, **kwargs: t.Any) -> t.Generator[t.Union[t.Dict[str, int], t.Tuple[str, int]], None, None]:
         if image_paths:
             print(f"[VLLMRunner] Warning: image_paths provided but standard vLLM OpenAI-compatible /v1/completions endpoint does not support them directly. Ignoring images: {image_paths}")
 
@@ -100,10 +115,19 @@ class VLLMRunner(BaseRunner):
             "stream": True,
         }
         payload = {k: v for k, v in payload.items() if v is not None}
-        payload.update(kwargs)
+        payload.update({k:v for k,v in kwargs.items() if k not in payload})
+
 
         print(f"[VLLMRunner] Calling stream on {self.completion_endpoint} for model '{self.model_name}'")
-        # print(f"Payload: {json.dumps(payload, indent=2)}")
+
+        prompt_tokens = 0
+        if hasattr(self, 'count_tokens') and callable(self.count_tokens):
+            pt_count = self.count_tokens(prompt)
+            prompt_tokens = pt_count if pt_count is not None else 0
+        else:
+            prompt_tokens = len(prompt.split())
+        yield {"prompt_tokens": prompt_tokens}
+
 
         try:
             with self.http_client.stream("POST", self.completion_endpoint, json=payload, headers=headers) as response:
@@ -120,7 +144,14 @@ class VLLMRunner(BaseRunner):
                             data_json = json.loads(data_json_str)
                             chunk_text = data_json.get("choices", [{}])[0].get("text", "")
                             if chunk_text:
-                                yield chunk_text
+                                # Estimating tokens for the chunk. This is an approximation.
+                                tokens_in_chunk = 0
+                                if hasattr(self, 'count_tokens') and callable(self.count_tokens):
+                                     tok_est = self.count_tokens(chunk_text)
+                                     tokens_in_chunk = tok_est if tok_est is not None else 0
+                                else:
+                                     tokens_in_chunk = len(chunk_text.split()) # Fallback
+                                yield (chunk_text, tokens_in_chunk)
                         except json.JSONDecodeError:
                             print(f"[VLLMRunner] Warning: Could not decode JSON from stream line: {line}")
                         except Exception as e_chunk:
@@ -128,15 +159,15 @@ class VLLMRunner(BaseRunner):
         except httpx.HTTPStatusError as e:
             error_detail = f"HTTP error {e.response.status_code} starting vLLM stream: {e.response.text}"
             print(f"[VLLMRunner] {error_detail}")
-            yield f"[VLLMRunner] Error: {error_detail}"
+            yield (f"[VLLMRunner] Error: {error_detail}", 0)
         except httpx.RequestError as e:
             error_detail = f"Request error connecting to vLLM server for stream: {str(e)}"
             print(f"[VLLMRunner] {error_detail}")
-            yield f"[VLLMRunner] Error: {error_detail}"
+            yield (f"[VLLMRunner] Error: {error_detail}", 0)
         except Exception as e:
             error_detail = f"Unexpected error during vLLM stream: {str(e)}"
             print(f"[VLLMRunner] {error_detail}")
-            yield f"[VLLMRunner] Error: {error_detail}"
+            yield (f"[VLLMRunner] Error: {error_detail}", 0)
         finally:
             print("[VLLMRunner] Stream finished or aborted.")
 
@@ -177,6 +208,15 @@ class VLLMRunner(BaseRunner):
         print("  Unmerging LoRAs is server-side or offline for vLLM. Not client controllable.")
         return False
 
+    def count_tokens(self, text: str) -> t.Optional[int]:
+        # vLLM /v1/completions does not have a standard /v1/tokenize endpoint.
+        # This is a placeholder. A real implementation might use a local tokenizer
+        # known to be compatible with the vLLM model, or this method could be removed
+        # if token counting is not expected from this client-side runner.
+        print(f"[VLLMRunner] count_tokens called for text: '{text[:50]}...'. This is a placeholder and uses word count.")
+        return len(text.split())
+
+
 if __name__ == '__main__':
     import os
     print("--- Testing VLLMRunner ---")
@@ -215,8 +255,10 @@ if __name__ == '__main__':
 
     gen_params = {"max_tokens": 50, "temperature": 0.5} # Using max_tokens as per OpenAI /v1/completions
     print(f"Sending to generate: '{gen_prompt}' with params: {gen_params}")
-    gen_output = vllm_runner.generate(gen_prompt, **gen_params)
+    gen_output, gen_tokens = vllm_runner.generate(gen_prompt, **gen_params)
     print(f"Generate Output:\n{gen_output}")
+    print(f"Token counts: {gen_tokens}")
+
 
     print("\n--- Stream Demo ---")
     stream_prompt = "Tell me a short joke."
@@ -224,11 +266,26 @@ if __name__ == '__main__':
     stream_params = {"temperature": 0.7, "max_tokens": 60}
     print(f"Sending to stream: '{stream_prompt}' with params: {stream_params}")
     full_streamed_response = []
+    stream_completion_tokens_estimate = 0
     print("Streamed Output:")
-    for chunk in vllm_runner.stream(stream_prompt, **stream_params):
-        print(chunk, end='', flush=True)
-        full_streamed_response.append(chunk)
+
+    stream_generator = vllm_runner.stream(stream_prompt, **stream_params)
+
+    first_item = next(stream_generator)
+    if isinstance(first_item, dict) and "prompt_tokens" in first_item:
+        print(f"(Prompt tokens: {first_item['prompt_tokens']})")
+
+    for item in stream_generator:
+        if isinstance(item, tuple):
+            chunk_text, chunk_tokens = item
+            print(chunk_text, end='', flush=True)
+            full_streamed_response.append(chunk_text)
+            stream_completion_tokens_estimate += chunk_tokens
+        else: # Should not happen
+            print(f"Unexpected item: {item}")
+
     print("\nFull streamed response collected:", "".join(full_streamed_response))
+    print(f"Estimated completion tokens from stream: {stream_completion_tokens_estimate}")
     print("\n")
 
     print("\nVLLMRunner functional demonstration complete.")

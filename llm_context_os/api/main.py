@@ -1,4 +1,4 @@
-# llm_context_os/api/main.py
+# yawl/api/main.py
 import uvicorn
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import StreamingResponse
@@ -12,7 +12,7 @@ import shutil
 
 # App-specific imports
 import yaml # For config loading
-from llm_context_os.api.schemas import (
+from yawl.api.schemas import (
     LoadModelRequest,
     ChatRequest,
     StatusResponse,
@@ -33,19 +33,19 @@ from llm_context_os.api.schemas import (
     ToolInfo, ToolListResponse, ToggleToolRequest, # Added for tool management
     DownloadModelRequest # Added for model download
 )
-from llm_context_os.utils.hf_downloader import download_model_from_hf # Added for model download
-from llm_context_os.context.context_manager import ContextManager, MockTokenizer
-from llm_context_os.context.token_estimator import TikTokenEstimator, HFTokenEstimator # For RAG tokenizer
-from llm_context_os.runners.manager import ModelManager
-from llm_context_os.runners.base import BaseRunner
-from llm_context_os.retriever.chat_history import ChatHistoryRetriever
-from llm_context_os.retriever.pdf_retriever import PdfRetriever
-from llm_context_os.tools.tool_dispatcher import ToolDispatcher
+from yawl.utils.hf_downloader import download_model_from_hf # Added for model download
+from yawl.context.context_manager import ContextManager, MockTokenizer
+from yawl.context.token_estimator import TikTokenEstimator, HFTokenEstimator # For RAG tokenizer
+from yawl.runners.manager import ModelManager
+from yawl.runners.base import BaseRunner
+from yawl.retriever.chat_history import ChatHistoryRetriever
+from yawl.retriever.pdf_retriever import PdfRetriever
+from yawl.tools.tool_dispatcher import ToolDispatcher
 
 # --- Application Setup ---
 app = FastAPI(
-    title="LLM Context OS API",
-    description="API for managing local LLM models, context, RAG, and tool-enhanced generation. "
+    title="YAWL API",
+    description="YAWL (Yet Another Wrapper for Llama): API for managing local LLM models, context, RAG, and tool-enhanced generation. "
                 "Supports OpenAI-compatible tool calling and schema retrieval.",
     version="0.1.3" # Incremented version for tool call and RAG enhancements
 )
@@ -93,10 +93,10 @@ DEFAULT_CONFIG = {
 }
 CONFIG = DEFAULT_CONFIG.copy() # Start with defaults
 try:
-    # Assuming config.yaml is in llm_context_os/config/config.yaml relative to project root
+    # Assuming config.yaml is in yawl/config/config.yaml relative to project root
     # For robustness, resolve path from this file's location.
-    # __file__ is llm_context_os/api/main.py
-    # So, parent is api/, parent.parent is llm_context_os/
+    # __file__ is yawl/api/main.py
+    # So, parent is api/, parent.parent is yawl/
     config_file_path = Path(__file__).parent.parent / "config" / "config.yaml"
     if config_file_path.exists():
         print(f"Loading configuration from: {config_file_path}")
@@ -203,7 +203,7 @@ tool_dispatcher = ToolDispatcher()
 print("ToolDispatcher initialized.")
 
 # --- Project Root for resolving relative paths in config ---
-PROJECT_ROOT = Path(__file__).resolve().parent.parent # llm_context_os directory
+PROJECT_ROOT = Path(__file__).resolve().parent.parent # yawl directory
 print(f"Project root determined for resolving relative paths: {PROJECT_ROOT}")
 
 # --- Helper for deep merging dictionaries for settings updates ---
@@ -461,7 +461,7 @@ async def get_available_models_endpoint():
 
     try:
         # Assuming model_scanner is imported correctly
-        from llm_context_os.utils import model_scanner # Ensure this import is at the top
+        from yawl.utils import model_scanner # Ensure this import is at the top
         found_models = model_scanner.scan_model_directories(absolute_scan_paths)
         return ModelListResponse(models=found_models)
     except Exception as e:
@@ -1126,7 +1126,7 @@ async def chat_endpoint(req: ChatRequest):
 
 
 if __name__ == "__main__":
-    print("Starting Uvicorn server for LLM Context OS API...")
+    print("Starting Uvicorn server for YAWL API...")
     # ... (Uvicorn run command) ...
 
     # Updated curl examples:

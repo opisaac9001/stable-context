@@ -1,4 +1,4 @@
-// llm_context_os/gui/src/components/ModelLoader.jsx
+// yawl/gui/src/components/ModelLoader.jsx
 import React, { useState } from 'react';
 import { loadModel } from '../apiClient';
 

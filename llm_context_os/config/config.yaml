@@ -1,4 +1,4 @@
-# llm_context_os/config/config.yaml
+# yawl/config/config.yaml
 
 # --- Configuration for API server components ---
 
@@ -81,7 +81,7 @@ token_estimator_for_rag_budgeting:
 
 # --- Model Discovery Configuration ---
 # Define a list of directories to scan for local models.
-# Paths can be absolute or relative to the project root (where llm_context_os is located).
+# Paths can be absolute or relative to the project root (where yawl is located).
 # For dockerized environments, these paths should correspond to paths within the container.
 # For downloaded models to be automatically discovered, ensure the 'model_download_dir' (see below)
 # or specific subdirectories within it are included in this list.

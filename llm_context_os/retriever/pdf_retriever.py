@@ -1,4 +1,4 @@
-# llm_context_os/retriever/pdf_retriever.py
+# yawl/retriever/pdf_retriever.py
 import typing as t
 from pathlib import Path
 import uuid
@@ -250,20 +250,23 @@ class PdfRetriever:
             print(f"[PdfRetriever] {msg}")
             return False, msg, doc_id, 0 # Return doc_id if available, else it might be None if error was early
 
-        if not self.text_splitter:
-            msg = "Error: Text splitter not available (e.g., langchain-text-splitters not installed). Cannot process document."
-            print(f"[PdfRetriever] {msg}")
-            return False, msg, doc_id, 0
+        # This check was originally here, but text_splitter is only used if strategy is 'recursive'
+        # if not self.text_splitter:
+        #     msg = "Error: Text splitter not available (e.g., langchain-text-splitters not installed). Cannot process document."
+        #     print(f"[PdfRetriever] {msg}")
+        #     return False, msg, doc_id, 0
 
-            print(f"[PdfRetriever] Splitting text for document {doc_id} using '{self.chunking_strategy}' strategy...")
+        print(f"[PdfRetriever] Splitting text for document {doc_id} using '{self.chunking_strategy}' strategy...")
         try:
             if self.chunking_strategy == "semantic" and self.semantic_sentence_embedder:
                 raw_chunks = self._chunk_semantically(full_text_content)
                 print(f"[PdfRetriever] Semantic chunking produced {len(raw_chunks)} chunks for {doc_id}.")
-            elif self.text_splitter: # Existing recursive chunking
+            elif self.text_splitter: # Existing recursive chunking or fallback if semantic_sentence_embedder is None
+                if self.chunking_strategy == "semantic" and not self.semantic_sentence_embedder:
+                    print(f"[PdfRetriever] Warning: Semantic chunking strategy selected, but semantic embedder not available. Falling back to recursive text splitter for {doc_id}.")
                 raw_chunks = self.text_splitter.split_text(full_text_content)
                 print(f"[PdfRetriever] Recursive chunking produced {len(raw_chunks)} chunks for {doc_id}.")
-            else: # Fallback if no splitter configured or semantic failed to init
+            else: # Fallback if no splitter configured or semantic failed to init and text_splitter is also None
                 raw_chunks = [full_text_content] # Treat full document as one chunk
                 print(f"[PdfRetriever] Warning: No text splitter available (semantic or recursive). Using full document as one chunk for {doc_id}.")
         except Exception as e_split:
@@ -295,11 +298,17 @@ class PdfRetriever:
             current_doc_chunk_ids.append(chunk_id_val) # Store mapping for BM25
 
             chunk_docs_to_add.append(chunk_text_content)
-            page_num_est = (i * (self.chunk_size - self.chunk_overlap)) // self.chunk_size + 1 # Basic estimation
+            # Estimate page number based on chunk index and typical chunk content. This is a rough estimate.
+            # A more accurate method would involve linking chunks back to specific PDF page numbers during extraction.
+            page_num_est = "N/A" # Default
+            if self.chunking_strategy == "recursive" and self.chunk_size > 0:
+                 page_num_est = (i * (self.chunk_size - self.chunk_overlap)) // self.chunk_size + 1 # Basic estimation for recursive
+            # For semantic, page number estimation is harder without more info from chunking.
+
             chunk_metadatas_to_add.append({
                 'doc_id': doc_id,
                 'pdf_path': str(pdf_path),
-                'page_number': page_num_est,
+                'page_number': page_num_est, # Store estimated page number
                 'chunk_index': i,
                 'text_length_chars': len(chunk_text_content),
                 'timestamp': time.time()
@@ -486,7 +495,11 @@ class PdfRetriever:
                     if doc_text.strip().lower() == query_text.strip().lower(): continue
 
                     # Store with a score where higher is better (e.g., negative distance)
-                    doc_details_cache[chunk_id] = {"id": chunk_id, "text": doc_text, "metadata": metadata, "dense_score": -distance, "source": "dense"}
+                    item_details = {"id": chunk_id, "text": doc_text, "metadata": metadata, "dense_score": -distance, "source": "dense"}
+                    dense_results_list.append(item_details) # Add to list for non-hybrid path
+                    doc_details_cache[chunk_id] = item_details # Add to cache for hybrid path
+
+                dense_results_list.sort(key=lambda x: x['dense_score'], reverse=True) # Sort for non-hybrid path
                 print(f"[PdfRetriever] Dense retrieval found {len(doc_details_cache)} candidates.")
         except Exception as e:
             print(f"[PdfRetriever] Error during dense retrieval: {e}")
@@ -570,7 +583,7 @@ class PdfRetriever:
                 pairs = [(query_text, item['text']) for item in candidate_items_for_cross_encoder]
                 cross_scores = self.cross_encoder.predict(pairs)
 
-                for i, item in enumerate(candidate_items):
+                for i, item in enumerate(candidate_items_for_cross_encoder): # Iterate over the correct list
                     item['cross_score'] = cross_scores[i]
 
                 # Sort by cross_score in descending order (higher is better)
@@ -616,8 +629,11 @@ class PdfRetriever:
             if current_token_count + snippet_tokens <= self.recall_budget_tokens:
                 retrieved_snippets.append({'r': 'retrieved_pdf_chunk', 'c': snippet_text})
                 current_token_count += snippet_tokens
-                log_score = f"cross_score: {cross_score_str}" if 'cross_score' in res_item else f"dist: {res_item['distance']:.4f}"
-                print(f"  Added snippet ({log_score}, tokens: {snippet_tokens}): '{snippet_text[:100]}...'")
+                # Corrected log_score to use res_item directly
+                log_score_val = res_item.get('cross_score', res_item.get('rrf_score', res_item.get('dense_score', -float('inf'))))
+                log_score_type = "cross" if 'cross_score' in res_item else ("rrf" if 'rrf_score' in res_item else ("dense" if 'dense_score' in res_item else "unknown"))
+                log_score_str = f"{log_score_val:.4f}" if isinstance(log_score_val, float) else "N/A"
+                print(f"  Added snippet ({log_score_type}: {log_score_str}, tokens: {snippet_tokens}): '{snippet_text[:100]}...'")
             else:
                 print(f"[PdfRetriever] Recall budget ({self.recall_budget_tokens} tokens) reached. Current: {current_token_count}, Snippet: {snippet_tokens}. Stopping.")
                 break
@@ -737,3 +753,5 @@ if __name__ == '__main__':
     # The following was a duplicate of the demo setup from an earlier version, removing it.
     # dummy_pdf_root.mkdir(parents=True, exist_ok=True)
     # ... (rest of duplicated demo code removed) ...
+
+# End of llm_context_os/retriever/pdf_retriever.py

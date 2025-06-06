@@ -1,4 +1,4 @@
-# llm_context_os/api/schemas.py
+# yawl/api/schemas.py
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 

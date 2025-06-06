@@ -1,4 +1,4 @@
-# llm_context_os/utils/model_scanner.py
+# yawl/utils/model_scanner.py
 import os
 import json
 from pathlib import Path
@@ -10,13 +10,13 @@ import shutil # For __main__ demo cleanup
 # at a higher level (e.g., in an API handler) to decouple utils from api.schemas.
 # For this task, direct import is fine as per prompt.
 try:
-    from llm_context_os.api.schemas import AvailableModel
+    from yawl.api.schemas import AvailableModel
 except ImportError:
     # Fallback for environments where api.schemas might not be in PYTHONPATH,
     # e.g. if running this script directly for testing without full package install.
     # This is a simplified version for the script to run.
     # In a real package, this dependency should be resolvable.
-    print("Warning: Could not import AvailableModel from llm_context_os.api.schemas. Using a local placeholder.")
+    print("Warning: Could not import AvailableModel from yawl.api.schemas. Using a local placeholder.")
     class AvailableModel: # type: ignore
         def __init__(self, model_id: str, model_type: str, path_or_identifier: str, name: Optional[str] = None,
                      description: Optional[str] = None, details: Optional[Dict[str, Any]] = None, source: str = "unknown"):

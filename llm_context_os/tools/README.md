@@ -1,10 +1,10 @@
-# Tools in LLM Context OS
+# Tools in YAWL (Yet Another Wrapper for Llama)
 
-The LLM Context OS includes a flexible tool system that allows Large Language Models (LLMs) to interact with external functionalities. This enhances the LLM's capabilities beyond text generation, enabling them to fetch real-time information, interact with other services, or perform specific actions.
+YAWL (Yet Another Wrapper for Llama) includes a flexible tool system that allows Large Language Models (LLMs) to interact with external functionalities. This enhances the LLM's capabilities beyond text generation, enabling them to fetch real-time information, interact with other services, or perform specific actions.
 
 ## Tool Dispatcher
 
-The core of the tool system is the `ToolDispatcher` class (`llm_context_os.tools.tool_dispatcher.ToolDispatcher`). It is responsible for:
+The core of the tool system is the `ToolDispatcher` class (`yawl.tools.tool_dispatcher.ToolDispatcher`). It is responsible for:
 
 *   Registering available tools (both local Python functions and potentially external tools via Model Capability Packs - MCPs).
 *   Listing tools and their configurations.
@@ -20,7 +20,7 @@ The system has been updated to support an OpenAI-compatible tool calling mechani
 
 2.  **LLM Interaction Flow:**
     *   When an LLM needs to use a tool, it's expected to generate a `tool_calls` object in its response (this part is handled by the specific model runner and how it's prompted).
-    *   The LLM Context OS API (specifically the `/chat` endpoint) detects these `tool_calls`.
+    *   The YAWL API (specifically the `/chat` endpoint) detects these `tool_calls`.
     *   For each requested tool call, the API uses the `ToolDispatcher` to execute the tool with the arguments provided by the LLM.
     *   The results from the tool executions are then formatted and sent back to the LLM.
     *   The LLM uses these results to formulate its final textual response to the user.

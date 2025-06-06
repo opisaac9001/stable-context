@@ -1,6 +1,6 @@
-# LLM Context OS - GUI Frontend
+# YAWL - GUI Frontend
 
-This directory contains the source code for the GUI frontend of the LLM Context OS, built using React with Vite, and intended to be packaged with Tauri.
+This directory contains the source code for the GUI frontend of YAWL (Yet Another Wrapper for Llama), built using React with Vite, and intended to be packaged with Tauri.
 
 ## Prerequisites
 
@@ -11,7 +11,7 @@ This directory contains the source code for the GUI frontend of the LLM Context 
 
 1.  **Navigate to the GUI directory:**
     ```bash
-    cd llm_context_os/gui
+    cd yawl/gui
     ```
 
 2.  **Install dependencies:**
@@ -35,7 +35,7 @@ This command compiles the React app into static assets that Tauri will use.
 ```bash
 npm run build
 ```
-The output will be in the `llm_context_os/gui/dist` directory, which is referenced by `tauri.conf.json`.
+The output will be in the `yawl/gui/dist` directory, which is referenced by `tauri.conf.json`.
 
 ## Tauri Integration
 
@@ -46,7 +46,7 @@ To run the application as a Tauri desktop app (after installing Tauri CLI and pr
 1.  Ensure the backend Python server is running.
 2.  Navigate to the Tauri source directory:
     ```bash
-    cd llm_context_os/gui/src-tauri
+    cd yawl/gui/src-tauri
     ```
 3.  Run the Tauri development command:
     ```bash
@@ -55,7 +55,7 @@ To run the application as a Tauri desktop app (after installing Tauri CLI and pr
 
 To build the Tauri application into an executable:
 ```bash
-cd llm_context_os/gui/src-tauri
+cd yawl/gui/src-tauri
 cargo tauri build
 ```
 This project provides a functional skeleton. Styling and advanced UI features are to be implemented.

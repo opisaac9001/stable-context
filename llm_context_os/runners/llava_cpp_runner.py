@@ -1,3 +1,4 @@
+# yawl/runners/llava_cpp_runner.py
 import time
 import typing as t
 from pathlib import Path
@@ -152,10 +153,17 @@ class LlavaCppRunner(BaseRunner):
                 image_embeds=embedded_images, # list[LlavaImageEmbed.EmbeddedImage]
                 **generation_params
             )
-            return output_text
+            # This runner currently doesn't return token counts from llava-cpp-python.
+            # Modify if future versions of the library provide this.
+            # For now, returning a placeholder for token_counts.
+            # A more accurate way would be to tokenize prompt and output_text separately.
+            prompt_tokens_est = len(self.model.tokenize(processed_prompt.encode("utf-8"))) if self.model else 0
+            completion_tokens_est = len(self.model.tokenize(output_text.encode("utf-8"))) if self.model else 0
+            token_counts = {"prompt_tokens": prompt_tokens_est, "completion_tokens": completion_tokens_est}
+            return output_text, token_counts
         except Exception as e:
             print(f"[LlavaCppRunner] Error during text generation: {e}")
-            return f"[LlavaCppRunner] Error: {e}"
+            return f"[LlavaCppRunner] Error: {e}", {"prompt_tokens": 0, "completion_tokens": 0}
 
     def stream(
         self,
@@ -168,17 +176,23 @@ class LlavaCppRunner(BaseRunner):
         **kwargs,
     ) -> t.Generator[str, None, None]:
         if not LLAVA_CPP_AVAILABLE or not self.model:
-            yield "[LlavaCppRunner] Error: llava-cpp-python not available or model not loaded."
+            yield {"prompt_tokens": 0} # type: ignore
+            yield ("[LlavaCppRunner] Error: llava-cpp-python not available or model not loaded.", 0) # type: ignore
             return
         if image_paths and (not self.image_embedder):
-            yield "[LlavaCppRunner] Error: Image paths provided, but multimodal projector not available/loaded."
+            yield {"prompt_tokens": 0} # type: ignore
+            yield ("[LlavaCppRunner] Error: Image paths provided, but multimodal projector not available/loaded.", 0) # type: ignore
             return
 
         processed_prompt, embedded_images = self._prepare_prompt_and_embeddings(prompt, image_paths)
 
         if image_paths and embedded_images is None:
-            yield "[LlavaCppRunner] Error: Image embedding failed. Cannot proceed with streaming."
+            yield {"prompt_tokens": 0} # type: ignore
+            yield ("[LlavaCppRunner] Error: Image embedding failed. Cannot proceed with streaming.", 0) # type: ignore
             return
+
+        prompt_tokens_est = len(self.model.tokenize(processed_prompt.encode("utf-8"))) if self.model else 0
+        yield {"prompt_tokens": prompt_tokens_est} # type: ignore
 
         generation_params = {
             "temp": temperature,
@@ -197,36 +211,44 @@ class LlavaCppRunner(BaseRunner):
         print(f"[LlavaCppRunner] Streaming text for prompt: '{processed_prompt[:50]}...' with {len(embedded_images or [])} images.")
         try:
             assert self.model is not None
-            # Check if self.model.generate has a 'stream' parameter
             import inspect
             sig = inspect.signature(self.model.generate)
             if 'stream' in sig.parameters: # pragma: no cover
-                # This path is taken if llava-cpp-python's generate method supports a 'stream' flag
                 generation_params['stream'] = True
                 token_generator = self.model.generate(
                     text=processed_prompt,
                     image_embeds=embedded_images,
                     **generation_params
                 )
-                for token_chunk in token_generator: # type: ignore
-                    if isinstance(token_chunk, dict) and 'text' in token_chunk:
-                        yield token_chunk['text']
-                    elif isinstance(token_chunk, str):
-                         yield token_chunk
+                for token_chunk_dict in token_generator: # type: ignore
+                    # Assuming stream yields dicts like {'text': '...', 'tokens_in_chunk': N} or just text
+                    if isinstance(token_chunk_dict, dict):
+                        text_chunk = token_chunk_dict.get('text', '')
+                        tokens_in_chunk = token_chunk_dict.get('tokens_in_chunk', 0) # Placeholder
+                        if not tokens_in_chunk and text_chunk and self.model: # Estimate if not provided
+                             tokens_in_chunk = len(self.model.tokenize(text_chunk.encode("utf-8")))
+                        yield (text_chunk, tokens_in_chunk) # type: ignore
+                    elif isinstance(token_chunk_dict, str): # Fallback if it just yields text
+                        tokens_in_chunk = len(self.model.tokenize(token_chunk_dict.encode("utf-8"))) if self.model else 0
+                        yield (token_chunk_dict, tokens_in_chunk) # type: ignore
             else:
-                # Fallback: If no 'stream' param, generate full response and yield as one chunk.
-                # This is based on the observation that llava_cpp.LlavaLlama.generate returns str.
                 print("[LlavaCppRunner] Warning: `llava_cpp.LlavaLlama.generate` may not support true streaming. Simulating.")
-                full_response = self.model.generate(
-                    text=processed_prompt,
-                    image_embeds=embedded_images,
-                    **generation_params # type: ignore
+                full_response, _ = self.generate( # Call self.generate to get token counts too
+                    prompt=processed_prompt,
+                    image_paths=None, # Already processed
+                    max_tokens=max_tokens, temperature=temperature, top_p=top_p, stop=stop, **kwargs
                 )
-                yield full_response
+                # For simulation, yield in one go or split by words/sentences
+                # This is a rough simulation.
+                simulated_tokens = len(self.model.tokenize(full_response.encode("utf-8"))) if self.model else 0
+                yield (full_response, simulated_tokens) # type: ignore
 
         except Exception as e:
             print(f"[LlavaCppRunner] Error during text streaming: {e}")
-            yield f"[LlavaCppRunner] Error: {e}"
+            yield (f"[LlavaCppRunner] Error: {e}",0) # type: ignore
+        finally:
+            print("[LlavaCppRunner] Streaming finished.")
+
 
     def count_tokens(self, text: str, **kwargs) -> int:
         if not self.model:
@@ -364,7 +386,7 @@ if __name__ == "__main__": # pragma: no cover
         # 1. Test generate with text only
         print("\n--- Testing generate (text only) ---")
         prompt_text_only = "USER: What is the capital of France?\nASSISTANT:"
-        response_text_only = runner.generate(prompt_text_only, max_tokens=50)
+        response_text_only, _ = runner.generate(prompt_text_only, max_tokens=50) # Adjusted to unpack tuple
         print(f"Response (text only): {response_text_only}")
 
         # 2. Test generate with text and image
@@ -373,7 +395,7 @@ if __name__ == "__main__": # pragma: no cover
             # LLaVA prompt format often includes <image> placeholder where image features are inserted.
             # The text prompt itself might also be structured, e.g. "USER: <image>\nDescribe this image.\nASSISTANT:"
             prompt_with_image_placeholder = "USER: <image>\nWhat is in this image?\nASSISTANT:"
-            response_with_image = runner.generate(
+            response_with_image, _ = runner.generate( # Adjusted to unpack tuple
                 prompt_with_image_placeholder, image_paths=[image_path_main], max_tokens=100
             )
             print(f"Response (with image): {response_with_image}")
@@ -383,7 +405,11 @@ if __name__ == "__main__": # pragma: no cover
         # 3. Test stream with text only
         print("\n--- Testing stream (text only) ---")
         full_streamed_text = ""
-        for chunk in runner.stream(prompt_text_only, max_tokens=50):
+        stream_gen1 = runner.stream(prompt_text_only, max_tokens=50)
+        _ = next(stream_gen1) # Skip prompt token info
+        for item in stream_gen1:
+            if isinstance(item, tuple): chunk = item[0]
+            else: chunk = item # Should not happen with current BaseRunner stream spec
             # print(chunk, end="", flush=True) # For live printing
             full_streamed_text += chunk
         # print()
@@ -395,9 +421,13 @@ if __name__ == "__main__": # pragma: no cover
             print("\n--- Testing stream (text + image) ---")
             prompt_with_image_placeholder_stream = "USER: <image>\nTell me a short story about this image.\nASSISTANT:"
             full_streamed_image_text = ""
-            for chunk in runner.stream(
+            stream_gen2 = runner.stream(
                 prompt_with_image_placeholder_stream, image_paths=[image_path_main], max_tokens=100
-            ):
+            )
+            _ = next(stream_gen2) # Skip prompt token info
+            for item in stream_gen2:
+                if isinstance(item, tuple): chunk = item[0]
+                else: chunk = item
                 # print(chunk, end="", flush=True) # For live printing
                 full_streamed_image_text += chunk
             # print()
@@ -422,10 +452,13 @@ if __name__ == "__main__": # pragma: no cover
         print(f"  Model path stored: {runner.model_path}")
         print(f"  MMProj path stored: {runner.mmproj_path}")
         # Test basic placeholder calls (these will just print warnings/errors from the class)
-        print(f"  Generate (placeholder call): {runner.generate('test prompt')}")
+        print(f"  Generate (placeholder call): {runner.generate('test prompt')[0]}") # Access text part
         print("  Stream (placeholder call): ", end="")
-        for chunk in runner.stream("test prompt"): # Should yield error message
-            print(chunk, end="")
+        stream_gen3 = runner.stream("test prompt")
+        _ = next(stream_gen3) # Skip prompt token info
+        for item in stream_gen3: # Should yield error message tuple
+             if isinstance(item, tuple): print(item[0], end="")
+             else: print(item, end="")
         print()
         print(f"  Count tokens (placeholder call): {runner.count_tokens('test prompt')}")
 

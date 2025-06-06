@@ -1,9 +1,9 @@
-# llm_context_os/tools/tool_dispatcher.py
+# yawl/tools/tool_dispatcher.py
 import json
 import inspect # For tool parameter and docstring inspection
-from llm_context_os.tools import builtin_weather
+from yawl.tools import builtin_weather # Updated import
 import typing as t
-from llm_context_os.api.schemas import ToolInfo # For listing tools
+from yawl.api.schemas import ToolInfo # Updated import
 
 # Attempt to import langchain_mcp_adapters
 MCP_ADAPTERS_AVAILABLE = False

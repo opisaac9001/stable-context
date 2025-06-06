@@ -1,4 +1,4 @@
-# llm_context_os/utils/hf_downloader.py
+# yawl/utils/hf_downloader.py
 import typing as t
 from pathlib import Path
 import shutil

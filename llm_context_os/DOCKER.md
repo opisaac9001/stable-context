@@ -1,6 +1,6 @@
-# Running LLM Context OS with Docker
+# Running YAWL with Docker
 
-This document provides instructions on how to build and run the LLM Context OS application using Docker and Docker Compose.
+This document provides instructions on how to build and run the YAWL application using Docker and Docker Compose.
 
 ## Prerequisites
 
@@ -9,7 +9,7 @@ This document provides instructions on how to build and run the LLM Context OS a
 
 ## Build the Docker Images
 
-Navigate to the project root directory (`llm_context_os/`) where the `docker-compose.yml` file is located, and run:
+Navigate to the project root directory (`yawl/`) where the `docker-compose.yml` file is located, and run:
 
 ```bash
 docker-compose build

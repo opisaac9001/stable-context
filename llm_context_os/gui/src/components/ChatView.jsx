@@ -1,4 +1,4 @@
-// llm_context_os/gui/src/components/ChatView.jsx
+// yawl/gui/src/components/ChatView.jsx
 import React, { useState, useEffect, useRef } from 'react';
 import { sendMessage } from '../apiClient'; // Assuming apiClient.js is in ../
 

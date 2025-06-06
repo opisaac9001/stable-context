@@ -1,0 +1,1 @@
+The primary project code directory `llm_context_os` will be renamed to `yawl`. All subsequent code, configuration, and documentation refactoring will assume this new root directory name `yawl` for import paths (e.g., `from yawl.utils import ...`) and other references. No files were changed in this specific preparatory step.

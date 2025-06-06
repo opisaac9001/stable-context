@@ -1,4 +1,4 @@
-# llm_context_os/runners/manager.py
+# yawl/runners/manager.py
 import typing as t
 import time
 from pathlib import Path
@@ -12,9 +12,9 @@ from .exl2_runner import EXL2Runner
 from .speculative_runner import SpeculativeRunner
 from .vllm_runner import VLLMRunner
 from .llava_cpp_runner import LlavaCppRunner
-from llm_context_os.caching.kv_cache_manager import KVCacheManager
-from llm_context_os.tuning.auto_tuner import AutoTuner
-from llm_context_os.api.schemas import AvailableModel # For model listing
+from yawl.caching.kv_cache_manager import KVCacheManager
+from yawl.tuning.auto_tuner import AutoTuner
+from yawl.api.schemas import AvailableModel # For model listing
 import glob # For model scanning
 
 class ModelManager:

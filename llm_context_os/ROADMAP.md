@@ -1,4 +1,4 @@
-LLM Context OS — Project Blueprint 📜
+# YAWL (Yet Another Wrapper for Llama) — Project Blueprint 📜
 0 · Mission
 Build a modular, local LLM engine that
 
@@ -40,7 +40,7 @@ This project includes Docker support for easier setup and deployment. For instru
 text
 Copy
 Edit
-llm_context_os/
+yawl/
 ├─ context/ # phase 1
 │ ├─ context_manager.py
 │ ├─ token_estimator.py

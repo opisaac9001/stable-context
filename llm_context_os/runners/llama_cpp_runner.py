@@ -1,4 +1,4 @@
-# llm_context_os/runners/llama_cpp_runner.py
+# yawl/runners/llama_cpp_runner.py
 import typing as t
 from .base import BaseRunner
 from llama_cpp import Llama, LlamaGrammar # LlamaGrammar might be useful later

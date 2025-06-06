@@ -1,4 +1,4 @@
-// llm_context_os/gui/src/App.jsx
+// yawl/gui/src/App.jsx
 import React from 'react';
 import ModelLoader from './components/ModelLoader';
 import ChatView from './components/ChatView';
@@ -29,7 +29,7 @@ function App() {
   return (
     <div style={styles.appContainer}>
       <header style={styles.header}>
-        <h1>LLM Context OS - GUI</h1>
+        <h1>YAWL - GUI</h1>
       </header>
       <div style={styles.contentContainer}>
         <ModelLoader />

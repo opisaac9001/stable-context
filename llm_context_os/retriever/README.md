@@ -1,6 +1,6 @@
-# Retrievers in LLM Context OS
+# Retrievers in YAWL
 
-The LLM Context OS employs retrievers to fetch relevant information for augmenting the context provided to Large Language Models (LLMs). This enhances the LLM's ability to answer questions and generate text based on specific documents or chat history.
+YAWL (Yet Another Wrapper for Llama) employs retrievers to fetch relevant information for augmenting the context provided to Large Language Models (LLMs). This enhances the LLM's ability to answer questions and generate text based on specific documents or chat history.
 
 Two primary retrievers are currently implemented: `PdfRetriever` and `ChatHistoryRetriever`. Both leverage vector embeddings for semantic search and can be enhanced with hybrid search and re-ranking stages for improved relevance.
 
@@ -102,7 +102,7 @@ The `ChatHistoryRetriever` stores and retrieves messages from past conversations
     *   `rerank_top_n_candidates`: Number of candidates for cross-encoder.
     *   `enable_hyde`: `true` or `false` to enable Hypothetical Document Embeddings (HyDE) for this retriever.
 
-By using these configurable retrieval stages, the LLM Context OS can provide highly relevant information to the LLM. Remember to install `rank_bm25` if using the hybrid search feature.
+By using these configurable retrieval stages, YAWL can provide highly relevant information to the LLM. Remember to install `rank_bm25` if using the hybrid search feature.
 
 ## Advanced Retrieval Techniques
 
