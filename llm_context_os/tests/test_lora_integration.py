@@ -1,12 +1,12 @@
-# llm_context_os/tests/test_lora_integration.py
+# yawl/tests/test_lora_integration.py
 import unittest
 from pathlib import Path
 import shutil
 import typing as t
 
-from llm_context_os.runners.manager import ModelManager
-from llm_context_os.runners import LlamaCppRunner, APIRunner # Import concrete runners for testing
-from llm_context_os.caching.kv_cache_manager import KVCacheManager # For controlling cache path in tests
+from yawl.runners.manager import ModelManager
+from yawl.runners import LlamaCppRunner, APIRunner # Import concrete runners for testing
+from yawl.caching.kv_cache_manager import KVCacheManager # For controlling cache path in tests
 
 class TestLoraIntegration(unittest.TestCase):
 

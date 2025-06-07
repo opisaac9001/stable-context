@@ -1,4 +1,4 @@
-# llm_context_os/tests/test_multimodal_integration.py
+# yawl/tests/test_multimodal_integration.py
 import unittest
 from fastapi.testclient import TestClient
 from pathlib import Path # For potential cleanup if KVCacheManager makes dirs
@@ -7,10 +7,10 @@ import io # For capturing stdout
 import sys # For capturing stdout
 from contextlib import redirect_stdout # For capturing stdout
 
-from llm_context_os.api.main import app, model_mgr, ctx_mgr # Import app and managers
-from llm_context_os.api.schemas import ChatRequest, GenerationParams # Schemas used by client
-from llm_context_os.runners.llava_cpp_runner import LlavaCppRunner # To check instance type
-from llm_context_os.caching.kv_cache_manager import KVCacheManager # To manage test cache dir
+from yawl.api.main import app, model_mgr, ctx_mgr # Import app and managers
+from yawl.api.schemas import ChatRequest, GenerationParams # Schemas used by client
+from yawl.runners.llava_cpp_runner import LlavaCppRunner # To check instance type
+from yawl.caching.kv_cache_manager import KVCacheManager # To manage test cache dir
 
 # Helper to capture stdout for tests that print a lot
 class Capturing(list):

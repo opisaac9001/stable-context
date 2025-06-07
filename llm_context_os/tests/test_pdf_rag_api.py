@@ -1,4 +1,4 @@
-# llm_context_os/tests/test_pdf_rag_api.py
+# yawl/tests/test_pdf_rag_api.py
 import unittest
 import shutil
 from pathlib import Path
@@ -7,11 +7,11 @@ import io # For capturing stdout
 import sys # For capturing stdout
 from contextlib import redirect_stdout # For capturing stdout
 
-from llm_context_os.api.main import app, model_mgr, ctx_mgr, pdf_retriever # Import app and managers
-from llm_context_os.api.schemas import ChatRequest, GenerationParams # Schemas used by client
-from llm_context_os.runners.llava_cpp_runner import LlavaCppRunner # To check instance type for setup
-from llm_context_os.runners.api_runner import APIRunner # For basic chat test
-from llm_context_os.caching.kv_cache_manager import KVCacheManager # To manage test cache dir
+from yawl.api.main import app, model_mgr, ctx_mgr, pdf_retriever # Import app and managers
+from yawl.api.schemas import ChatRequest, GenerationParams # Schemas used by client
+from yawl.runners.llava_cpp_runner import LlavaCppRunner # To check instance type for setup
+from yawl.runners.api_runner import APIRunner # For basic chat test
+from yawl.caching.kv_cache_manager import KVCacheManager # To manage test cache dir
 
 # Helper to capture stdout for tests that print a lot
 class Capturing(list):

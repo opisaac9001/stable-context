@@ -1,9 +1,9 @@
-# llm_context_os/tests/test_retriever.py
+# yawl/tests/test_retriever.py
 import unittest
-from llm_context_os.retriever.chat_history import ChatHistoryRetriever
+from yawl.retriever.chat_history import ChatHistoryRetriever
 # For a simple tokenizer if needed. ChatHistoryRetriever uses its own SimpleCharTokenizer by default.
-# from llm_context_os.context.context_manager import MockTokenizer
-from llm_context_os.retriever.chat_history import SimpleCharTokenizer # Explicitly import if used
+# from yawl.context.context_manager import MockTokenizer
+from yawl.retriever.chat_history import SimpleCharTokenizer # Explicitly import if used
 
 class TestChatHistoryRetriever(unittest.TestCase):
 

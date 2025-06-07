@@ -1,6 +1,6 @@
-# llm_context_os/tests/test_llava_cpp_runner.py
+# yawl/tests/test_llava_cpp_runner.py
 import unittest
-from llm_context_os.runners.llava_cpp_runner import LlavaCppRunner
+from yawl.runners.llava_cpp_runner import LlavaCppRunner
 import typing as t
 from unittest.mock import patch # For suppressing prints in setUp
 from io import StringIO # For suppressing prints in setUp

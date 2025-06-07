@@ -1,4 +1,4 @@
-# llm_context_os/tests/test_pdf_retriever.py
+# yawl/tests/test_pdf_retriever.py
 import unittest
 from unittest.mock import patch, MagicMock, ANY
 import uuid
@@ -7,7 +7,7 @@ from pathlib import Path
 import os # For dummy file creation in tests if needed
 import shutil # For cleanup
 
-from llm_context_os.retriever.pdf_retriever import (
+from yawl.retriever.pdf_retriever import (
     PdfRetriever,
     LANGCHAIN_TEXT_SPLITTERS_AVAILABLE,
     SENTENCE_TRANSFORMERS_AVAILABLE,
@@ -38,11 +38,11 @@ except ImportError:
     "One or more core dependencies (PyMuPDF, langchain-text-splitters, sentence-transformers, chromadb) not available. Skipping PdfRetriever tests."
 )
 # Remove PdfReader patch, add fitz.open patch
-@patch('llm_context_os.retriever.pdf_retriever.BM25Okapi') # Add BM25Okapi patch
-@patch('llm_context_os.retriever.pdf_retriever.fitz.open')
-@patch('llm_context_os.retriever.pdf_retriever.RecursiveCharacterTextSplitter')
-@patch('llm_context_os.retriever.pdf_retriever.SentenceTransformer')
-@patch('llm_context_os.retriever.pdf_retriever.chromadb.PersistentClient')
+@patch('yawl.retriever.pdf_retriever.BM25Okapi') # Add BM25Okapi patch
+@patch('yawl.retriever.pdf_retriever.fitz.open')
+@patch('yawl.retriever.pdf_retriever.RecursiveCharacterTextSplitter')
+@patch('yawl.retriever.pdf_retriever.SentenceTransformer')
+@patch('yawl.retriever.pdf_retriever.chromadb.PersistentClient')
 class TestPdfRetriever(unittest.TestCase):
 
     def setUp(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi): # Order of mocks matters
@@ -214,17 +214,17 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertIsNotNone(self.retriever.text_splitter)
         self.assertIs(self.retriever.tokenizer, self.mock_tokenizer)
 
-    @patch('llm_context_os.retriever.pdf_retriever.LANGCHAIN_TEXT_SPLITTERS_AVAILABLE', False)
+    @patch('yawl.retriever.pdf_retriever.LANGCHAIN_TEXT_SPLITTERS_AVAILABLE', False)
     def test_initialization_no_splitter_lib(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         # Ensure that when re-initing, chunking_strategy is recursive if splitter is not available.
         # The PdfRetriever init logic itself doesn't set strategy based on LANGCHAIN_TEXT_SPLITTERS_AVAILABLE,
         # but rather if self.text_splitter ends up being None.
-        with patch('llm_context_os.retriever.pdf_retriever.RecursiveCharacterTextSplitter', None): # Make it None after import
+        with patch('yawl.retriever.pdf_retriever.RecursiveCharacterTextSplitter', None): # Make it None after import
              retriever_no_splitter = PdfRetriever(vector_db_path=self.test_db_base_path, tokenizer=self.mock_tokenizer, chunking_strategy="recursive")
              self.assertIsNone(retriever_no_splitter.text_splitter)
 
 
-    @patch('llm_context_os.retriever.pdf_retriever.SENTENCE_TRANSFORMERS_AVAILABLE', False)
+    @patch('yawl.retriever.pdf_retriever.SENTENCE_TRANSFORMERS_AVAILABLE', False)
     def test_initialization_no_embedding_lib(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         # Side effect for SentenceTransformer should be None or raise error if SENTENCE_TRANSFORMERS_AVAILABLE is False
         original_st_side_effect = self.MockSentenceTransformer.side_effect
@@ -235,7 +235,7 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertEqual(retriever_no_embed.chunking_strategy, "recursive") # Should fallback
         self.MockSentenceTransformer.side_effect = original_st_side_effect # Restore
 
-    @patch('llm_context_os.retriever.pdf_retriever.CHROMADB_AVAILABLE', False)
+    @patch('yawl.retriever.pdf_retriever.CHROMADB_AVAILABLE', False)
     def test_initialization_no_chromadb_lib(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         retriever_no_db = PdfRetriever(vector_db_path=self.test_db_base_path, tokenizer=self.mock_tokenizer)
         self.assertIsNone(retriever_no_db.db_client)
@@ -244,7 +244,7 @@ class TestPdfRetriever(unittest.TestCase):
     def test_upload_document_success_recursive_strategy(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self._reinit_retriever(chunking_strategy="recursive")
         fake_pdf_path_str = "dummy_document_recursive.pdf"
-        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+        with patch('yawl.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
             mock_path_instance.is_file.return_value = True
@@ -275,7 +275,7 @@ class TestPdfRetriever(unittest.TestCase):
     def test_upload_document_pdf_read_error(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self.MockFitzOpen.side_effect = Exception("PyMuPDF Read Error")
         fake_pdf_path_str = "error.pdf"
-        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+        with patch('yawl.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
             mock_path_instance.is_file.return_value = True
@@ -290,7 +290,7 @@ class TestPdfRetriever(unittest.TestCase):
     def test_upload_document_no_text_extracted(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self.mock_fitz_page_instance.get_text.return_value = ""
         fake_pdf_path_str = "empty_text.pdf"
-        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+        with patch('yawl.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
             mock_path_instance.is_file.return_value = True
@@ -305,7 +305,7 @@ class TestPdfRetriever(unittest.TestCase):
     def test_upload_document_embedding_error(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self.mock_main_embedding_model_instance.encode.side_effect = Exception("Embedding Error") # Changed from mock_bi_encoder_instance
         fake_pdf_path_str = "embed_error.pdf"
-        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+        with patch('yawl.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
             mock_path_instance.is_file.return_value = True
@@ -319,7 +319,7 @@ class TestPdfRetriever(unittest.TestCase):
     def test_upload_document_db_add_error(self, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self.mock_collection.add.side_effect = Exception("DB Add Error")
         fake_pdf_path_str = "db_add_error.pdf"
-        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+        with patch('yawl.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
             mock_path_instance.is_file.return_value = True
@@ -386,7 +386,7 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertEqual(chunks, expected_chunks)
 
 
-    @patch('llm_context_os.retriever.pdf_retriever.PdfRetriever._chunk_semantically')
+    @patch('yawl.retriever.pdf_retriever.PdfRetriever._chunk_semantically')
     def test_upload_document_with_semantic_chunking_strategy(self, mock_chunk_semantically, MockNltkDownload, MockNltkDataFind, MockChromaDBClient, MockSentenceTransformer, MockSplitter, MockFitzOpen, MockBM25Okapi):
         self._reinit_retriever(chunking_strategy="semantic", semantic_chunker_model_name='fake-semantic-chunker-model')
         self.assertTrue(self.retriever.chunking_strategy == "semantic")
@@ -396,7 +396,7 @@ class TestPdfRetriever(unittest.TestCase):
         mock_chunk_semantically.return_value = predefined_semantic_chunks
 
         fake_pdf_path = "semantic_test.pdf"
-        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+        with patch('yawl.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
             mock_path_instance.is_file.return_value = True
@@ -442,7 +442,7 @@ class TestPdfRetriever(unittest.TestCase):
         self.assertIsNone(self.retriever.semantic_sentence_embedder, "Semantic embedder should be None after fallback")
 
         fake_pdf_path = "semantic_fallback.pdf"
-        with patch('llm_context_os.retriever.pdf_retriever.Path') as mock_path_constructor:
+        with patch('yawl.retriever.pdf_retriever.Path') as mock_path_constructor:
             mock_path_instance = MagicMock()
             mock_path_instance.exists.return_value = True
             mock_path_instance.is_file.return_value = True
@@ -686,4 +686,4 @@ class TestPdfRetriever(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main(argv=['first-arg-is-ignored'], exit=False)
 
-# End of llm_context_os/tests/test_pdf_retriever.py
+# End of yawl/tests/test_pdf_retriever.py

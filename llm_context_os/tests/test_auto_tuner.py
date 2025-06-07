@@ -1,4 +1,4 @@
-# llm_context_os/tests/test_auto_tuner.py
+# yawl/tests/test_auto_tuner.py
 import unittest
 from unittest.mock import patch, MagicMock
 import json
@@ -8,10 +8,10 @@ import random # For mocking
 import typing as t # For t.Any, t.List, t.Dict
 from io import StringIO # Import for new_callable
 
-from llm_context_os.tuning.auto_tuner import AutoTuner
-from llm_context_os.runners.manager import ModelManager
-from llm_context_os.runners.llama_cpp_runner import LlamaCppRunner
-from llm_context_os.caching.kv_cache_manager import KVCacheManager
+from yawl.tuning.auto_tuner import AutoTuner
+from yawl.runners.manager import ModelManager
+from yawl.runners.llama_cpp_runner import LlamaCppRunner
+from yawl.caching.kv_cache_manager import KVCacheManager
 
 class TestAutoTuner(unittest.TestCase):
     def setUp(self):
@@ -126,7 +126,7 @@ class TestModelManagerWithAutoTuner(unittest.TestCase):
 
         initial_runner_params = {'n_gpu_layers': 10, 'n_ctx': 2048, 'some_other_param': 'value'}
 
-        with patch('llm_context_os.runners.llama_cpp_runner.LlamaCppRunner.__init__', return_value=None) as mock_runner_init:
+        with patch('yawl.runners.llama_cpp_runner.LlamaCppRunner.__init__', return_value=None) as mock_runner_init: # Updated mock path
             with patch('sys.stdout', new_callable=StringIO): # Suppress manager load prints
                 self.manager.load(
                     model_type='gguf',
@@ -150,7 +150,7 @@ class TestModelManagerWithAutoTuner(unittest.TestCase):
     @patch.object(AutoTuner, 'get_optimal_settings')
     def test_load_with_auto_tune_disabled(self, mock_get_optimal_settings):
         initial_params = {'n_gpu_layers': 5}
-        with patch('llm_context_os.runners.llama_cpp_runner.LlamaCppRunner.__init__', return_value=None) as mock_runner_init:
+        with patch('yawl.runners.llama_cpp_runner.LlamaCppRunner.__init__', return_value=None) as mock_runner_init: # Updated mock path
             with patch('sys.stdout', new_callable=StringIO):
                 self.manager.load(model_type='gguf', model_path_or_name='test/model.gguf', auto_tune=False, **initial_params)
 

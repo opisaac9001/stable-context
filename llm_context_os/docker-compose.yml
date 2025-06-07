@@ -1,4 +1,4 @@
-# llm_context_os/docker-compose.yml
+# yawl/docker-compose.yml
 version: '3.8'
 
 services:
@@ -11,18 +11,18 @@ services:
     # volumes:
     #   # Mount the application code for development (reflects changes without rebuild)
     #   # Note: requirements.txt changes would still need a rebuild of the image if not also mounted.
-    #   # This assumes your Python code is primarily within the llm_context_os sub-package.
-    #   - ./llm_context_os:/app/llm_context_os
+    #   # This assumes your Python code is primarily within the yawl sub-package.
+    #   - ./yawl:/app/yawl
     #   # If you have other Python files in the root, you might need a broader mount like:
     #   # - .:/app
     #   # However, be careful not to overwrite installed packages in /app if WORKDIR is /app.
-    # command: uvicorn llm_context_os.api.main:app --host 0.0.0.0 --port 8000 --reload # For dev
+    # command: uvicorn yawl.api.main:app --host 0.0.0.0 --port 8000 --reload # For dev
     # depends_on:
     #   - some_db_service # If you add a database service later
     environment:
       # - PYTHONUNBUFFERED=1 # Already set in Dockerfile.backend but can be explicit
       - APP_ENV=development # Example environment variable
-      # - PYTHONPATH=/app # Ensures llm_context_os package is found if not installed site-wide
+      # - PYTHONPATH=/app # Ensures yawl package is found if not installed site-wide
 
   frontend:
     build:
@@ -41,7 +41,7 @@ services:
 # For direct browser-to-backend API calls using localhost:8000, a shared Docker network isn't strictly needed,
 # but it's good practice for inter-service communication if that evolves.
 # networks:
-#   llm_os_network:
+#   yawl_network:
 #     driver: bridge
 
 # Optional: Define volumes if you need persistent storage

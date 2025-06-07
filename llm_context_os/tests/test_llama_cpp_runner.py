@@ -1,4 +1,4 @@
-# llm_context_os/tests/test_llama_cpp_runner.py
+# yawl/tests/test_llama_cpp_runner.py
 import unittest
 from unittest.mock import patch, MagicMock, mock_open, ANY
 import typing as t
@@ -7,7 +7,7 @@ import tempfile
 import os
 from io import StringIO # Correct import for StringIO
 
-from llm_context_os.runners.llama_cpp_runner import LlamaCppRunner
+from yawl.runners.llama_cpp_runner import LlamaCppRunner
 
 DUMMY_MODEL_PATH = "test_model.gguf"
 
@@ -15,7 +15,7 @@ DUMMY_MODEL_PATH = "test_model.gguf"
 class TestLlamaCppRunner(unittest.TestCase):
 
     def setUp(self):
-        self.patcher = patch('llm_context_os.runners.llama_cpp_runner.Llama')
+        self.patcher = patch('yawl.runners.llama_cpp_runner.Llama')
         self.MockLlamaClass = self.patcher.start() # This is the MagicMock class
         self.addCleanup(self.patcher.stop) # Ensures patch is stopped after each test
 

@@ -1,4 +1,4 @@
-# llm_context_os/requirements.txt
+# yawl/requirements.txt
 
 # --- Core API & Schema Dependencies ---
 fastapi
@@ -7,15 +7,16 @@ pydantic
 python-multipart # For FastAPI File Uploads (used in /upload_document)
 
 # --- Other Core / General Dependencies (add as identified) ---
-# numpy         # For numerical operations, mock tensor data, and potential real tensor handling
+numpy>=1.20.0         # For numerical operations, used in semantic chunking and by other libs
 # sse-starlette # For streaming if needed beyond basic WebSocket/HTTP
 # python-dotenv # For managing environment variables
-# PyYAML        # For config file loading
+PyYAML        # For config file loading
 # watchdog      # For config hot-reloading (optional)
 
 # --- Tokenizers (beyond basic char counting) ---
 # sentencepiece
 # transformers[tokenizers] # For Hugging Face tokenizers
+tiktoken>=0.5.0               # For token counting, often used with embedding/retrieval
 
 # --- Model Runners & Related Libraries ---
 # For LlamaCppRunner (GGUF models)
@@ -51,11 +52,11 @@ huggingface-hub>=0.17.0       # For downloading models from Hugging Face Hub
 # --- Retriever (RAG - Phase 4) ---
 sentence-transformers>=2.2.0 # For embedding text
 chromadb>=0.4.15              # For vector storage and similarity search
-tiktoken>=0.5.0               # For token counting, often used with embedding/retrieval
+rank_bm25>=0.2.2              # For BM25 sparse retrieval in hybrid search
+nltk>=3.8.0                   # For sentence tokenization in semantic chunking
 # For PDF Processing (in PdfRetriever)
-pypdf2>=3.0.0                 # For PDF text extraction
-# pymupdf               # Alternative for PDF text extraction, often faster/more robust
-langchain-text-splitters>=0.0.1 # For RecursiveCharacterTextSplitter
+PyMuPDF>=1.23.0               # For PDF text extraction (replaces pypdf2)
+langchain-text-splitters>=0.0.1 # For RecursiveCharacterTextSplitter (fallback chunking)
 # langchain             # For text splitting and document loading (optional, can use custom)
 
 

@@ -1,20 +1,20 @@
-# llm_context_os/tests/test_model_manager.py
+# yawl/tests/test_model_manager.py
 import unittest
 from unittest.mock import patch, MagicMock, call
 import time # For mocking time
 
-from llm_context_os.runners.manager import ModelManager
-from llm_context_os.runners.base import BaseRunner
-from llm_context_os.runners.api_runner import APIRunner
-from llm_context_os.runners.exl2_runner import EXL2Runner, EXL2_AVAILABLE
+from yawl.runners.manager import ModelManager
+from yawl.runners.base import BaseRunner
+from yawl.runners.api_runner import APIRunner
+from yawl.runners.exl2_runner import EXL2Runner, EXL2_AVAILABLE
 # KVCacheManager and AutoTuner are imported by ModelManager, so we patch their paths there.
 
 # Mock instances to be configured and used
 mock_kv_cache_mgr_instance = MagicMock()
 mock_auto_tuner_instance = MagicMock()
 
-@patch('llm_context_os.runners.manager.AutoTuner', MagicMock(return_value=mock_auto_tuner_instance))
-@patch('llm_context_os.runners.manager.KVCacheManager', MagicMock(return_value=mock_kv_cache_mgr_instance))
+@patch('yawl.runners.manager.AutoTuner', MagicMock(return_value=mock_auto_tuner_instance))
+@patch('yawl.runners.manager.KVCacheManager', MagicMock(return_value=mock_kv_cache_mgr_instance))
 class TestModelManagerIntegration(unittest.TestCase):
 
     def setUp(self):
@@ -35,7 +35,7 @@ class TestModelManagerIntegration(unittest.TestCase):
         # The patching at class level should ensure ModelManager() uses the MagicMock constructors.
 
 
-    @patch('llm_context_os.runners.manager.APIRunner')
+    @patch('yawl.runners.manager.APIRunner')
     def test_load_get_unload_api_runner(self, MockAPIRunner):
         mock_api_runner_instance = MagicMock(spec=APIRunner)
         mock_api_runner_instance.model_name = "test-api-model" # Needed for some internal manager logic
@@ -90,7 +90,7 @@ class TestModelManagerIntegration(unittest.TestCase):
         # For now, assume ModelManager.unload() handles what's needed for the runner object itself.
 
 
-    @patch('llm_context_os.runners.manager.EXL2Runner')
+    @patch('yawl.runners.manager.EXL2Runner')
     @unittest.skipUnless(EXL2_AVAILABLE, "EXL2 dependencies not available, skipping EXL2 integration test.")
     def test_load_get_unload_exl2_runner(self, MockEXL2Runner):
         mock_exl2_runner_instance = MagicMock(spec=EXL2Runner)
@@ -144,7 +144,7 @@ class TestModelManagerIntegration(unittest.TestCase):
         mock_kv_cache_mgr_instance.save_kv_cache.assert_not_called()
 
 
-    @patch('llm_context_os.runners.manager.APIRunner')
+    @patch('yawl.runners.manager.APIRunner')
     @patch('time.time') # Patch time globally for this test method
     def test_idle_unload_api_runner(self, mock_time, MockAPIRunner):
         mock_api_runner_instance = MagicMock(spec=APIRunner)
@@ -182,7 +182,7 @@ class TestModelManagerIntegration(unittest.TestCase):
             cache_object=mock_api_runner_instance.export_kv_cache.return_value
         )
 
-    @patch('llm_context_os.runners.manager.EXL2Runner')
+    @patch('yawl.runners.manager.EXL2Runner')
     @unittest.skipUnless(EXL2_AVAILABLE, "EXL2 dependencies not available.")
     def test_load_exl2_with_kv_preload_not_implemented(self, MockEXL2Runner):
         mock_exl2_runner_instance = MagicMock(spec=EXL2Runner)

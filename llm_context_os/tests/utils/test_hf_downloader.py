@@ -1,3 +1,4 @@
+# yawl/tests/utils/test_hf_downloader.py
 import unittest
 from unittest.mock import patch, MagicMock, call
 from pathlib import Path
@@ -5,8 +6,8 @@ import shutil
 import os
 
 # Adjust import path based on actual project structure
-# Assuming llm_context_os is in the Python path or tests are run from project root
-from llm_context_os.utils.hf_downloader import (
+# Assuming yawl is in the Python path or tests are run from project root
+from yawl.utils.hf_downloader import (
     download_model_from_hf,
     EntryNotFoundError,
     HfHubHTTPError,
@@ -33,8 +34,8 @@ class TestHfDownloader(unittest.TestCase):
         if self.test_dir.exists():
             shutil.rmtree(self.test_dir)
 
-    @patch('llm_context_os.utils.hf_downloader.shutil.copy')
-    @patch('llm_context_os.utils.hf_downloader.hf_hub_download')
+    @patch('yawl.utils.hf_downloader.shutil.copy')
+    @patch('yawl.utils.hf_downloader.hf_hub_download')
     def test_download_single_file_success(self, mock_hf_download, mock_shutil_copy):
         mock_hf_download.return_value = str(self.dummy_cache_file)
         repo_id = "test/model-single"
@@ -58,7 +59,7 @@ class TestHfDownloader(unittest.TestCase):
         )
         mock_shutil_copy.assert_called_once_with(str(self.dummy_cache_file), expected_path)
 
-    @patch('llm_context_os.utils.hf_downloader.snapshot_download')
+    @patch('yawl.utils.hf_downloader.snapshot_download')
     def test_download_snapshot_success(self, mock_snapshot_download):
         repo_id = "test/model-snapshot"
         expected_snapshot_path_str = str(self.test_dir / repo_id.split('/')[-1])
@@ -87,7 +88,7 @@ class TestHfDownloader(unittest.TestCase):
             local_dir_use_symlinks=False # Assuming this is the default in the actual code
         )
 
-    @patch('llm_context_os.utils.hf_downloader.hf_hub_download', side_effect=EntryNotFoundError("File not found"))
+    @patch('yawl.utils.hf_downloader.hf_hub_download', side_effect=EntryNotFoundError("File not found"))
     def test_download_file_not_found(self, mock_hf_download):
         success, message = download_model_from_hf(
             repo_id="test/nonexistent",
@@ -98,7 +99,7 @@ class TestHfDownloader(unittest.TestCase):
         self.assertIn("not found in repo", message.lower())
         self.assertIn("nonexistent.gguf", message)
 
-    @patch('llm_context_os.utils.hf_downloader.snapshot_download', side_effect=RepositoryNotFoundError("Repo not found"))
+    @patch('yawl.utils.hf_downloader.snapshot_download', side_effect=RepositoryNotFoundError("Repo not found"))
     def test_download_repo_not_found(self, mock_snapshot_download):
         success, message = download_model_from_hf(
             repo_id="unknown/repo",
@@ -109,7 +110,7 @@ class TestHfDownloader(unittest.TestCase):
         self.assertIn("repository not found", message.lower())
         self.assertIn("unknown/repo", message)
 
-    @patch('llm_context_os.utils.hf_downloader.hf_hub_download', side_effect=RevisionNotFoundError("Revision not found"))
+    @patch('yawl.utils.hf_downloader.hf_hub_download', side_effect=RevisionNotFoundError("Revision not found"))
     def test_download_revision_not_found_single_file(self, mock_hf_download):
         success, message = download_model_from_hf(
             repo_id="test/model-rev",
@@ -120,7 +121,7 @@ class TestHfDownloader(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("revision 'bad-revision' not found", message.lower())
 
-    @patch('llm_context_os.utils.hf_downloader.snapshot_download', side_effect=RevisionNotFoundError("Revision not found"))
+    @patch('yawl.utils.hf_downloader.snapshot_download', side_effect=RevisionNotFoundError("Revision not found"))
     def test_download_revision_not_found_snapshot(self, mock_snapshot_download):
         success, message = download_model_from_hf(
             repo_id="test/model-rev-snap",
@@ -131,7 +132,7 @@ class TestHfDownloader(unittest.TestCase):
         self.assertIn("revision 'bad-revision-snap' not found", message.lower())
 
 
-    @patch('llm_context_os.utils.hf_downloader.hf_hub_download', side_effect=HfHubHTTPError("HTTP error"))
+    @patch('yawl.utils.hf_downloader.hf_hub_download', side_effect=HfHubHTTPError("HTTP error"))
     def test_download_http_error(self, mock_hf_download):
         success, message = download_model_from_hf(
             repo_id="test/http-error",
@@ -141,8 +142,8 @@ class TestHfDownloader(unittest.TestCase):
         self.assertFalse(success)
         self.assertIn("http error accessing file", message.lower())
 
-    @patch('llm_context_os.utils.hf_downloader.shutil.copy', side_effect=Exception("Disk full"))
-    @patch('llm_context_os.utils.hf_downloader.hf_hub_download')
+    @patch('yawl.utils.hf_downloader.shutil.copy', side_effect=Exception("Disk full"))
+    @patch('yawl.utils.hf_downloader.hf_hub_download')
     def test_download_general_exception_on_copy(self, mock_hf_download, mock_shutil_copy):
         mock_hf_download.return_value = str(self.dummy_cache_file)
         success, message = download_model_from_hf(
@@ -154,7 +155,7 @@ class TestHfDownloader(unittest.TestCase):
         self.assertIn("unexpected error occurred", message.lower())
         self.assertIn("disk full", message.lower())
 
-    @patch('llm_context_os.utils.hf_downloader.hf_hub_download', side_effect=Exception("Very generic error"))
+    @patch('yawl.utils.hf_downloader.hf_hub_download', side_effect=Exception("Very generic error"))
     def test_download_general_exception_on_hf_call(self, mock_hf_download):
         success, message = download_model_from_hf(
             repo_id="test/generic-hf-error",
@@ -166,7 +167,7 @@ class TestHfDownloader(unittest.TestCase):
         self.assertIn("very generic error", message.lower())
 
     # Test for the initial check if huggingface_hub is not available
-    @patch('llm_context_os.utils.hf_downloader.HUGGINGFACE_HUB_AVAILABLE', False)
+    @patch('yawl.utils.hf_downloader.HUGGINGFACE_HUB_AVAILABLE', False)
     def test_huggingface_hub_not_available(self):
         success, message = download_model_from_hf(
             repo_id="test/any",

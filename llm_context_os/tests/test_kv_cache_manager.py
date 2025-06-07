@@ -1,11 +1,11 @@
-# llm_context_os/tests/test_kv_cache_manager.py
+# yawl/tests/test_kv_cache_manager.py
 import unittest
 import shutil
 from pathlib import Path
 import typing as t
 import pickle # For dummy file content in new test
 
-from llm_context_os.caching.kv_cache_manager import KVCacheManager
+from yawl.caching.kv_cache_manager import KVCacheManager
 
 class TestKVCacheManager(unittest.TestCase):
     def setUp(self):

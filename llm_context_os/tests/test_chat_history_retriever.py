@@ -1,4 +1,4 @@
-# llm_context_os/tests/test_chat_history_retriever.py
+# yawl/tests/test_chat_history_retriever.py
 import unittest
 from unittest.mock import patch, MagicMock, ANY
 import uuid
@@ -6,7 +6,7 @@ import time
 import os
 import shutil # For cleaning up any potential dummy db paths if needed for a specific test
 
-from llm_context_os.retriever.chat_history import (
+from yawl.retriever.chat_history import (
     ChatHistoryRetriever,
     SENTENCE_TRANSFORMERS_AVAILABLE,
     CHROMADB_AVAILABLE,
@@ -19,15 +19,15 @@ from llm_context_os.retriever.chat_history import (
 # when TIKTOKEN_AVAILABLE is True but we want to simulate its absence for a specific test case.
 # For most tests, we'll provide a mock_tokenizer directly.
 # For testing the __init__ fallback:
-# @patch('llm_context_os.retriever.chat_history.TIKTOKEN_AVAILABLE', False) # Example for one test
-from llm_context_os.retriever.chat_history import BM25Okapi # Import for patching target
+# @patch('yawl.retriever.chat_history.TIKTOKEN_AVAILABLE', False) # Example for one test
+from yawl.retriever.chat_history import BM25Okapi # Import for patching target
 
 
 @unittest.skipUnless(SENTENCE_TRANSFORMERS_AVAILABLE, "SentenceTransformers library not available, skipping ChatHistoryRetriever tests.")
 @unittest.skipUnless(CHROMADB_AVAILABLE, "ChromaDB library not available, skipping ChatHistoryRetriever tests.")
-@patch('llm_context_os.retriever.chat_history.BM25Okapi') # Added BM25Okapi patch
-@patch('llm_context_os.retriever.chat_history.SentenceTransformer')
-@patch('llm_context_os.retriever.chat_history.chromadb.PersistentClient')
+@patch('yawl.retriever.chat_history.BM25Okapi') # Added BM25Okapi patch
+@patch('yawl.retriever.chat_history.SentenceTransformer')
+@patch('yawl.retriever.chat_history.chromadb.PersistentClient')
 class TestChatHistoryRetriever(unittest.TestCase):
 
     def setUp(self, MockChromaDBClient, MockSentenceTransformer, MockBM25Okapi): # Added MockBM25Okapi
@@ -135,7 +135,7 @@ class TestChatHistoryRetriever(unittest.TestCase):
         self.assertIsNotNone(self.retriever.collection)
         self.assertIs(self.retriever.tokenizer, self.mock_tokenizer)
 
-    @patch('llm_context_os.retriever.chat_history.TIKTOKEN_AVAILABLE', False)
+    @patch('yawl.retriever.chat_history.TIKTOKEN_AVAILABLE', False)
     def test_initialization_fallback_tokenizer(self, MockChromaDBClient, MockSentenceTransformer, MockBM25Okapi): # Added MockBM25Okapi
         original_side_effect = self.MockSentenceTransformer.side_effect
         def specific_side_effect(model_name):
